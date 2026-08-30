@@ -164,9 +164,43 @@ result = scene.render(
 )
 ```
 
+## Pixel-to-Gaussian observation topology
+
+Build one mode-independent topology after accepting a static scene. Each
+`--view` binds a reference-camera label from the static bundle to the matching
+fixed-view flow artifact:
+
+```powershell
+modal-gaussians topology build `
+  --scene C:\outputs\static_scene `
+  --view view1 C:\outputs\view1_flow `
+  --view view2 C:\outputs\view2_flow `
+  --output C:\outputs\observation_topology
+```
+
+For every sampled pixel inside the eroded flow mask, the command requires valid
+foreground alpha and expected depth, unprojects a canonical surface point,
+preselects nearby foreground Gaussians, and ranks them by opacity-weighted 3D
+Mahalanobis contribution. It retains up to four positive-depth contributors,
+normalizes their weights per pixel, and stores the pinhole projection Jacobian
+for each contributor. Background Gaussian indices never enter this artifact.
+
+The output is deliberately limited to two files:
+
+```text
+observation_topology/
+├── manifest.json
+└── topology.npz
+```
+
+The NPZ uses ragged `sample_offsets` rather than duplicating pixel data for
+every contributor. The manifest binds the topology to the exact static-scene,
+foreground-Gaussian, reference-camera, and flow-artifact identities. All
+scientific thresholds are included in the topology identity.
+
 ## Migrated pipeline boundary
 
-This slice deliberately stops before peak selection and visualization:
+The migrated core currently reaches the reusable observation topology:
 
 1. discover zero-padded image names in lexicographic order and validate matching
    masks, FPS, and the reference frame;
@@ -176,7 +210,10 @@ This slice deliberately stops before peak selection and visualization:
 4. compute fixed-parameter Farneback flow from the reference to every frame;
 5. optionally apply Davis-inspired contrast-weighted Gaussian smoothing;
 6. subtract each pixel's temporal mean, apply a symmetric Hann window, and
-   compute its temporal real FFT.
+   compute its temporal real FFT;
+7. train and accept a static foreground/background 3DGS;
+8. map fixed-view flow pixels to foreground Gaussian contributors and projection
+   Jacobians.
 
 The output is one non-overwriting directory containing raw flow, per-frame valid
 masks, the union analysis mask, frame times, the RGB reference frame, complex

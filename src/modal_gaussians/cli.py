@@ -54,7 +54,7 @@ def _non_negative_int(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the unified flow, COLMAP, and static-3DGS command tree."""
+    """Build the unified flow, COLMAP, static-3DGS, and topology command tree."""
 
     parser = argparse.ArgumentParser(prog="modal-gaussians")
     command_parsers = parser.add_subparsers(dest="command", required=True)
@@ -147,6 +147,35 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument(
         "--role", choices=("all", "sweep", "reference"), default="all"
     )
+    topology_parser = command_parsers.add_parser(
+        "topology", help="Pixel-to-foreground-Gaussian observation topology"
+    )
+    topology_commands = topology_parser.add_subparsers(
+        dest="topology_command", required=True
+    )
+    topology_build = topology_commands.add_parser(
+        "build", help="Build one reusable mode-independent topology artifact"
+    )
+    topology_build.add_argument("--scene", required=True, type=Path)
+    topology_build.add_argument(
+        "--view",
+        required=True,
+        action="append",
+        nargs=2,
+        metavar=("LABEL", "FLOW_ARTIFACT"),
+        help="Reference-camera label and matching flow artifact; repeat per view",
+    )
+    topology_build.add_argument("--output", required=True, type=Path)
+    topology_build.add_argument("--pixel-stride", type=_positive_int, default=4)
+    topology_build.add_argument("--candidate-count", type=_positive_int, default=4)
+    topology_build.add_argument("--preselect-count", type=_positive_int, default=32)
+    topology_build.add_argument("--alpha-min", type=_non_negative_float, default=0.05)
+    topology_build.add_argument(
+        "--min-contribution", type=_non_negative_float, default=1e-12
+    )
+    topology_build.add_argument(
+        "--mask-erode-iters", type=_non_negative_int, default=1
+    )
     return parser
 
 
@@ -227,6 +256,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(f"static QA: {output.resolve()}")
             print(f"metrics: {(output / 'metrics.json').resolve()}")
+            return 0
+        if args.command == "topology" and args.topology_command == "build":
+            from modal_gaussians.topology import (
+                TopologyConfig,
+                TopologyViewInput,
+                build_observation_topology_artifact,
+            )
+
+            artifact = build_observation_topology_artifact(
+                scene_dir=args.scene,
+                views=tuple(
+                    TopologyViewInput(label=label, flow_artifact=Path(flow_artifact))
+                    for label, flow_artifact in args.view
+                ),
+                output_dir=args.output,
+                config=TopologyConfig(
+                    pixel_sample_stride=int(args.pixel_stride),
+                    pixel_candidate_count=int(args.candidate_count),
+                    pixel_preselect_count=int(args.preselect_count),
+                    foreground_alpha_minimum=float(args.alpha_min),
+                    minimum_contribution=float(args.min_contribution),
+                    mask_erosion_iterations=int(args.mask_erode_iters),
+                ),
+                command=[parser.prog, *arguments],
+            )
+            print(f"observation topology: {artifact.path.resolve()}")
+            print(f"identity: {artifact.manifest['topology_identity']}")
             return 0
         parser.error("unsupported command")
     except (

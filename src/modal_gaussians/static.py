@@ -485,7 +485,9 @@ def _prepare_windows_extension_environment() -> None:
     for line in process.stdout.splitlines():
         if "=" in line:
             key, value = line.split("=", 1)
-            vc_environment[key.upper()] = value
+            normalized_key = key.upper()
+            if normalized_key not in vc_environment or key == normalized_key:
+                vc_environment[normalized_key] = value
     os.environ.update(vc_environment)
     if shutil.which("cl") is None:
         raise RuntimeError("Visual Studio environment did not expose cl.exe")
