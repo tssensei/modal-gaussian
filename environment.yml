@@ -1,0 +1,14 @@
+name: modal-gaussian
+
+channels:
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - nvidia::cuda-toolkit=12.8
+  - pip>=24
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.7.1+cu128
+      - -e .

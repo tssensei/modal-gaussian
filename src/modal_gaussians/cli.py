@@ -6,6 +6,10 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
+from modal_gaussians.colmap import (
+    ReferenceInput,
+    prepare_colmap,
+)
 from modal_gaussians.flow.pipeline import (
     SMOOTHING_METHODS,
     FlowAnalysisConfig,
@@ -14,6 +18,8 @@ from modal_gaussians.flow.pipeline import (
 
 
 def _positive_float(value: str) -> float:
+    """Parse one finite positive CLI float."""
+
     parsed = float(value)
     if not math.isfinite(parsed) or parsed <= 0.0:
         raise argparse.ArgumentTypeError("value must be finite and positive")
@@ -21,13 +27,35 @@ def _positive_float(value: str) -> float:
 
 
 def _non_negative_float(value: str) -> float:
+    """Parse one finite non-negative CLI float."""
+
     parsed = float(value)
     if not math.isfinite(parsed) or parsed < 0.0:
         raise argparse.ArgumentTypeError("value must be finite and non-negative")
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    """Parse one positive CLI integer."""
+
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    """Parse one non-negative CLI integer."""
+
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
+    """Build the unified flow, COLMAP, and static-3DGS command tree."""
+
     parser = argparse.ArgumentParser(prog="modal-gaussians")
     command_parsers = parser.add_subparsers(dest="command", required=True)
     flow_parser = command_parsers.add_parser(
@@ -66,35 +94,151 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Pre-gradient contrast blur sigma in pixels",
     )
+    colmap_parser = command_parsers.add_parser(
+        "colmap", help="Joint COLMAP preparation for static Gaussian training"
+    )
+    colmap_commands = colmap_parser.add_subparsers(
+        dest="colmap_subcommand", required=True
+    )
+    prepare = colmap_commands.add_parser(
+        "prepare",
+        help="Register sampled sweep frames and one reference per fixed view",
+    )
+    prepare.add_argument("--frames", required=True, type=Path)
+    prepare.add_argument("--frame-masks", required=True, type=Path)
+    prepare.add_argument(
+        "--reference",
+        required=True,
+        action="append",
+        nargs=3,
+        metavar=("LABEL", "IMAGE", "MASK"),
+        help="Reference label, RGB path, and mask path; repeat for more views",
+    )
+    prepare.add_argument("--sample-stride", required=True, type=_positive_int)
+    prepare.add_argument("--output", required=True, type=Path)
+    prepare.add_argument("--colmap-command", dest="colmap_executable", default="colmap")
+    static_parser = command_parsers.add_parser(
+        "static", help="Independent static foreground/background 3DGS"
+    )
+    static_commands = static_parser.add_subparsers(
+        dest="static_command", required=True
+    )
+    train = static_commands.add_parser(
+        "train", help="Train and export a pure-tensor static 3DGS bundle"
+    )
+    train.add_argument("--input", required=True, type=Path)
+    train.add_argument("--work-dir", required=True, type=Path)
+    train.add_argument("--output", required=True, type=Path)
+    train.add_argument("--epochs", type=_positive_int, default=100)
+    train.add_argument("--batch-size", type=_positive_int, default=8)
+    train.add_argument("--num-fg", type=_positive_int, default=40_000)
+    train.add_argument("--num-bg", type=_positive_int, default=100_000)
+    train.add_argument("--seed", type=_non_negative_int, default=42)
+    train.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume only when input and resolved training config identities match",
+    )
+    render = static_commands.add_parser(
+        "render", help="Render stored sweep/reference cameras for offline QA"
+    )
+    render.add_argument("--scene", required=True, type=Path)
+    render.add_argument("--output", required=True, type=Path)
+    render.add_argument(
+        "--role", choices=("all", "sweep", "reference"), default="all"
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Dispatch one CLI invocation and report user-facing validation errors."""
+
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)
-    if args.command != "flow" or args.flow_command != "analyze":
-        parser.error("unsupported command")
     try:
-        artifact = run_flow_analysis(
-            image_dir=args.images,
-            mask_dir=args.masks,
-            fps_hz=args.fps,
-            reference_frame_name=args.reference_frame,
-            output_dir=args.output,
-            config=FlowAnalysisConfig(
-                stabilize=bool(args.stabilize),
-                smoothing=str(args.smoothing),
-                sigma_b_px=float(args.sigma_b_px),
-                sigma_c_px=float(args.sigma_c_px),
-            ),
-            command=[parser.prog, *arguments],
-        )
-    except (FileExistsError, FileNotFoundError, OSError, ValueError) as error:
+        if args.command == "flow" and args.flow_command == "analyze":
+            artifact = run_flow_analysis(
+                image_dir=args.images,
+                mask_dir=args.masks,
+                fps_hz=args.fps,
+                reference_frame_name=args.reference_frame,
+                output_dir=args.output,
+                config=FlowAnalysisConfig(
+                    stabilize=bool(args.stabilize),
+                    smoothing=str(args.smoothing),
+                    sigma_b_px=float(args.sigma_b_px),
+                    sigma_c_px=float(args.sigma_c_px),
+                ),
+                command=[parser.prog, *arguments],
+            )
+            print(f"flow artifact: {artifact.path.resolve()}")
+            print(f"manifest: {(artifact.path / 'manifest.json').resolve()}")
+            return 0
+        if args.command == "colmap" and args.colmap_subcommand == "prepare":
+            output = prepare_colmap(
+                frames_dir=args.frames,
+                frame_masks_dir=args.frame_masks,
+                references=tuple(
+                    ReferenceInput(
+                        label=label,
+                        image_path=Path(image_path),
+                        mask_path=Path(mask_path),
+                    )
+                    for label, image_path, mask_path in args.reference
+                ),
+                sample_stride=int(args.sample_stride),
+                output_dir=args.output,
+                colmap_command=str(args.colmap_executable),
+            )
+            print(f"COLMAP output: {output.resolve()}")
+            print(f"cameras: {(output / 'cameras.json').resolve()}")
+            print(f"point cloud: {(output / 'point_cloud.ply').resolve()}")
+            return 0
+        if args.command == "static":
+            from modal_gaussians.static_training import (
+                StaticTrainConfig,
+                render_static_bundle,
+                run_static_training,
+            )
+        if args.command == "static" and args.static_command == "train":
+            output = run_static_training(
+                input_dir=args.input,
+                work_dir=args.work_dir,
+                output_dir=args.output,
+                config=StaticTrainConfig(
+                    epochs=int(args.epochs),
+                    batch_size=int(args.batch_size),
+                    num_foreground=int(args.num_fg),
+                    num_background=int(args.num_bg),
+                    seed=int(args.seed),
+                ),
+                resume=bool(args.resume),
+            )
+            print(f"static scene: {output.resolve()}")
+            print(f"manifest: {(output / 'manifest.json').resolve()}")
+            print(f"tensors: {(output / 'tensors.pt').resolve()}")
+            return 0
+        if args.command == "static" and args.static_command == "render":
+            output = render_static_bundle(
+                scene_dir=args.scene,
+                output_dir=args.output,
+                role=str(args.role),
+            )
+            print(f"static QA: {output.resolve()}")
+            print(f"metrics: {(output / 'metrics.json').resolve()}")
+            return 0
+        parser.error("unsupported command")
+    except (
+        FileExistsError,
+        FileNotFoundError,
+        FloatingPointError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as error:
         parser.error(str(error))
-    print(f"flow artifact: {artifact.path.resolve()}")
-    print(f"manifest: {(artifact.path / 'manifest.json').resolve()}")
-    return 0
+    return 2
 
 
 if __name__ == "__main__":

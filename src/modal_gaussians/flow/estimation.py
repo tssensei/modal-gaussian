@@ -1,12 +1,25 @@
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Sequence, TypedDict
 
 import cv2
 import numpy as np
 
 
-FARNEBACK_PARAMETERS = {
+
+class _FarnebackParameters(TypedDict):
+    """Describe the exact OpenCV Farneback keyword types."""
+
+    pyr_scale: float
+    levels: int
+    winsize: int
+    iterations: int
+    poly_n: int
+    poly_sigma: float
+    flags: int
+
+
+FARNEBACK_PARAMETERS: _FarnebackParameters = {
     "pyr_scale": 0.5,
     "levels": 4,
     "winsize": 15,
@@ -28,9 +41,11 @@ def compute_farneback_pair(
         raise ValueError("Farneback inputs contain NaN or Inf")
     reference = np.clip(reference_gray * 255.0, 0.0, 255.0).astype(np.uint8)
     current = np.clip(current_gray * 255.0, 0.0, 255.0).astype(np.uint8)
-    return cv2.calcOpticalFlowFarneback(
-        reference, current, None, **FARNEBACK_PARAMETERS
-    ).astype(np.float32, copy=False)
+    output = np.empty((*reference.shape, 2), dtype=np.float32)
+    estimated = cv2.calcOpticalFlowFarneback(
+        reference, current, output, **FARNEBACK_PARAMETERS
+    )
+    return np.asarray(estimated, dtype=np.float32)
 
 
 def compute_reference_to_frame_flow(

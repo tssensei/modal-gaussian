@@ -10,8 +10,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
+  "gsplat==1.5.3",
   "numpy>=1.26",
   "opencv-python-headless>=4.8",
+  "pytorch-msssim>=1.0",
+  "scipy>=1.11",
 ]
 
 [project.scripts]
