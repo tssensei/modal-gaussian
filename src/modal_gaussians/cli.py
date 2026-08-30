@@ -54,7 +54,7 @@ def _non_negative_int(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the unified flow, COLMAP, static-3DGS, and topology command tree."""
+    """Build the unified flow, static-scene, topology, and frequency commands."""
 
     parser = argparse.ArgumentParser(prog="modal-gaussians")
     command_parsers = parser.add_subparsers(dest="command", required=True)
@@ -176,6 +176,29 @@ def build_parser() -> argparse.ArgumentParser:
     topology_build.add_argument(
         "--mask-erode-iters", type=_non_negative_int, default=1
     )
+    frequency_parser = command_parsers.add_parser(
+        "frequency", help="Automatic shared modal-frequency selection"
+    )
+    frequency_commands = frequency_parser.add_subparsers(
+        dest="frequency_command", required=True
+    )
+    frequency_select = frequency_commands.add_parser(
+        "select", help="Greedily select the first K shared exact-DFT frequencies"
+    )
+    frequency_select.add_argument("--topology", required=True, type=Path)
+    frequency_select.add_argument(
+        "--view",
+        required=True,
+        action="append",
+        nargs=2,
+        metavar=("LABEL", "FLOW_ARTIFACT"),
+        help="Topology view label and matching flow artifact; repeat in view order",
+    )
+    frequency_select.add_argument("--min-hz", required=True, type=_positive_float)
+    frequency_select.add_argument("--max-hz", required=True, type=_positive_float)
+    frequency_select.add_argument("--step-hz", required=True, type=_positive_float)
+    frequency_select.add_argument("--count", required=True, type=_positive_int)
+    frequency_select.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -283,6 +306,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(f"observation topology: {artifact.path.resolve()}")
             print(f"identity: {artifact.manifest['topology_identity']}")
+            return 0
+        if args.command == "frequency" and args.frequency_command == "select":
+            from modal_gaussians.frequency import (
+                FrequencySelectionConfig,
+                FrequencyViewInput,
+                build_frequency_selection_artifact,
+            )
+
+            artifact = build_frequency_selection_artifact(
+                topology_dir=args.topology,
+                views=tuple(
+                    FrequencyViewInput(
+                        label=label, flow_artifact=Path(flow_artifact)
+                    )
+                    for label, flow_artifact in args.view
+                ),
+                output_dir=args.output,
+                config=FrequencySelectionConfig(
+                    minimum_hz=float(args.min_hz),
+                    maximum_hz=float(args.max_hz),
+                    step_hz=float(args.step_hz),
+                    count=int(args.count),
+                ),
+                command=[parser.prog, *arguments],
+            )
+            selected = artifact.arrays.selected_frequencies_hz
+            print(f"frequency selection: {artifact.path.resolve()}")
+            print("selected Hz: " + ", ".join(f"{value:.9g}" for value in selected))
+            print(f"identity: {artifact.manifest['frequency_selection_identity']}")
             return 0
         parser.error("unsupported command")
     except (

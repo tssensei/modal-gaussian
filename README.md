@@ -198,9 +198,43 @@ every contributor. The manifest binds the topology to the exact static-scene,
 foreground-Gaussian, reference-camera, and flow-artifact identities. All
 scientific thresholds are included in the topology identity.
 
+## Automatic greedy frequency selection
+
+Select one shared ordered prefix of `K` frequencies from an inclusive candidate
+grid. The `--view` entries must use the same labels and order as the topology:
+
+```powershell
+modal-gaussians frequency select `
+  --topology C:\outputs\observation_topology `
+  --view view1 C:\outputs\view1_flow `
+  --view view2 C:\outputs\view2_flow `
+  --min-hz 0.2 `
+  --max-hz 4.0 `
+  --step-hz 0.025 `
+  --count 20 `
+  --output C:\outputs\frequency_selection
+```
+
+For every view, selection samples raw reference-to-frame flow at the topology
+pixels, removes its temporal mean, applies the symmetric Hann window, and
+evaluates an exact DFT at every candidate frequency. One frequency is a paired
+real/imaginary group. At each step, greedy selection adds the candidate with
+the largest equal-view mean R2; ties select the lower frequency. The result is
+kept in greedy order rather than sorted by frequency.
+
+```text
+frequency_selection/
+├── manifest.json
+└── selection.npz
+```
+
+This stage intentionally has no manual peak picking, GUI, editable shortlist,
+regional plots, or 3D modal solve. The artifact is bound to the exact topology
+and per-view flow identities.
+
 ## Migrated pipeline boundary
 
-The migrated core currently reaches the reusable observation topology:
+The migrated core currently reaches automatic shared-frequency selection:
 
 1. discover zero-padded image names in lexicographic order and validate matching
    masks, FPS, and the reference frame;
@@ -213,12 +247,11 @@ The migrated core currently reaches the reusable observation topology:
    compute its temporal real FFT;
 7. train and accept a static foreground/background 3DGS;
 8. map fixed-view flow pixels to foreground Gaussian contributors and projection
-   Jacobians.
+   Jacobians;
+9. greedily select the requested first K shared exact-DFT frequencies by
+   equal-view macro R2.
 
-The output is one non-overwriting directory containing raw flow, per-frame valid
-masks, the union analysis mask, frame times, the RGB reference frame, complex
-per-pixel spectra, the frequency axis, a global amplitude summary, and a
-structurally validated `manifest.json`. When stabilization is enabled, the
-derived PNG sequence, homographies, settings, and diagnostics are stored
-alongside the analysis. The manifest records source directories and active
-scientific settings but does not compute content identities or file hashes.
+Every stage writes a separate non-overwriting artifact. Frequency selection
+uses the topology pixels and raw flow arrays directly; the cached rFFT remains
+the earlier dense per-pixel spectrum product and does not constrain the exact
+candidate grid.

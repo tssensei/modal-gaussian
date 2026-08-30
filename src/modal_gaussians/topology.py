@@ -182,7 +182,7 @@ def _arrays_identity(arrays: Mapping[str, np.ndarray]) -> str:
     return digest.hexdigest()
 
 
-def _flow_artifact_identity(artifact: FlowAnalysisArtifact) -> str:
+def flow_artifact_identity(artifact: FlowAnalysisArtifact) -> str:
     """Bind topology views to exact flow, mask, spectrum, and settings content."""
 
     manifest = artifact.manifest
@@ -808,7 +808,7 @@ def build_observation_topology_artifact(
             )
             alpha = rendered["alpha"].detach().cpu().numpy().astype(np.float32)
             camera_record = camera.to_manifest_record()
-            flow_identity = _flow_artifact_identity(flow_artifact)
+            flow_identity = flow_artifact_identity(flow_artifact)
             cameras.append(camera)
             masks.append(mask)
             rendered_depths.append(depth)
@@ -881,5 +881,6 @@ __all__ = [
     "TopologyViewInput",
     "build_observation_topology_artifact",
     "build_topology_arrays",
+    "flow_artifact_identity",
     "load_observation_topology",
 ]
