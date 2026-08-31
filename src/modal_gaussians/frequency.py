@@ -15,15 +15,16 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from modal_gaussians.numpy_io import save_named_arrays
+
 from modal_gaussians import __version__
 from modal_gaussians.flow.artifact import (
     FlowAnalysisArtifact,
+    flow_artifact_identity,
     load_flow_analysis_artifact,
 )
-from modal_gaussians.topology import (
-    flow_artifact_identity,
-    load_observation_topology,
-)
+from modal_gaussians.flow.spectrum import exact_dft_basis
+from modal_gaussians.topology import load_observation_topology
 
 
 FREQUENCY_FORMAT = "modal_gaussians.frequency_selection"
@@ -206,22 +207,6 @@ def _arrays_identity(arrays: Mapping[str, np.ndarray]) -> str:
     return digest.hexdigest()
 
 
-def _temporal_basis(
-    frame_count: int, fps_hz: float, frequencies_hz: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Construct the exact negative-exponent DFT basis and symmetric Hann window."""
-
-    times = np.arange(frame_count, dtype=np.float64) / float(fps_hz)
-    basis = np.exp(
-        (-2j * np.pi) * frequencies_hz[:, None] * times[None, :]
-    ).astype(np.complex64, copy=False)
-    indices = np.arange(frame_count, dtype=np.float64)
-    window = (
-        0.5 - 0.5 * np.cos(2.0 * np.pi * indices / max(1, frame_count - 1))
-    ).astype(np.float32)
-    return basis, window
-
-
 def _accumulate_view_statistics(
     label: str,
     artifact: FlowAnalysisArtifact,
@@ -233,7 +218,7 @@ def _accumulate_view_statistics(
     flow = artifact.arrays.flow
     frame_count = flow.shape[0]
     reference_index = int(artifact.manifest["reference_frame_index"])
-    basis, window = _temporal_basis(
+    basis, window = exact_dft_basis(
         frame_count, float(artifact.manifest["fps_hz"]), frequencies_hz
     )
     column_count = 2 * len(frequencies_hz)
@@ -565,7 +550,7 @@ def _publish_selection(
     try:
         values = arrays.as_dict()
         arrays_path = temporary / ARRAY_FILENAME
-        np.savez_compressed(arrays_path, **values)
+        save_named_arrays(arrays_path, values)
         arrays_identity = _arrays_identity(values)
         manifest["arrays"] = {
             name: {"dtype": value.dtype.name, "shape": list(value.shape)}

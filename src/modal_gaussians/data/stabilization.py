@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -260,7 +260,11 @@ def _track_reference_points(
         ),
     }
     forward, forward_status, _ = cv2.calcOpticalFlowPyrLK(
-        reference_u8, current_u8, reference_points, None, **lk_parameters
+        reference_u8,
+        current_u8,
+        reference_points,
+        cast(Any, None),
+        **lk_parameters,
     )
     count = len(reference_points)
     if forward is None or forward_status is None:
@@ -270,7 +274,11 @@ def _track_reference_points(
             np.full(count, np.inf, dtype=np.float32),
         )
     backward, backward_status, _ = cv2.calcOpticalFlowPyrLK(
-        current_u8, reference_u8, forward, None, **lk_parameters
+        current_u8,
+        reference_u8,
+        forward,
+        cast(Any, None),
+        **lk_parameters,
     )
     if backward is None or backward_status is None:
         return (

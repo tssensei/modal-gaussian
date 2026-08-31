@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -48,6 +49,43 @@ class FlowAnalysisArtifact:
     path: Path
     manifest: dict[str, Any]
     arrays: FlowAnalysisArrays
+
+
+def _sha256_file(path: Path) -> str:
+    """Hash one artifact file without loading it entirely into memory."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def flow_artifact_identity(artifact: FlowAnalysisArtifact) -> str:
+    """Bind consumers to exact flow, mask, spectrum, and analysis settings."""
+
+    manifest = artifact.manifest
+    scientific_manifest = {
+        "format": manifest["format"],
+        "version": manifest["version"],
+        "parameters": manifest["parameters"],
+        "frame_names": manifest["frame_names"],
+        "fps_hz": manifest["fps_hz"],
+        "reference_frame_name": manifest["reference_frame_name"],
+        "reference_frame_index": manifest["reference_frame_index"],
+    }
+    encoded = json.dumps(
+        scientific_manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded)
+    for name in ARRAY_FILES:
+        filename = str(manifest["arrays"][name]["file"])
+        digest.update(name.encode("utf-8"))
+        digest.update(_sha256_file(artifact.path / filename).encode("ascii"))
+    return digest.hexdigest()
 
 
 def _load_manifest(path: Path) -> dict[str, Any]:

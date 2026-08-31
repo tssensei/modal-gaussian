@@ -379,6 +379,132 @@ class ForegroundBackgroundScene(nn.Module):
         rendered, _ = self.render_batch([camera], composition=composition)
         return {name: rendered[name][0] for name in outputs}
 
+    def render_deformed(
+        self,
+        camera: Camera,
+        foreground_means: Tensor,
+        *,
+        foreground_colors: Tensor | None = None,
+        include_background: bool = True,
+    ) -> dict[str, Tensor]:
+        """Render deformed foreground and static background with one depth order.
+
+        The modal viewer supplies only foreground means and, optionally, display
+        colors.  Every other Gaussian parameter remains the trained static value.
+        Foreground and background are concatenated before rasterization so their
+        occlusion is identical to the public static ``composition="all"`` path.
+        """
+
+        foreground = self.foreground.active()
+        background = self.background.active()
+        device = foreground["means"].device
+        means = foreground_means.to(
+            device=device, dtype=foreground["means"].dtype
+        ).contiguous()
+        if means.shape != foreground["means"].shape:
+            raise ValueError("foreground_means must have shape [G_foreground,3]")
+        if not bool(torch.isfinite(means).all().item()):
+            raise ValueError("foreground_means contain non-finite values")
+        if foreground_colors is None:
+            colors = foreground["colors"]
+        else:
+            colors = foreground_colors.to(
+                device=device, dtype=foreground["colors"].dtype
+            ).contiguous()
+            if colors.shape != foreground["colors"].shape:
+                raise ValueError("foreground_colors must have shape [G_foreground,3]")
+            if not bool(torch.isfinite(colors).all().item()):
+                raise ValueError("foreground_colors contain non-finite values")
+            colors = colors.clamp(0.0, 1.0)
+
+        active = {
+            "means": means,
+            "quaternions": foreground["quaternions"],
+            "scales": foreground["scales"],
+            "colors": colors,
+            "opacities": foreground["opacities"],
+        }
+        if include_background:
+            combined: dict[str, Tensor] = {}
+            for name, value in active.items():
+                background_value = background[name]
+                if name == "colors" and foreground_colors is not None:
+                    background_value = torch.full_like(background_value, 0.5)
+                combined[name] = torch.cat(
+                    [value, background_value], dim=0
+                ).contiguous()
+            active = combined
+
+        rasterization = _load_gsplat_rasterization()
+        rendered, alphas, _ = rasterization(
+            means=active["means"],
+            quats=active["quaternions"],
+            scales=active["scales"],
+            opacities=active["opacities"],
+            colors=active["colors"],
+            viewmats=camera.world_to_camera.to(device)[None],
+            Ks=camera.K.to(device)[None],
+            width=camera.width,
+            height=camera.height,
+            packed=False,
+            backgrounds=torch.ones((1, 3), device=device),
+            render_mode="RGB+ED",
+            rasterize_mode="classic",
+            camera_model="pinhole",
+        )
+        alpha = alphas[0, ..., 0]
+        depth = torch.where(
+            alpha > 1.0e-8,
+            rendered[0, ..., 3],
+            torch.zeros_like(rendered[0, ..., 3]),
+        )
+        return {"rgb": rendered[0, ..., :3], "alpha": alpha, "expected_depth": depth}
+
+    def render_features(
+        self,
+        camera: Camera,
+        features: Tensor,
+        *,
+        composition: Composition = "foreground",
+    ) -> tuple[Tensor, Tensor]:
+        """Rasterize arbitrary per-Gaussian features with a zero background."""
+
+        active = self._active_for(composition)
+        if features.ndim != 2 or features.shape[0] != active["means"].shape[0]:
+            raise ValueError(
+                "features must have shape [selected_gaussians, feature_channels]"
+            )
+        if features.shape[1] < 1:
+            raise ValueError("features must contain at least one channel")
+        device = active["means"].device
+        values = features.to(device=device, dtype=active["means"].dtype).contiguous()
+        if not bool(torch.isfinite(values).all().item()):
+            raise ValueError("features contain non-finite values")
+        rasterization = _load_gsplat_rasterization()
+        rendered, alphas, _ = rasterization(
+            means=active["means"],
+            quats=active["quaternions"],
+            scales=active["scales"],
+            opacities=active["opacities"],
+            colors=values,
+            viewmats=camera.world_to_camera.to(device)[None],
+            Ks=camera.K.to(device)[None],
+            width=camera.width,
+            height=camera.height,
+            packed=False,
+            backgrounds=torch.zeros((1, values.shape[1]), device=device),
+            render_mode="RGB",
+            rasterize_mode="classic",
+            camera_model="pinhole",
+        )
+        image = rendered[0]
+        alpha = alphas[0, ..., 0]
+        if image.shape != (camera.height, camera.width, values.shape[1]):
+            raise RuntimeError("gsplat returned an unexpected feature-image shape")
+        if alpha.shape != (camera.height, camera.width):
+            raise RuntimeError("gsplat returned an unexpected feature-alpha shape")
+        return image, alpha
+
     def tensor_dictionary(self) -> dict[str, Tensor]:
         """Export the class-free tensor dictionary used by the public bundle."""
 

@@ -20,9 +20,10 @@ import torch
 
 from modal_gaussians import __version__
 from modal_gaussians.flow.artifact import (
-    FlowAnalysisArtifact,
+    flow_artifact_identity,
     load_flow_analysis_artifact,
 )
+from modal_gaussians.numpy_io import save_named_arrays
 from modal_gaussians.static import (
     Camera,
     cameras_from_scene_manifest,
@@ -179,27 +180,6 @@ def _arrays_identity(arrays: Mapping[str, np.ndarray]) -> str:
     for name in ARRAY_DTYPES:
         digest.update(name.encode("utf-8"))
         digest.update(_sha256_array(arrays[name]).encode("ascii"))
-    return digest.hexdigest()
-
-
-def flow_artifact_identity(artifact: FlowAnalysisArtifact) -> str:
-    """Bind topology views to exact flow, mask, spectrum, and settings content."""
-
-    manifest = artifact.manifest
-    scientific_manifest = {
-        "format": manifest["format"],
-        "version": manifest["version"],
-        "parameters": manifest["parameters"],
-        "frame_names": manifest["frame_names"],
-        "fps_hz": manifest["fps_hz"],
-        "reference_frame_name": manifest["reference_frame_name"],
-        "reference_frame_index": manifest["reference_frame_index"],
-    }
-    digest = hashlib.sha256(_canonical_json(scientific_manifest))
-    for name in ("flow", "mask_union", "spectrum"):
-        filename = str(manifest["arrays"][name]["file"])
-        digest.update(name.encode("utf-8"))
-        digest.update(_sha256_file(artifact.path / filename).encode("ascii"))
     return digest.hexdigest()
 
 
@@ -718,7 +698,7 @@ def _publish_topology(
     try:
         values = arrays.as_dict()
         arrays_path = temporary / ARRAY_FILENAME
-        np.savez_compressed(arrays_path, **values)
+        save_named_arrays(arrays_path, values)
         arrays_identity = _arrays_identity(values)
         manifest["arrays"] = {
             name: {"dtype": value.dtype.name, "shape": list(value.shape)}
@@ -881,6 +861,5 @@ __all__ = [
     "TopologyViewInput",
     "build_observation_topology_artifact",
     "build_topology_arrays",
-    "flow_artifact_identity",
     "load_observation_topology",
 ]

@@ -275,8 +275,13 @@ def _parse_images_txt(path: Path) -> dict[str, _RegisteredImage]:
             images[name] = _RegisteredImage(
                 image_id=int(values[0]),
                 camera_id=int(values[8]),
-                qvec_wxyz=tuple(float(value) for value in values[1:5]),
-                tvec=tuple(float(value) for value in values[5:8]),
+                qvec_wxyz=(
+                    float(values[1]),
+                    float(values[2]),
+                    float(values[3]),
+                    float(values[4]),
+                ),
+                tvec=(float(values[5]), float(values[6]), float(values[7])),
             )
             if not stream.readline():
                 raise ValueError(f"Missing points2D line after COLMAP image {name}")
