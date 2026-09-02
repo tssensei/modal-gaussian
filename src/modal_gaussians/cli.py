@@ -58,6 +58,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(prog="modal-gaussians")
     command_parsers = parser.add_subparsers(dest="command", required=True)
+    prepare_parser = command_parsers.add_parser("prepare", help="Optional video/SAM/XMem preparation")
+    prepare_commands = prepare_parser.add_subparsers(dest="prepare_command", required=True)
+    mask_gui = prepare_commands.add_parser("gui", help="Local interactive frame/mask preparation")
+    mask_gui.add_argument("--root-dir", required=True, type=Path)
+    mask_gui.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/masking"))
+    mask_gui.add_argument("--port", type=_positive_int, default=8890)
+    mask_gui.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     flow_parser = command_parsers.add_parser(
         "flow", help="Dense 2D image-plane motion analysis"
     )
@@ -395,6 +402,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(arguments)
     try:
+        if args.command == "prepare" and args.prepare_command == "gui":
+            try:
+                from modal_gaussians.mask_gui import run_mask_gui
+            except ImportError as error:
+                raise RuntimeError("Mask preparation requires the optional [mask] dependencies; see README") from error
+            run_mask_gui(root_dir=args.root_dir, checkpoint_dir=args.checkpoint_dir,
+                         port=args.port, device=args.device)
+            return 0
         if args.command == "flow" and args.flow_command == "analyze":
             artifact = run_flow_analysis(
                 image_dir=args.images,

@@ -22,8 +22,23 @@ dependencies = [
 [project.scripts]
 modal-gaussians = "modal_gaussians.cli:main"
 
+[project.optional-dependencies]
+mask = [
+  "gradio==6.21.0",
+  "torchvision==0.22.1+cu128",
+  "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git@dca509fe793f601edb92606367a655c15ac00fdf",
+]
+
+[tool.setuptools.package-data]
+"modal_gaussians._vendor.xmem" = ["LICENSE*", "NOTICE.md"]
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pyright]
+# Keep the untyped third-party inference snapshot unchanged. Our wrappers and
+# the complete pipeline are still checked; only vendored diagnostics are ignored.
+ignore = ["src/modal_gaussians/_vendor"]

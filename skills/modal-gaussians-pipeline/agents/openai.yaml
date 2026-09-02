@@ -1,0 +1,4 @@
+interface:
+  display_name: "Modal Gaussians Pipeline"
+  short_description: "Run and debug the pipeline to a Viser-ready result"
+  default_prompt: "Use $modal-gaussians-pipeline to run and debug my prepared dataset stage by stage until all artifacts needed by Viser are validated; stop without launching Viser and give me its launch command."

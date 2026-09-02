@@ -1,0 +1,59 @@
+{
+  "repo": null,
+  "python": null,
+  "colmap_executable": null,
+  "run_root": null,
+  "execution": {
+    "host": "local",
+    "gpu_allocation": null,
+    "resource_limits": null,
+    "scientific_overrides": []
+  },
+  "sweep": {
+    "images": null,
+    "masks": null,
+    "sample_stride": null
+  },
+  "views": [
+    {
+      "label": "view1",
+      "images": null,
+      "masks": null,
+      "fps": null,
+      "reference_frame": null,
+      "stabilize": false,
+      "smoothing": "none",
+      "sigma_b_px": 3.0,
+      "sigma_c_px": 0.0
+    },
+    {
+      "label": "view2",
+      "images": null,
+      "masks": null,
+      "fps": null,
+      "reference_frame": null,
+      "stabilize": false,
+      "smoothing": "none",
+      "sigma_b_px": 3.0,
+      "sigma_c_px": 0.0
+    }
+  ],
+  "frequency": {
+    "min_hz": null,
+    "max_hz": null,
+    "step_hz": null,
+    "count": null
+  },
+  "static": {
+    "epochs": 100,
+    "batch_size": 8,
+    "num_fg": 40000,
+    "num_bg": 100000,
+    "seed": 42
+  },
+  "viewer": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "resolution": 1024
+  }
+}

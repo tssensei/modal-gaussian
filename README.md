@@ -27,6 +27,117 @@ loader discovers Conda's Ninja and Visual Studio 2022 C++ Build Tools, and
 translates the two GCC-only flags emitted by gsplat 1.5.3. Linux cluster runs do
 not use this compatibility path.
 
+## Optional video and mask preparation
+
+The local preparation app preserves SAM ViT-H prompting and XMem-s012
+forward/backward tracking. It is independent of Shape-of-Motion and does not
+change the analysis pipeline: analysis still starts from prepared PNGs/masks.
+No mask dependencies are imported by the other commands.
+
+Install the optional tools in the **same** Conda environment. First inspect the
+installation plans; do not replace the existing PyTorch/CUDA/gsplat versions:
+
+```powershell
+conda activate modal-gaussian
+conda install -c conda-forge ffmpeg --freeze-installed --dry-run
+python -m pip install --dry-run --extra-index-url https://download.pytorch.org/whl/cu128 -e ".[mask]"
+
+conda install -c conda-forge ffmpeg --freeze-installed
+python -m pip install --extra-index-url https://download.pytorch.org/whl/cu128 -e ".[mask]"
+python -m pip check
+```
+
+The extra pins Gradio 6.21.0, torchvision 0.22.1+cu128 (matching
+PyTorch 2.7.1+cu128), and official SAM at commit
+`dca509fe793f601edb92606367a655c15ac00fdf`. FFmpeg supplies both `ffmpeg`
+and `ffprobe`. No second Conda environment is needed. The vendored XMem
+inference code and third-party notices are under `src/modal_gaussians/_vendor/xmem`.
+
+Place these two official model downloads directly in `checkpoints/masking/`:
+
+- [sam_vit_h_4b8939.pth](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth)
+- [XMem-s012.pth](https://github.com/hkchengrex/XMem/releases/download/v1.0/XMem-s012.pth)
+
+The app checks both files before launch, records their SHA-256 in sequence
+metadata, and never downloads weights during a tracking job. XMem loads the
+complete checkpoint strictly, without extra pretrained-ResNet downloads.
+
+From the repository root, launch:
+
+```powershell
+modal-gaussians prepare gui `
+  --root-dir data/prepared `
+  --checkpoint-dir checkpoints/masking `
+  --port 8890
+```
+
+Open `http://127.0.0.1:8890` locally. The server is loopback-only, with sharing
+and Gradio usage analytics disabled; no video upload is needed. CUDA is the default;
+`--device cpu` is an explicit, slower alternative. This is a single-editor app:
+do not edit the same prompt in multiple browser tabs.
+
+1. **Extract video (optional):** enter a local MOV/MP4 path (for example
+   `C:\Users\zitengsong\Documents\school\research\modal-gaussian\data\corn1.mov`),
+   a sequence name such as `corn1`, and the desired output FPS. FPS is required;
+   choose it for your experiment, not a guessed default. Blank end uses the
+   rest of the video; blank height preserves resolution. FFmpeg honors rotation
+   metadata, preserves aspect ratio when resizing, and performs no crop.
+2. **Load sequence:** enter the sequence name; leave the image path blank to
+   use `root/images/name`, or enter an external PNG directory to use it in place.
+   Extracted sequences recover FPS from metadata; external sequences need their
+   actual FPS. A read-only line shows exactly which input and mask output are
+   currently bound. Editing the input fields takes effect only after Load.
+3. Select a clear prompting frame and click **Get SAM features**. Use positive
+   foreground and negative background clicks. **Add foreground / start another**
+   unions the current object with previous foregrounds; **Clear current points**
+   discards only the current object; **Clear all masks** starts over. Changing
+   the frame or loaded sequence clears all prompts and features.
+4. Click **Track / replace masks**. XMem tracks every frame forward/backward
+   from the prompt, saving masks incrementally into a temporary directory.
+   SAM VRAM is released before tracking; XMem memory resets between directions.
+   Cancel takes effect between frames. There is no whole-video preview or
+   extra Save Masks step; the output is published after complete validation.
+
+The SAM prompting frame is **not** implicitly the later optical-flow reference.
+Choose that reference separately when running `flow analyze`.
+
+```text
+data/prepared/
+├── images/<sequence>/00001.png, 00002.png, ...
+├── masks/<sequence>/00001.png, 00002.png, ...
+└── metadata/<sequence>.json
+```
+
+Inputs and masks must contain at least three equal-sized, lexicographically
+ordered PNGs with matching names. Masks are single-channel uint8, background
+0 / foreground 255. Metadata (kept outside PNG directories) records source,
+clip interval, output FPS, size/count, paths, prompting frame and model hashes.
+External image directories are neither copied nor modified.
+
+**Overwrite rules:** same-name preparation reruns need no renaming or overwrite
+flag. The app replaces whole directories so shorter reruns leave no stale
+frames. Successful re-extraction **deletes that sequence's old masks** and marks
+masks pending; retracking replaces masks only. Other sequences, original videos,
+external images and model weights are never removed. Generation/cancellation or
+a caught publication failure preserves the previously published result. During
+publication, same-filesystem renames and temporary rollback copies are used
+(multi-directory replacement is not a single atomic operation on Windows).
+Do not read the same outputs in another pipeline while replacing them.
+
+If the OS/process is killed during publication, `.prepare.lock` and a
+`.prepare-*` directory can remain. Inspect `publication.json` and `previous-*`
+rollback copies before recovery; do not blindly delete these directories. There
+is no automatic mid-track checkpoint/resume. Normal successful or cancelled
+operations clean their temporary files and do not keep historical backups.
+
+Overwriting inputs referenced by an old experiment may invalidate identities or
+change its reference-image visualization. Archive those inputs yourself if an
+old experiment must remain reproducible. The core flow/COLMAP/modal artifacts
+retain their existing non-overwrite rules. `data/`, `checkpoints/` and `outputs/`
+are Git-ignored; original raw videos stay where you placed them. Type checking
+covers the project and mask wrappers; the untyped third-party XMem snapshot is
+explicitly excluded from diagnostics to preserve its inference implementation.
+
 ## Current command
 
 ```powershell
