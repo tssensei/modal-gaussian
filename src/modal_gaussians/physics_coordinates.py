@@ -15,10 +15,12 @@ import time
 from typing import Any, Mapping, Sequence, cast
 
 import numpy as np
+from modal_gaussians.progress import Progress
 from scipy import sparse
 from scipy.sparse.linalg import LinearOperator, onenormest, splu
 
 from modal_gaussians import __version__
+from modal_gaussians.flow.storage import DenseArray, read_pixels
 from modal_gaussians.direct_coordinates import (
     DirectModalCoordinatesArtifact,
     load_direct_modal_coordinates,
@@ -708,7 +710,7 @@ def solve_physics_coordinate_mode(
 
 
 def _flow_matrix(
-    flow: np.ndarray,
+    flow: DenseArray,
     pixels: np.ndarray,
     start: int,
     end: int,
@@ -716,9 +718,8 @@ def _flow_matrix(
 ) -> np.ndarray:
     """Sample one block of reference-relative flow as `[2P,B]`."""
 
-    x, y = pixels[:, 0], pixels[:, 1]
-    values = np.asarray(flow[start:end][:, y, x, :], dtype=np.float64)
-    reference = np.asarray(flow[reference_index, y, x, :], dtype=np.float64)
+    values = read_pixels(flow, slice(start, end), pixels).astype(np.float64)
+    reference = read_pixels(flow, reference_index, pixels).astype(np.float64)
     values -= reference[None]
     if not np.isfinite(values).all():
         raise ValueError("Flow contains NaN or Inf at rendered-design pixels")
@@ -729,7 +730,7 @@ def _evaluate_coordinate_sets_view(
     *,
     design: np.ndarray,
     pixels_xy: np.ndarray,
-    flow: np.ndarray,
+    flow: DenseArray,
     reference_frame_index: int,
     coordinate_sets: Mapping[str, np.ndarray],
     frame_chunk_size: int,
@@ -738,7 +739,7 @@ def _evaluate_coordinate_sets_view(
 
     design_value = np.asarray(design)
     pixels = np.asarray(pixels_xy, dtype=np.int64)
-    flow_value = np.asarray(flow)
+    flow_value = flow
     if design_value.ndim != 3 or design_value.shape[1] != 2:
         raise ValueError("Physics flow evaluation design must be [P,2,2K]")
     sample_count, _, column_count = design_value.shape
@@ -956,6 +957,7 @@ def build_physics_modal_coordinates_artifact(
         diagnostics[name] = np.empty(view_count, dtype=np.float64)
 
     solve_start = time.perf_counter()
+    progress = Progress("physics coordinate fit", view_count * mode_count, unit="view-modes")
     for view_index, view in enumerate(views):
         lower = int(view["frame_offset"])
         upper = lower + int(view["frame_count"])
@@ -988,6 +990,10 @@ def build_physics_modal_coordinates_artifact(
             diagnostics["output_dominant_signed_frequency_hz"][view_index, mode_slot] = output_dominant
             diagnostics["input_assigned_frequency_energy_ratio"][view_index, mode_slot] = input_ratio
             diagnostics["output_assigned_frequency_energy_ratio"][view_index, mode_slot] = output_ratio
+            progress.update(
+                view_index * mode_count + mode_slot + 1,
+                f"view={view['label']} mode_slot={mode_slot} hz={frequency:.6g}",
+            )
         if settings.forcing_weight > 0.0 or settings.forcing_difference_weight > 0.0:
             view_output -= np.mean(view_output, axis=0, keepdims=True)
         if not np.isfinite(view_output).all():

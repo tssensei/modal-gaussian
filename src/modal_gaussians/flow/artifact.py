@@ -13,16 +13,20 @@ from typing import Any, Callable, Mapping
 import numpy as np
 
 from modal_gaussians import __version__
+from modal_gaussians.flow.storage import (
+    DenseArray, copy_array, create_array, open_array, storage_sha256, validate_finite,
+)
 
 
 ARTIFACT_FORMAT = "modal_gaussians.flow_analysis"
-ARTIFACT_VERSION = 6
+ARTIFACT_VERSION = 7
 
 ARRAY_FILES = {
-    "flow": "flow.npy",
+    "flow": "flow.zarr",
     "mask_union": "mask_union.npy",
-    "spectrum": "spectrum.npy",
+    "spectrum": "spectrum.zarr",
 }
+LEGACY_ARRAY_FILES = {**ARRAY_FILES, "flow": "flow.npy", "spectrum": "spectrum.npy"}
 
 ARRAY_DTYPES = {
     "flow": np.dtype(np.float32),
@@ -33,13 +37,14 @@ ARRAY_DTYPES = {
 
 @dataclass(frozen=True)
 class FlowAnalysisArrays:
-    flow: np.ndarray
+    flow: DenseArray
     mask_union: np.ndarray
-    spectrum: np.ndarray
+    spectrum: DenseArray
 
-    def as_dict(self) -> dict[str, np.ndarray]:
+    def as_dict(self) -> dict[str, DenseArray]:
+        """Expose lazy arrays without materializing their full contents."""
         return {
-            name: np.asarray(getattr(self, name), dtype=ARRAY_DTYPES[name])
+            name: getattr(self, name)
             for name in ARRAY_FILES
         }
 
@@ -49,16 +54,6 @@ class FlowAnalysisArtifact:
     path: Path
     manifest: dict[str, Any]
     arrays: FlowAnalysisArrays
-
-
-def _sha256_file(path: Path) -> str:
-    """Hash one artifact file without loading it entirely into memory."""
-
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def flow_artifact_identity(artifact: FlowAnalysisArtifact) -> str:
@@ -84,7 +79,7 @@ def flow_artifact_identity(artifact: FlowAnalysisArtifact) -> str:
     for name in ARRAY_FILES:
         filename = str(manifest["arrays"][name]["file"])
         digest.update(name.encode("utf-8"))
-        digest.update(_sha256_file(artifact.path / filename).encode("ascii"))
+        digest.update(storage_sha256(artifact.path / filename).encode("ascii"))
     return digest.hexdigest()
 
 
@@ -102,7 +97,7 @@ def _load_manifest(path: Path) -> dict[str, Any]:
 def _validate_manifest(manifest: Mapping[str, Any]) -> None:
     if manifest.get("format") != ARTIFACT_FORMAT:
         raise ValueError(f"Unsupported flow artifact format: {manifest.get('format')!r}")
-    if manifest.get("version") != ARTIFACT_VERSION:
+    if manifest.get("version") not in (6, ARTIFACT_VERSION):
         raise ValueError(f"Unsupported flow artifact version: {manifest.get('version')!r}")
     inputs = manifest.get("inputs")
     parameters = manifest.get("parameters")
@@ -135,7 +130,8 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
     arrays = manifest.get("arrays")
     if not isinstance(arrays, dict) or set(arrays) != set(ARRAY_FILES):
         raise ValueError("Flow artifact array inventory is incomplete")
-    for name, filename in ARRAY_FILES.items():
+    files = LEGACY_ARRAY_FILES if manifest["version"] == 6 else ARRAY_FILES
+    for name, filename in files.items():
         record = arrays[name]
         if not isinstance(record, dict):
             raise ValueError(f"Flow artifact arrays.{name} must be an object")
@@ -145,6 +141,13 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
             raise ValueError(f"Flow artifact arrays.{name}.dtype is invalid")
         if not isinstance(record.get("shape"), list):
             raise ValueError(f"Flow artifact arrays.{name}.shape is invalid")
+        if manifest["version"] == ARTIFACT_VERSION:
+            expected_storage = "npy" if name == "mask_union" else "zarr_v3_zstd"
+            if record.get("storage") != expected_storage:
+                raise ValueError(f"Flow artifact arrays.{name}.storage is invalid")
+            checksum = record.get("sha256")
+            if not isinstance(checksum, str) or len(checksum) != 64:
+                raise ValueError(f"Flow artifact arrays.{name}.sha256 is invalid")
     stabilization = parameters.get("stabilization")
     if not isinstance(stabilization, dict) or not isinstance(
         stabilization.get("method"), str
@@ -162,7 +165,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
 
 
 def _validate_arrays(
-    arrays: Mapping[str, np.ndarray], manifest: Mapping[str, Any]
+    arrays: Mapping[str, DenseArray], manifest: Mapping[str, Any]
 ) -> None:
     for name in ARRAY_FILES:
         array = arrays[name]
@@ -174,19 +177,20 @@ def _validate_arrays(
             raise ValueError(f"Flow artifact {name} shape does not match manifest")
 
     flow = arrays["flow"]
-    mask_union = arrays["mask_union"]
+    mask_union = np.asarray(arrays["mask_union"])
     spectrum = arrays["spectrum"]
     if flow.ndim != 4 or flow.shape[-1] != 2:
         raise ValueError("Flow artifact flow must be [T,H,W,2]")
     frame_count, height, width, _ = flow.shape
+    if frame_count != len(manifest["frame_names"]) or height < 1 or width < 1:
+        raise ValueError("Flow artifact frame count or image dimensions are invalid")
     frequency_count = frame_count // 2 + 1
     if mask_union.shape != (height, width) or not np.any(mask_union):
         raise ValueError("Flow artifact mask_union is invalid or empty")
     if spectrum.shape != (frequency_count, height, width, 2):
         raise ValueError("Flow artifact spectrum shape is invalid")
     for name in ("flow", "spectrum"):
-        if not np.isfinite(arrays[name]).all():
-            raise ValueError(f"Flow artifact {name} contains NaN or Inf")
+        validate_finite(arrays[name], f"Flow artifact {name}")
     reference_index = int(manifest["reference_frame_index"])
     if not np.array_equal(flow[reference_index], np.zeros_like(flow[reference_index])):
         raise ValueError("Flow artifact reference-to-reference flow is not exactly zero")
@@ -195,7 +199,7 @@ def _validate_arrays(
 def _validate_stabilized_sequence(
     root: Path,
     manifest: Mapping[str, Any],
-    arrays: Mapping[str, np.ndarray],
+    arrays: Mapping[str, DenseArray],
 ) -> None:
     record = manifest.get("stabilized_sequence")
     if record is None:
@@ -277,14 +281,27 @@ def load_flow_analysis_artifact(path: str | Path) -> FlowAnalysisArtifact:
         raise FileNotFoundError(f"Flow artifact directory does not exist: {root}")
     manifest = _load_manifest(root)
     _validate_manifest(manifest)
-    loaded: dict[str, np.ndarray] = {}
-    for name, filename in ARRAY_FILES.items():
+    loaded: dict[str, Any] = {}
+    files = LEGACY_ARRAY_FILES if manifest["version"] == 6 else ARRAY_FILES
+    for name, filename in files.items():
         array_path = root / filename
-        if not array_path.is_file():
+        if not array_path.exists():
             raise FileNotFoundError(f"Flow artifact is missing {filename}")
-        array = np.load(array_path, mmap_mode="r", allow_pickle=False)
-        if not isinstance(array, np.ndarray):
-            raise ValueError(f"Flow artifact {filename} must contain one array")
+        if manifest["version"] == ARTIFACT_VERSION:
+            if storage_sha256(array_path) != manifest["arrays"][name]["sha256"]:
+                raise ValueError(f"Flow artifact {filename} SHA-256 differs")
+        if name != "mask_union" and manifest["version"] == ARTIFACT_VERSION:
+            array = open_array(array_path)
+            record = manifest["arrays"][name]
+            if list(array.chunks) != record.get("chunks") or list(array.shards or ()) != record.get("shards"):
+                raise ValueError(f"Flow artifact {filename} chunk layout differs")
+        else:
+            array = np.load(
+                array_path, mmap_mode=None if name == "mask_union" else "r",
+                allow_pickle=False,
+            )
+            if not isinstance(array, np.ndarray):
+                raise ValueError(f"Flow artifact {filename} must contain one array")
         loaded[name] = array
     _validate_arrays(loaded, manifest)
     _validate_stabilized_sequence(root, manifest, loaded)
@@ -298,7 +315,7 @@ def load_flow_analysis_artifact(path: str | Path) -> FlowAnalysisArtifact:
 def publish_flow_analysis_artifact(
     target: str | Path,
     *,
-    arrays: FlowAnalysisArrays,
+    arrays: FlowAnalysisArrays | Callable[[Path], FlowAnalysisArrays],
     inputs: Mapping[str, Any],
     parameters: Mapping[str, Any],
     frame_names: list[str],
@@ -318,15 +335,33 @@ def publish_flow_analysis_artifact(
         )
     )
     try:
-        array_values = arrays.as_dict()
+        generated = callable(arrays)
+        array_values = (arrays(temporary) if callable(arrays) else arrays).as_dict()
         array_records: dict[str, Any] = {}
         for name, filename in ARRAY_FILES.items():
             path = temporary / filename
-            np.save(path, array_values[name], allow_pickle=False)
+            value = array_values[name]
+            if np.dtype(value.dtype) != ARRAY_DTYPES[name]:
+                raise ValueError(f"Flow artifact {name} has an invalid dtype")
+            if name == "mask_union":
+                np.save(path, np.asarray(value), allow_pickle=False)
+                layout = {"storage": "npy"}
+            else:
+                if not generated:
+                    stored = create_array(path, value.shape, value.dtype)
+                    copy_array(value, stored)
+                stored = open_array(path)
+                layout = {
+                    "storage": "zarr_v3_zstd",
+                    "chunks": list(stored.chunks),
+                    "shards": list(stored.shards or ()),
+                }
             array_records[name] = {
                 "file": filename,
                 "dtype": ARRAY_DTYPES[name].name,
-                "shape": list(array_values[name].shape),
+                "shape": list(value.shape),
+                "sha256": storage_sha256(path),
+                **layout,
             }
         stabilized_record = None
         if write_stabilized is not None:

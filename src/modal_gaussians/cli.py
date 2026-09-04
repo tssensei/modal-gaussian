@@ -4,6 +4,8 @@ import argparse
 import math
 from pathlib import Path
 import sys
+import time
+import traceback
 from typing import Literal, Sequence, cast
 
 from modal_gaussians.colmap import (
@@ -15,6 +17,7 @@ from modal_gaussians.flow.pipeline import (
     FlowAnalysisConfig,
     run_flow_analysis,
 )
+from modal_gaussians.progress import progress_log, report_progress
 
 
 def _positive_float(value: str) -> float:
@@ -57,6 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the unified analysis, static-scene, and modal-data commands."""
 
     parser = argparse.ArgumentParser(prog="modal-gaussians")
+    parser.add_argument(
+        "--log-file", type=Path,
+        help="Append live progress and failures to this external log (before subcommand)",
+    )
     command_parsers = parser.add_subparsers(dest="command", required=True)
     prepare_parser = command_parsers.add_parser("prepare", help="Optional video/SAM/XMem preparation")
     prepare_commands = prepare_parser.add_subparsers(dest="prepare_command", required=True)
@@ -139,8 +146,16 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--epochs", type=_positive_int, default=100)
     train.add_argument("--batch-size", type=_positive_int, default=8)
     train.add_argument("--num-fg", type=_positive_int, default=40_000)
-    train.add_argument("--num-bg", type=_positive_int, default=100_000)
+    train.add_argument("--num-bg", type=_positive_int, default=80_000)
     train.add_argument("--seed", type=_non_negative_int, default=42)
+    train.add_argument("--mask-weight", type=_non_negative_float, default=1.0)
+    train.add_argument(
+        "--fg-densify-stop-step", type=_positive_int, default=4_000
+    )
+    train.add_argument(
+        "--bg-densify-stop-step", type=_positive_int, default=1_000
+    )
+    train.add_argument("--max-bg-gaussians", type=_positive_int, default=160_000)
     train.add_argument(
         "--resume",
         action="store_true",
@@ -294,6 +309,10 @@ def build_parser() -> argparse.ArgumentParser:
     motion_fill.add_argument("--rigid", required=True, type=Path)
     motion_fill.add_argument("--work-dir", required=True, type=Path)
     motion_fill.add_argument("--output", required=True, type=Path)
+    motion_fill.add_argument(
+        "--valid-modes-only", action="store_true",
+        help="Treat selected K as an upper limit; omit modes with no trusted rigid seeds",
+    )
     motion_fill.add_argument("--neighbors", type=_positive_int, default=8)
     motion_fill.add_argument("--max-distance", type=_positive_float, default=0.008)
     motion_fill.add_argument("--max-anchor-hops", type=_positive_int, default=8)
@@ -391,16 +410,39 @@ def build_parser() -> argparse.ArgumentParser:
     viewer.add_argument("--work-dir", required=True, type=Path)
     viewer.add_argument("--host", default="0.0.0.0")
     viewer.add_argument("--port", type=_positive_int, default=8080)
-    viewer.add_argument("--viewer-res", type=_positive_int, default=1024)
+    viewer.add_argument("--viewer-res", type=_positive_int, default=2048)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Dispatch one CLI invocation and report user-facing validation errors."""
+    """Log one CLI stage without hiding failures, retrying, or starting others."""
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)
+    with progress_log(args.log_file):
+        started_at = time.perf_counter()
+        report_progress(f"START {parser.prog} {arguments!r}")
+        try:
+            result = _dispatch(parser, args, arguments)
+        except KeyboardInterrupt:
+            report_progress("INTERRUPTED by user")
+            raise
+        except BaseException:
+            report_progress(f"FAILED\n{traceback.format_exc()}")
+            raise
+        report_progress(
+            f"{'COMPLETE' if result == 0 else 'FAILED'} {args.command}"
+            f" | elapsed={time.perf_counter() - started_at:.1f}s exit_code={result}"
+        )
+        return result
+
+
+def _dispatch(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, arguments: list[str]
+) -> int:
+    """Dispatch the parsed command and preserve existing CLI error semantics."""
+
     try:
         if args.command == "prepare" and args.prepare_command == "gui":
             try:
@@ -464,6 +506,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     num_foreground=int(args.num_fg),
                     num_background=int(args.num_bg),
                     seed=int(args.seed),
+                    mask_loss_weight=float(args.mask_weight),
+                    foreground_densify_stop_step=int(args.fg_densify_stop_step),
+                    background_densify_stop_step=int(args.bg_densify_stop_step),
+                    max_background_gaussians=int(args.max_bg_gaussians),
                 ),
                 resume=bool(args.resume),
             )
@@ -663,6 +709,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rigid_modes_dir=args.rigid,
                 work_dir=args.work_dir,
                 output_dir=args.output,
+                valid_modes_only=bool(args.valid_modes_only),
                 config=MotionFillConfig(
                     neighbors=int(args.neighbors),
                     max_distance=float(args.max_distance),

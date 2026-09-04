@@ -22,7 +22,9 @@ from modal_gaussians.flow.artifact import (
     load_flow_analysis_artifact,
 )
 from modal_gaussians.flow.spectrum import exact_dft_basis
+from modal_gaussians.flow.storage import spatial_blocks
 from modal_gaussians.frequency import load_frequency_selection
+from modal_gaussians.progress import Progress
 
 
 MODES_FORMAT = "modal_gaussians.complex_2d_modes"
@@ -239,11 +241,13 @@ def _write_dense_exact_dft(
         shape=(len(frequencies_hz), height, width, 2),
     )
     try:
-        for lower in range(0, width, DENSE_DFT_BLOCK_WIDTH):
-            upper = min(width, lower + DENSE_DFT_BLOCK_WIDTH)
+        progress = Progress(f"dense exact DFT {destination.name}", height * width, unit="pixels")
+        completed = 0
+        for rows, columns in spatial_blocks(flow.shape, DENSE_DFT_BLOCK_WIDTH):
+            block_height, block_width = rows.stop - rows.start, columns.stop - columns.start
             for component in range(2):
                 values = np.asarray(
-                    flow[:, :, lower:upper, component], dtype=np.float32
+                    flow[:, rows, columns, component], dtype=np.float32
                 )
                 if not np.isfinite(values).all():
                     raise ValueError("Flow block contains NaN or Inf")
@@ -254,9 +258,11 @@ def _write_dense_exact_dft(
                 transformed = basis @ values.reshape(frame_count, -1)
                 if not np.isfinite(transformed).all():
                     raise ValueError("Dense exact-DFT block contains NaN or Inf")
-                modes[:, :, lower:upper, component] = transformed.reshape(
-                    len(frequencies_hz), height, upper - lower
+                modes[:, rows, columns, component] = transformed.reshape(
+                    len(frequencies_hz), block_height, block_width
                 )
+            completed += block_height * block_width
+            progress.update(completed)
         modes.flush()
     finally:
         del modes

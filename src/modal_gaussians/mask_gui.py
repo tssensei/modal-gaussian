@@ -124,43 +124,57 @@ class MaskController:
 def build_mask_app(root_dir: Path, checkpoint_dir: Path, device: str = "cuda") -> gr.Blocks:
     """Build the local GUI without starting a server (also useful for smoke checks)."""
     controller = MaskController(root_dir, checkpoint_dir, device)
-    with gr.Blocks(title="Modal Gaussians — Mask preparation", analytics_enabled=False) as app:
+    with gr.Blocks(title="Modal Gaussians — Mask preparation", analytics_enabled=False,
+                   fill_width=True) as app:
         gr.Markdown(
             "# Video frames → SAM mask → XMem tracking\n"
             "Local single-editor workspace. Same-name outputs are replaced after validation. "
             "Re-extraction clears that sequence's old masks. Raw videos are never modified."
         )
         gr.Markdown(f"Output root: `{controller.workspace.root}`")
-        with gr.Tab("1 · Extract video (optional)"):
-            video = gr.Textbox(label="Local video path (MOV / MP4)")
-            extraction_name = gr.Textbox(label="Sequence name", placeholder="corn1")
-            with gr.Row():
-                start = gr.Number(label="Start (seconds)", value=0)
-                # Number converts None to zero in Gradio; text preserves optional blanks.
-                end = gr.Textbox(label="End (seconds; blank = end of video)", value="")
-                output_fps = gr.Textbox(label="Output FPS (required)", value="", placeholder="e.g. 30")
-                height = gr.Textbox(label="Height (blank = original)", value="")
-            extract = gr.Button("Extract / replace frames", variant="primary")
-        with gr.Tab("2 · Prompt and track"):
-            sequence = gr.Textbox(label="Sequence name", placeholder="corn1")
-            external = gr.Textbox(label="Existing PNG directory (blank = root/images/sequence)")
-            fps = gr.Number(label="Sequence FPS (read from extraction metadata when available)", value=None)
-            load = gr.Button("Load sequence")
-            loaded = gr.Textbox(label="Loaded input", interactive=False)
-            frame_index = gr.Slider(label="Prompt frame index (not the optical-flow reference)",
-                                    minimum=0, maximum=1, step=1, value=0)
-            features = gr.Button("Get SAM features")
-            canvas = gr.Image(label="Click to select foreground/background", type="numpy",
-                              interactive=False, height=600, buttons=["fullscreen", "download"])
-            polarity = gr.Radio(["Foreground (+)", "Background (-)"], value="Foreground (+)",
-                                label="Point type")
-            with gr.Row():
+        status = gr.Textbox(label="Status", value="Load a video or an existing PNG sequence.",
+                            interactive=False)
+        # Keep the old left-to-right workflow; columns wrap on narrower windows.
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=1, min_width=320):
+                gr.Markdown("## 1 · Extract video\nOptional if PNG frames are already available.")
+                video = gr.Textbox(label="Local video path (MOV / MP4)")
+                extraction_name = gr.Textbox(label="Sequence name", placeholder="corn1")
+                with gr.Row():
+                    start = gr.Number(label="Start (seconds)", value=0, min_width=140)
+                    # Number converts None to zero in Gradio; text preserves optional blanks.
+                    end = gr.Textbox(label="End (seconds; blank = end of video)", value="",
+                                     min_width=140)
+                with gr.Row():
+                    output_fps = gr.Textbox(label="Output FPS (required)", value="",
+                                            placeholder="e.g. 30", min_width=140)
+                    height = gr.Textbox(label="Height (blank = original)", value="", min_width=140)
+                extract = gr.Button("Extract / replace frames", variant="primary")
+                gr.Markdown("After extraction, click **Load sequence** in the next column. "
+                            "The sequence name and FPS are filled in automatically.")
+            with gr.Column(scale=1, min_width=320):
+                gr.Markdown("## 2 · Select frame and prompt\nLoad frames, then click foreground/background points.")
+                sequence = gr.Textbox(label="Sequence name", placeholder="corn1")
+                external = gr.Textbox(label="Existing PNG directory (blank = root/images/sequence)")
+                fps = gr.Number(label="Sequence FPS (read from extraction metadata when available)", value=None)
+                load = gr.Button("Load sequence")
+                frame_index = gr.Slider(label="Prompt frame index (not the optical-flow reference)",
+                                        minimum=0, maximum=1, step=1, value=0)
+                features = gr.Button("Get SAM features")
+                canvas = gr.Image(label="Input frame · click to select", type="numpy",
+                                  interactive=False, height=480, buttons=["fullscreen", "download"])
+                polarity = gr.Radio(["Foreground (+)", "Background (-)"], value="Foreground (+)",
+                                    label="Point type")
                 clear = gr.Button("Clear current points")
+            with gr.Column(scale=1, min_width=320):
+                gr.Markdown("## 3 · Review and track mask\nCheck the selection, then track the full sequence.")
+                selection = gr.Image(label="Current selection", type="numpy", interactive=False,
+                                     height=480, buttons=["fullscreen", "download"])
                 add = gr.Button("Add foreground / start another")
                 reset = gr.Button("Clear all masks")
-            track = gr.Button("Track / replace masks", variant="primary")
-        cancel = gr.Button("Cancel current operation")
-        status = gr.Textbox(label="Status", value="Load a video or an existing PNG sequence.", interactive=False)
+                track = gr.Button("Track / replace masks", variant="primary")
+                cancel = gr.Button("Cancel current operation")
+                loaded = gr.Textbox(label="Loaded input / mask output", interactive=False, lines=4)
 
         def extract_video(path, name, rate, begin, finish, size, progress=gr.Progress()):
             """Publish new frames only after decoding/validation succeeds."""
@@ -177,26 +191,28 @@ def build_mask_app(root_dir: Path, checkpoint_dir: Path, device: str = "cuda") -
                         progress=partial(_report_progress, progress),
                     )
                 except PreparationCancelled as error:
-                    return str(error), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
+                    return str(error), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
                 controller.images = None
                 controller.prompt.release()
                 return (f"Extracted {record['frame_count']} frames at {record['fps_hz']:g} FPS. "
                         "Old masks cleared; load the sequence to create new masks.",
-                        name, "", record["fps_hz"], None, "No sequence loaded.")
+                        name, "", record["fps_hz"], None, None, "No sequence loaded.")
 
         def load_sequence(name, directory, rate):
             """Load/bind all downstream prompting actions to this input snapshot."""
             with controller.operation():
                 preview, slider, resolved_fps = controller.load(name, directory, rate)
                 assert controller.images is not None
-                return (preview, slider, resolved_fps, "Sequence loaded; get SAM features.",
+                return (controller.prompt.image, preview, slider, resolved_fps,
+                        "Sequence loaded; get SAM features.",
                         f"{controller.images.directory} | {len(controller.images.paths)} frames | "
                         f"{resolved_fps:g} FPS | output masks: {controller.workspace.paths(name)[1]}")
 
         def change_frame(index):
             """Reset prompt state on a slider release."""
             with controller.operation():
-                return controller.select_frame(index), "Frame changed; get SAM features again."
+                preview = controller.select_frame(index)
+                return controller.prompt.image, preview, "Frame changed; get SAM features again."
 
         def get_features():
             """Compute SAM features for the bound prompting frame."""
@@ -228,7 +244,8 @@ def build_mask_app(root_dir: Path, checkpoint_dir: Path, device: str = "cuda") -
         def clear_all():
             """Reload the current image and discard all masks and embeddings."""
             with controller.operation():
-                return controller.select_frame(controller.frame_index), "Masks cleared; get SAM features."
+                preview = controller.select_frame(controller.frame_index)
+                return preview, "Masks cleared; get SAM features."
 
         def track_masks(progress=gr.Progress()):
             """Run the single streaming job; cancellation leaves old results intact."""
@@ -242,15 +259,16 @@ def build_mask_app(root_dir: Path, checkpoint_dir: Path, device: str = "cuda") -
         # Non-queued edits fail immediately while a long job holds the shared lock.
         # Gradio attaches these event methods dynamically through its metaclass.
         getattr(extract, "click")(extract_video, [video, extraction_name, output_fps, start, end, height],
-                      [status, sequence, external, fps, canvas, loaded], concurrency_limit=None)
-        getattr(load, "click")(load_sequence, [sequence, external, fps], [canvas, frame_index, fps, status, loaded],
+                      [status, sequence, external, fps, canvas, selection, loaded], concurrency_limit=None)
+        getattr(load, "click")(load_sequence, [sequence, external, fps],
+                   [canvas, selection, frame_index, fps, status, loaded],
                    queue=False)
-        getattr(frame_index, "release")(change_frame, frame_index, [canvas, status], queue=False)
+        getattr(frame_index, "release")(change_frame, frame_index, [canvas, selection, status], queue=False)
         getattr(features, "click")(get_features, outputs=status, concurrency_limit=None)
-        getattr(canvas, "select")(select_point, polarity, canvas, queue=False)
-        getattr(clear, "click")(clear_points, outputs=canvas, queue=False)
-        getattr(add, "click")(add_foreground, outputs=canvas, queue=False)
-        getattr(reset, "click")(clear_all, outputs=[canvas, status], queue=False)
+        getattr(canvas, "select")(select_point, polarity, selection, queue=False)
+        getattr(clear, "click")(clear_points, outputs=selection, queue=False)
+        getattr(add, "click")(add_foreground, outputs=selection, queue=False)
+        getattr(reset, "click")(clear_all, outputs=[selection, status], queue=False)
         getattr(track, "click")(track_masks, outputs=status, concurrency_limit=None)
         getattr(cancel, "click")(controller.cancel, outputs=status, queue=False)
     return app.queue()

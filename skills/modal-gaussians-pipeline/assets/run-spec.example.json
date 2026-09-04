@@ -48,7 +48,11 @@
     "epochs": 100,
     "batch_size": 8,
     "num_fg": 40000,
-    "num_bg": 100000,
+    "num_bg": 80000,
+    "mask_weight": 1.0,
+    "fg_densify_stop_step": 4000,
+    "bg_densify_stop_step": 1000,
+    "max_bg_gaussians": 160000,
     "seed": 42
   },
   "viewer": {

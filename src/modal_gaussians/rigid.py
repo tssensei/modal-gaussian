@@ -32,6 +32,7 @@ from modal_gaussians.synchronization import (
     solve_alpha_sync,
 )
 from modal_gaussians.topology import load_observation_topology
+from modal_gaussians.progress import Progress, report_progress
 
 
 EPSILON = 1.0e-12
@@ -1243,9 +1244,12 @@ def build_rigid_modes_artifact(
     )
     view_labels = tuple(view["label"] for view in source["views"])
     mode_results: list[dict[str, np.ndarray]] = []
+    progress = Progress("rigid solve", len(source["modes"]), unit="modes")
     for mode in source["modes"]:
         slot = int(mode["mode_slot"])
         checkpoint = work / f"mode_{slot:03d}.npz"
+        reused = checkpoint.is_file()
+        report_progress(f"rigid: mode_slot={slot} {'loading checkpoint' if reused else 'solving'}")
         if checkpoint.is_file():
             result = _load_mode_checkpoint(
                 checkpoint,
@@ -1279,6 +1283,7 @@ def build_rigid_modes_artifact(
                 solver_run_identity=source["solver_run_identity"],
             )
         mode_results.append(result)
+        progress.update(len(mode_results), f"mode_slot={slot} reused={reused}", force=True)
 
     shared = {
         name: np.asarray(mode_results[0][name]) for name in SHARED_ARRAY_FIELDS

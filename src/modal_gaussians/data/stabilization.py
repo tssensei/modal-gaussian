@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import cv2
 import numpy as np
@@ -13,6 +13,8 @@ from modal_gaussians.data.sequence import (
     read_binary_mask,
     read_color_image,
 )
+from modal_gaussians.flow.storage import DenseArray, create_array
+from modal_gaussians.progress import Progress
 
 
 @dataclass(frozen=True)
@@ -54,9 +56,9 @@ class StabilizationResult:
     frame-to-reference homographies, diagnostics, and the applied settings.
     """
 
-    frames_gray: np.ndarray
-    masks: np.ndarray
-    valid_mask: np.ndarray
+    frames_gray: DenseArray
+    masks: DenseArray
+    valid_mask: DenseArray
     homographies_frame_to_reference: np.ndarray
     statistics: dict[str, Any]
     settings: StabilizationSettings
@@ -464,62 +466,82 @@ def _smooth_homographies(
     ]
 
 
-def stabilize_to_reference(
-    frames_gray: np.ndarray,
-    masks: np.ndarray,
+def _stabilize_frames(
+    read_frame: Callable[[int], tuple[np.ndarray, np.ndarray]],
+    shape: tuple[int, int, int],
     reference_index: int,
     settings: StabilizationSettings | None = None,
+    output_directory: Path | None = None,
 ) -> StabilizationResult:
     """Estimate camera motion and align all grayscale frames to the reference.
 
     Args:
-        frames_gray: Grayscale sequence as ``float [T,H,W]`` in 0--1.
-        masks: Foreground masks as ``bool [T,H,W]``.
+        read_frame: Decode one ``float [H,W]`` grayscale frame and bool mask.
+        shape: Frame count, height and width of the sequence.
         reference_index: Temporal index of the reference frame.
         settings: Optional settings; ``None`` uses the accepted defaults.
+        output_directory: Temporary chunked storage, or None for in-memory output.
     Returns:
         A ``StabilizationResult`` containing aligned frames/masks, valid areas,
         ``float64 [T,3,3]`` homographies, and tracking diagnostics.
     """
     config = settings or StabilizationSettings()
     _validate_settings(config)
-    if frames_gray.ndim != 3 or frames_gray.shape[0] < 3:
+    if len(shape) != 3 or shape[0] < 3:
         raise ValueError("frames_gray must be [T,H,W] with at least three frames")
-    if masks.shape != frames_gray.shape or masks.dtype != np.bool_:
-        raise ValueError("masks must be bool [T,H,W] matching frames_gray")
-    if not np.isfinite(frames_gray).all():
-        raise ValueError("frames_gray contains NaN or Inf")
-    if np.any(frames_gray < 0.0) or np.any(frames_gray > 1.0):
-        raise ValueError("frames_gray intensities must be in [0,1]")
-    if reference_index < 0 or reference_index >= frames_gray.shape[0]:
+    if reference_index < 0 or reference_index >= shape[0]:
         raise ValueError("reference_index is outside the frame sequence")
 
-    frame_count, height, width = frames_gray.shape
-    frames_u8 = np.clip(frames_gray * 255.0, 0.0, 255.0).astype(np.uint8)
-    dilated_masks = np.stack(
-        [_dilate_mask(mask, config.mask_dilate_iterations) for mask in masks], axis=0
-    )
-    reference_u8 = frames_u8[reference_index]
+    frame_count, height, width = shape
+
+    def checked_frame(index: int) -> tuple[np.ndarray, np.ndarray]:
+        """Validate one decoded frame at each pass without keeping the video in RAM."""
+
+        gray, mask = read_frame(index)
+        if (
+            gray.shape != (height, width)
+            or mask.shape != gray.shape
+            or mask.dtype != np.bool_
+        ):
+            raise ValueError("Stabilization frame/mask dimensions or dtype differ")
+        if not np.isfinite(gray).all() or np.any(gray < 0.0) or np.any(gray > 1.0):
+            raise ValueError("Stabilization grayscale values must be finite in [0,1]")
+        return gray, mask
+
+    def tracking_frame(index: int) -> tuple[np.ndarray, np.ndarray]:
+        """Prepare one LK image and foreground exclusion mask."""
+
+        gray, mask = checked_frame(index)
+        return (
+            np.clip(gray * 255.0, 0.0, 255.0).astype(np.uint8),
+            _dilate_mask(mask, config.mask_dilate_iterations),
+        )
+
+    reference_u8, reference_mask = tracking_frame(reference_index)
     candidate_points = _detect_reference_features(
-        reference_u8, dilated_masks[reference_index], config
+        reference_u8, reference_mask, config
     )
 
     success_count = np.zeros(len(candidate_points), dtype=np.int64)
     error_sum = np.zeros(len(candidate_points), dtype=np.float64)
+    progress = Progress("stabilization stable features", frame_count, unit="frames")
     for frame_index in range(frame_count):
         if frame_index == reference_index:
             success_count += 1
+            progress.update(frame_index + 1)
             continue
+        current_u8, current_mask = tracking_frame(frame_index)
         _, good, error = _track_reference_points(
             reference_u8,
-            frames_u8[frame_index],
+            current_u8,
             candidate_points,
-            dilated_masks[frame_index],
+            current_mask,
             config,
             config.pass1_forward_backward_threshold_px,
         )
         success_count += good.astype(np.int64)
         error_sum += np.where(good, error, 0.0)
+        progress.update(frame_index + 1)
     success_fraction = success_count / frame_count
     average_error = np.divide(
         error_sum,
@@ -541,6 +563,7 @@ def stabilize_to_reference(
 
     raw_homographies: list[np.ndarray | None] = []
     per_frame_stats: list[dict[str, Any]] = []
+    progress = Progress("stabilization homographies", frame_count, unit="frames")
     for frame_index in range(frame_count):
         if frame_index == reference_index:
             raw_homographies.append(np.eye(3, dtype=np.float64))
@@ -554,12 +577,14 @@ def stabilize_to_reference(
                     "mean_forward_backward_error_px": 0.0,
                 }
             )
+            progress.update(frame_index + 1)
             continue
+        current_u8, current_mask = tracking_frame(frame_index)
         current_xy, good, error = _track_reference_points(
             reference_u8,
-            frames_u8[frame_index],
+            current_u8,
             stable_reference_points,
-            dilated_masks[frame_index],
+            current_mask,
             config,
             config.pass2_forward_backward_threshold_px,
         )
@@ -572,6 +597,7 @@ def stabilize_to_reference(
         )
         raw_homographies.append(matrix)
         per_frame_stats.append(stats)
+        progress.update(frame_index + 1)
 
     filled, fill_records = _fill_missing_homographies(
         raw_homographies, config.maximum_fallback_fraction
@@ -581,20 +607,31 @@ def stabilize_to_reference(
     )
     homographies = np.stack(smoothed, axis=0)
 
-    stabilized_gray = np.empty_like(frames_gray, dtype=np.float32)
-    stabilized_masks = np.empty_like(masks, dtype=bool)
-    valid_mask = np.empty_like(masks, dtype=bool)
+    stabilized_gray: DenseArray = (
+        np.empty(shape, dtype=np.float32) if output_directory is None
+        else create_array(output_directory / "gray.zarr", shape, np.float32)
+    )
+    stabilized_masks: DenseArray = (
+        np.empty(shape, dtype=bool) if output_directory is None
+        else create_array(output_directory / "masks.zarr", shape, bool)
+    )
+    valid_mask: DenseArray = (
+        np.empty(shape, dtype=bool) if output_directory is None
+        else create_array(output_directory / "valid.zarr", shape, bool)
+    )
     ones = np.ones((height, width), dtype=np.uint8)
+    progress = Progress("stabilization warp", frame_count, unit="frames")
     for frame_index, matrix in enumerate(homographies):
+        gray, mask = checked_frame(frame_index)
         stabilized_gray[frame_index] = cv2.warpPerspective(
-            frames_gray[frame_index],
+            gray,
             matrix,
             (width, height),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_REPLICATE,
         )
         stabilized_masks[frame_index] = cv2.warpPerspective(
-            masks[frame_index].astype(np.uint8),
+            mask.astype(np.uint8),
             matrix,
             (width, height),
             flags=cv2.INTER_NEAREST,
@@ -609,6 +646,7 @@ def stabilize_to_reference(
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0,
         ) > 0
+        progress.update(frame_index + 1)
 
     statistics = {
         "detected_reference_points": int(len(candidate_points)),
@@ -629,6 +667,35 @@ def stabilize_to_reference(
         homographies_frame_to_reference=homographies,
         statistics=statistics,
         settings=config,
+    )
+
+
+def stabilize_to_reference(
+    frames_gray: np.ndarray,
+    masks: np.ndarray,
+    reference_index: int,
+    settings: StabilizationSettings | None = None,
+) -> StabilizationResult:
+    """Keep the in-memory convenience API for small sequences."""
+
+    if frames_gray.ndim != 3 or masks.shape != frames_gray.shape or masks.dtype != np.bool_:
+        raise ValueError("Stabilization requires matching [T,H,W] frames and boolean masks")
+    return _stabilize_frames(
+        lambda index: (frames_gray[index], masks[index]),
+        frames_gray.shape, reference_index, settings,
+    )
+
+
+def stabilize_image_sequence(
+    sequence: ImageMaskSequence,
+    settings: StabilizationSettings,
+    output_directory: Path,
+) -> StabilizationResult:
+    """Stream PNG inputs through the same homography solver into temporary Zarr arrays."""
+
+    return _stabilize_frames(
+        sequence.read_frame, (sequence.frame_count, sequence.height, sequence.width),
+        sequence.reference_frame_index, settings, output_directory,
     )
 
 
@@ -667,7 +734,7 @@ def write_stabilized_sequence(
         if not cv2.imwrite(str(image_path), stabilized_color):
             raise OSError(f"Failed to write stabilized image: {image_path}")
         if not cv2.imwrite(
-            str(mask_path), result.masks[frame_index].astype(np.uint8) * 255
+            str(mask_path), np.asarray(result.masks[frame_index], dtype=np.uint8) * 255
         ):
             raise OSError(f"Failed to write stabilized mask: {mask_path}")
         read_binary_mask(mask_path, (height, width))

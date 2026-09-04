@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import numpy as np
+from modal_gaussians.progress import Progress
+from modal_gaussians.flow.storage import DenseArray, spatial_blocks
 
 
 def symmetric_hann(sample_count: int) -> np.ndarray:
@@ -43,33 +45,38 @@ def exact_dft_basis(
 
 
 def temporal_rfft(
-    flow: np.ndarray,
+    flow: DenseArray,
     *,
     block_width: int = 128,
-) -> np.ndarray:
+    output: DenseArray | None = None,
+) -> DenseArray:
+    """Transform spatial tiles; pass a disk-backed output to avoid a dense RAM result."""
     if flow.ndim != 4 or flow.shape[-1] != 2:
         raise ValueError("flow must be [T,H,W,2]")
     if flow.shape[0] < 3:
         raise ValueError("At least three temporal samples are required")
-    if not np.isfinite(flow).all():
-        raise ValueError("flow contains NaN or Inf")
     if block_width <= 0:
         raise ValueError("block_width must be positive")
 
     sample_count, height, width, _ = flow.shape
     frequency_count = sample_count // 2 + 1
-    spectrum = np.empty(
-        (frequency_count, height, width, 2), dtype=np.complex64
-    )
+    shape = (frequency_count, height, width, 2)
+    spectrum = np.empty(shape, dtype=np.complex64) if output is None else output
+    if spectrum.shape != shape or spectrum.dtype != np.dtype(np.complex64):
+        raise ValueError("rFFT output must be complex64 [F,H,W,2]")
     window = symmetric_hann(sample_count).astype(np.float32)[:, None, None, None]
-    width_block = min(int(block_width), width)
-    for lower in range(0, width, width_block):
-        upper = min(width, lower + width_block)
-        values = np.asarray(flow[:, :, lower:upper, :], dtype=np.float32)
+    progress = Progress("flow dense rFFT", height * width, unit="pixels")
+    completed = 0
+    for rows, columns in spatial_blocks(flow.shape, block_width):
+        values = np.asarray(flow[:, rows, columns, :], dtype=np.float32)
+        if not np.isfinite(values).all():
+            raise ValueError("flow contains NaN or Inf")
         values = values - values.mean(axis=0, keepdims=True, dtype=np.float32)
         values = values * window
-        spectrum[:, :, lower:upper, :] = np.fft.rfft(
+        spectrum[:, rows, columns, :] = np.fft.rfft(
             values, axis=0
         ).astype(np.complex64, copy=False)
+        completed += (rows.stop - rows.start) * (columns.stop - columns.start)
+        progress.update(completed)
 
     return spectrum

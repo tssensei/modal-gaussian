@@ -7,16 +7,17 @@ name = "modal-gaussians"
 version = "0.1.0"
 description = "Standalone asynchronous multi-view modal Gaussian analysis"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = [
   "gsplat==1.5.3",
-  "numpy>=1.26",
+  "numpy>=2.0",
   "opencv-python-headless>=4.8",
   "pytorch-msssim>=1.0",
   "scipy>=1.11",
   "splines==0.3.2",
-  "viser==1.0.30",
+  "viser==1.1.0",
+  "zarr==3.1.6",
 ]
 
 [project.scripts]

@@ -12,6 +12,8 @@ import numpy as np
 import viser
 import viser.uplot
 
+from modal_gaussians.flow.storage import DenseArray, read_pixels
+
 from modal_gaussians.flow.artifact import (
     FlowAnalysisArtifact,
     flow_artifact_identity,
@@ -19,6 +21,7 @@ from modal_gaussians.flow.artifact import (
 )
 from modal_gaussians.measurements import load_gaussian_measurements
 from modal_gaussians.modes import Complex2DModesArtifact, load_complex_2d_modes
+from modal_gaussians.motion_fill import resolve_source_mode_slots
 from modal_gaussians.result import ModalResultArtifact
 from modal_gaussians.topology import load_observation_topology
 
@@ -88,14 +91,14 @@ def _read_reference_rgb(flow: FlowAnalysisArtifact) -> np.ndarray:
 
 
 def _mean_image_plane_power(
-    spectrum: np.ndarray, pixels_xy: np.ndarray
+    spectrum: DenseArray, pixels_xy: np.ndarray
 ) -> np.ndarray:
     """Average vector amplitude over candidate pixels without a large temporary."""
 
     result = np.zeros(spectrum.shape[0], dtype=np.float64)
     for lower in range(0, len(pixels_xy), PIXEL_CHUNK_SIZE):
         pixels = pixels_xy[lower : lower + PIXEL_CHUNK_SIZE]
-        values = np.asarray(spectrum[:, pixels[:, 1], pixels[:, 0], :])
+        values = read_pixels(spectrum, slice(None), pixels)
         result += np.sum(
             np.sqrt(np.abs(values[..., 0]) ** 2 + np.abs(values[..., 1]) ** 2),
             axis=1,
@@ -121,8 +124,15 @@ class SpectrumComparisonController:
         measurements = load_gaussian_measurements(measurement_path)
         dense = load_complex_2d_modes(measurements.manifest["complex_2d_modes"])
         topology = load_observation_topology(measurements.manifest["topology"])
-        if dense.manifest["modes"] != result.manifest["modes"]:
-            raise ValueError("Viewer dense-mode order differs from modal result")
+        if measurements.manifest["gaussian_measurements_identity"] != completed.manifest["gaussian_measurements_identity"]:
+            raise ValueError("Viewer measurements differ from completed modes")
+        if dense.manifest["complex_2d_modes_identity"] != measurements.manifest["complex_2d_modes_identity"]:
+            raise ValueError("Viewer dense-mode identity differs from measurements")
+        if dense.manifest["modes"] != measurements.manifest["modes"]:
+            raise ValueError("Viewer dense-mode order differs from measurements")
+        self._source_mode_slots = resolve_source_mode_slots(
+            result.manifest["modes"], dense.manifest["modes"]
+        )
         if topology.manifest["topology_identity"] != completed.manifest[
             "topology_identity"
         ]:
@@ -188,7 +198,7 @@ class SpectrumComparisonController:
                 * np.asarray(matrix[:, :, 2 * mode_index + 1], dtype=np.float64)
             )
             raw = np.asarray(
-                dense[mode_index, pixels[:, 1], pixels[:, 0], :],
+                dense[self._source_mode_slots[mode_index], pixels[:, 1], pixels[:, 0], :],
                 dtype=np.complex128,
             )
             denominator = float(np.vdot(projected, projected).real)
@@ -282,7 +292,7 @@ class SpectrumComparisonController:
         pixels = self.state.pixels_xy
         raw = np.asarray(
             self.dense_modes.view_modes[self.state.index][
-                index, pixels[:, 1], pixels[:, 0], :
+                self._source_mode_slots[index], pixels[:, 1], pixels[:, 0], :
             ],
             dtype=np.complex64,
         )
@@ -308,13 +318,8 @@ class SpectrumComparisonController:
         spectrum = self.state.flow.arrays.spectrum
         maximum = 0.0
         for lower in range(0, spectrum.shape[0], 8):
-            block = np.asarray(
-                spectrum[
-                    lower : lower + 8,
-                    pixels[:, 1],
-                    pixels[:, 0],
-                    self.component_index,
-                ]
+            block = read_pixels(
+                spectrum, slice(lower, lower + 8), pixels, self.component_index
             )
             maximum = max(maximum, float(np.percentile(np.abs(block), PREVIEW_PERCENTILE)))
         for mode_index in range(len(self.frequencies_hz)):
@@ -478,7 +483,9 @@ class ModalSpectrumPanel:
             initial_value=controller.view_id,
         )
         self.component = server.gui.add_dropdown(
-            "Modal image component", options=("U", "V"), initial_value="U"
+            "Modal image component",
+            options=("U", "V"),
+            initial_value="U" if controller.component_index == 0 else "V",
         )
         self.normalization = server.gui.add_dropdown(
             "Amplitude normalization",
@@ -494,7 +501,7 @@ class ModalSpectrumPanel:
         )
         self.frequency = server.gui.add_number(
             "Selected frequency (Hz)",
-            initial_value=float(controller.frequencies_hz[0]),
+            initial_value=float(controller.frequencies_hz[controller.reconstructed_index]),
             disabled=True,
         )
         solo = server.gui.add_button("Solo selected mode")

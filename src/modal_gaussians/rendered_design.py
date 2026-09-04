@@ -15,6 +15,7 @@ from typing import Any, Mapping, Sequence
 
 import cv2
 import numpy as np
+from modal_gaussians.progress import Progress
 import torch
 
 from modal_gaussians.numpy_io import save_named_arrays
@@ -777,6 +778,7 @@ def build_rendered_modal_design_artifact(
             shape=(sample_count, 2, 2 * mode_count),
         )
         rng = np.random.default_rng(1729)
+        progress = Progress("rendered design", len(cameras) * mode_count, unit="view-modes")
         with torch.no_grad():
             for view_index, (camera, pixels, sampled_alpha, jacobian) in enumerate(
                 zip(cameras, pixels_by_view, alpha_by_view, jacobian_by_view)
@@ -828,6 +830,10 @@ def build_rendered_modal_design_artifact(
                         design[lower:upper, 1, 2 * mode_slot + 1] = values[
                             :, local_mode, 3
                         ]
+                    progress.update(
+                        view_index * mode_count + stop,
+                        f"camera={camera.name} modes={stop}/{mode_count}",
+                    )
 
                 packed = rng.standard_normal(2 * mode_count).astype(np.float32)
                 packed /= np.sqrt(np.mean(packed * packed, dtype=np.float64))

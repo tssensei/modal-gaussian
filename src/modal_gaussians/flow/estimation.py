@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Sequence, TypedDict
+from typing import Callable, Sequence, TypedDict
 
 import cv2
 import numpy as np
+from modal_gaussians.progress import Progress
 
 
 
@@ -61,6 +62,7 @@ def compute_reference_to_frame_flow(
     frame_count, height, width = frames_gray.shape
     flow = np.empty((frame_count, height, width, 2), dtype=np.float32)
     reference = frames_gray[reference_frame_index]
+    progress = Progress("flow Farneback", frame_count, unit="frames")
     for frame_index in range(frame_count):
         if frame_index == reference_frame_index:
             flow[frame_index] = 0.0
@@ -68,6 +70,7 @@ def compute_reference_to_frame_flow(
             flow[frame_index] = compute_farneback_pair(
                 reference, frames_gray[frame_index]
             )
+        progress.update(frame_index + 1)
     return flow
 
 
@@ -111,8 +114,7 @@ def _weighted_pyramid_sobel(
     return gradient_x, gradient_y
 
 
-def weighted_gaussian_smooth(
-    flow: np.ndarray,
+def make_gaussian_smoother(
     reference_gray: np.ndarray,
     mask_union: np.ndarray,
     *,
@@ -120,20 +122,18 @@ def weighted_gaussian_smooth(
     sigma_c_px: float = 0.0,
     gradient_pyramid_weights: Sequence[float] = (0.5, 0.3, 0.2),
     epsilon: float = 1e-6,
-) -> np.ndarray:
-    """Davis-inspired contrast-weighted spatial flow smoothing.
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Prepare reusable Davis-style weights for independent flow frames.
 
     This preserves the accepted legacy approximation: horizontal and vertical
     displacement are weighted by the corresponding reference-image Sobel
     gradient, spatially blurred, and normalized by the blurred weights.
     """
-    if flow.ndim != 4 or flow.shape[-1] != 2:
-        raise ValueError("flow must be [T,H,W,2]")
-    if reference_gray.shape != flow.shape[1:3]:
-        raise ValueError("reference_gray does not spatially match flow")
+    if reference_gray.ndim != 2:
+        raise ValueError("reference_gray must be [H,W]")
     if mask_union.shape != reference_gray.shape or mask_union.dtype != np.bool_:
         raise ValueError("mask_union must be bool [H,W]")
-    if not np.isfinite(flow).all() or not np.isfinite(reference_gray).all():
+    if not np.isfinite(reference_gray).all():
         raise ValueError("Smoothing inputs contain NaN or Inf")
     if not np.isfinite(sigma_b_px) or sigma_b_px <= 0.0:
         raise ValueError("sigma_b_px must be finite and positive")
@@ -178,25 +178,57 @@ def weighted_gaussian_smooth(
         borderType=cv2.BORDER_REFLECT,
     ) + float(epsilon)
 
-    output = np.empty_like(flow, dtype=np.float32)
-    for frame_index in range(flow.shape[0]):
+    def smooth_frame(flow: np.ndarray) -> np.ndarray:
+        """Smooth one full-resolution frame, preserving legacy mask and border rules."""
+
+        if flow.shape != (*reference_gray.shape, 2) or not np.isfinite(flow).all():
+            raise ValueError("Flow frame must be finite [H,W,2]")
+        output = np.empty_like(flow, dtype=np.float32)
         numerator_x = cv2.GaussianBlur(
-            flow[frame_index, :, :, 0] * weight_x,
+            flow[:, :, 0] * weight_x,
             (displacement_kernel, displacement_kernel),
             sigmaX=float(sigma_b_px),
             sigmaY=float(sigma_b_px),
             borderType=cv2.BORDER_REFLECT,
         )
         numerator_y = cv2.GaussianBlur(
-            flow[frame_index, :, :, 1] * weight_y,
+            flow[:, :, 1] * weight_y,
             (displacement_kernel, displacement_kernel),
             sigmaX=float(sigma_b_px),
             sigmaY=float(sigma_b_px),
             borderType=cv2.BORDER_REFLECT,
         )
-        output[frame_index, :, :, 0] = numerator_x / denominator_x
-        output[frame_index, :, :, 1] = numerator_y / denominator_y
-    output *= mask_float[None, :, :, None]
-    if not np.isfinite(output).all():
-        raise ValueError("Davis-style smoothing produced NaN or Inf")
+        output[:, :, 0] = numerator_x / denominator_x
+        output[:, :, 1] = numerator_y / denominator_y
+        output *= mask_float[:, :, None]
+        if not np.isfinite(output).all():
+            raise ValueError("Davis-style smoothing produced NaN or Inf")
+        return output
+
+    return smooth_frame
+
+
+def weighted_gaussian_smooth(
+    flow: np.ndarray,
+    reference_gray: np.ndarray,
+    mask_union: np.ndarray,
+    *,
+    sigma_b_px: float = 3.0,
+    sigma_c_px: float = 0.0,
+    gradient_pyramid_weights: Sequence[float] = (0.5, 0.3, 0.2),
+    epsilon: float = 1e-6,
+) -> np.ndarray:
+    """Keep the small-array convenience API; the pipeline uses the frame callable."""
+
+    if flow.ndim != 4 or flow.shape[-1] != 2:
+        raise ValueError("flow must be [T,H,W,2]")
+    smooth = make_gaussian_smoother(
+        reference_gray, mask_union, sigma_b_px=sigma_b_px, sigma_c_px=sigma_c_px,
+        gradient_pyramid_weights=gradient_pyramid_weights, epsilon=epsilon,
+    )
+    output = np.empty_like(flow, dtype=np.float32)
+    progress = Progress("flow Gaussian smoothing", flow.shape[0], unit="frames")
+    for frame_index in range(flow.shape[0]):
+        output[frame_index] = smooth(flow[frame_index])
+        progress.update(frame_index + 1)
     return output

@@ -15,9 +15,16 @@ from torch import Tensor
 import viser
 import viser.transforms as vtf
 
-from modal_gaussians.motion_fill import SUPPORT_CLASS_NAMES
 from modal_gaussians.result import ModalResultArtifact, load_modal_result
-from modal_gaussians.static import Camera, cameras_from_scene_manifest
+from modal_gaussians.static import (
+    Camera,
+    _load_gsplat_rasterization,
+    cameras_from_scene_manifest,
+)
+from modal_gaussians.structure_graph import (
+    ObservedStructureGraphArtifact,
+    load_observed_structure_graph,
+)
 from modal_gaussians.topology import load_observation_topology
 from modal_gaussians.vis.playback_panel import add_gui_playback_group
 from modal_gaussians.vis.render_panel import populate_render_tab
@@ -34,20 +41,70 @@ COLOR_PHASE = "modal phase"
 COLOR_OBSERVATIONS = "obs count"
 
 SUPPORT_DISPLAY_NAMES = (
-    "trusted rigid",
-    "promoted single-view rigid",
-    "pointwise KNN fill",
-    "unresolved",
+    "anchor",
+    "filled",
+    "unobserved",
 )
 SUPPORT_COLORS = np.asarray(
     (
         (0.05, 0.55, 1.0),
-        (1.0, 0.43, 0.16),
-        (0.27, 0.82, 0.47),
-        (0.58, 0.34, 0.82),
+        (0.1, 0.85, 0.3),
+        (0.65, 0.35, 1.0),
     ),
     dtype=np.float32,
 )
+
+
+def _stable_uniform_indices(count: int, maximum: int) -> np.ndarray:
+    """Select a deterministic uniform subset without reordering its indices."""
+
+    if count < 0 or maximum < 0:
+        raise ValueError("Uniform-subset sizes must be non-negative")
+    visible = min(int(count), int(maximum))
+    if visible == 0:
+        return np.empty((0,), dtype=np.int64)
+    if visible == count:
+        return np.arange(count, dtype=np.int64)
+    return np.floor(
+        np.linspace(0, count, visible, endpoint=False, dtype=np.float64)
+    ).astype(np.int64)
+
+
+def _component_colors(component_index: np.ndarray) -> np.ndarray:
+    """Reproduce the old graph Viewer's deterministic component palette."""
+
+    components = np.asarray(component_index)
+    if components.ndim != 1 or not np.issubdtype(components.dtype, np.integer):
+        raise ValueError("component_index must be a 1-D integer array")
+    if np.any(components < 0):
+        raise ValueError("component_index must be non-negative")
+    hue = np.mod(components.astype(np.float64) * 0.6180339887498949, 1.0)
+    h6 = hue * 6.0
+    sector = np.floor(h6).astype(np.int64)
+    fraction = h6 - sector
+    saturation = 0.72
+    value = 0.95
+    p = value * (1.0 - saturation)
+    q = value * (1.0 - saturation * fraction)
+    t = value * (1.0 - saturation * (1.0 - fraction))
+    rgb = np.empty((len(components), 3), dtype=np.float64)
+    choices = (
+        (value, t, p),
+        (q, value, p),
+        (p, value, t),
+        (p, q, value),
+        (t, p, value),
+        (value, p, q),
+    )
+    for index, channels in enumerate(choices):
+        mask = sector == index
+        if np.any(mask):
+            for column, channel in enumerate(channels):
+                if isinstance(channel, np.ndarray):
+                    rgb[mask, column] = channel[mask]
+                else:
+                    rgb[mask, column] = float(channel)
+    return rgb.astype(np.float32)
 
 
 @dataclass(frozen=True)
@@ -59,6 +116,18 @@ class ViewerCamera:
     c2w: np.ndarray
     fov: float
     aspect: float
+
+
+def _motion_fill_display_classes(arrays: dict[str, np.ndarray]) -> np.ndarray:
+    """Map the final sequential-fill state to the three useful Viewer roles."""
+
+    # Both trusted seeds and promoted components are fixed anchors. All other
+    # completed points are filled, while incomplete points remain unobserved.
+    anchors = arrays["trusted_seed_mask"] | arrays["component_anchor_point_mask"]
+    classes = np.full(anchors.shape, 2, dtype=np.int8)  # Unobserved.
+    classes[arrays["completion_mask"] & ~anchors] = 1  # Filled.
+    classes[anchors] = 0  # Anchor, including promoted single-view components.
+    return classes
 
 
 def _hsv_to_rgb(hue: Tensor, value: Tensor) -> Tensor:
@@ -169,17 +238,41 @@ class ModalViewerData:
         self.coordinates = np.asarray(
             self.result.coordinates.coordinates, dtype=np.complex64
         )
-        self.support_class = np.asarray(
-            self.result.completed_modes.arrays["support_class"], dtype=np.int8
+        self.display_class = _motion_fill_display_classes(
+            self.result.completed_modes.arrays
         )
-        if tuple(SUPPORT_CLASS_NAMES) != (
-            "trusted_rigid",
-            "promoted_single_view_rigid",
-            "pointwise_knn_fill",
-            "unresolved",
-        ):
-            raise RuntimeError("Viewer support-class display contract drifted")
         self.observation_counts = _observation_counts(self.result)
+        graph_path = self.result.completed_modes.manifest.get(
+            "observed_structure_graph"
+        )
+        graph_identity = self.result.completed_modes.manifest.get(
+            "observed_structure_graph_identity"
+        )
+        if not isinstance(graph_path, str) or not graph_path:
+            raise ValueError("Completed modes do not identify their observed graph")
+        self.structure_graph: ObservedStructureGraphArtifact = (
+            load_observed_structure_graph(graph_path)
+        )
+        if (
+            self.structure_graph.manifest["observed_structure_graph_identity"]
+            != graph_identity
+        ):
+            raise ValueError("Completed modes identify a different observed graph")
+        if (
+            self.structure_graph.manifest["static_scene_identity"]
+            != self.result.manifest["static_scene_identity"]
+            or self.structure_graph.manifest["foreground_identity"]
+            != self.result.manifest["foreground_identity"]
+        ):
+            raise ValueError("Observed graph does not belong to the Viewer scene")
+        graph_arrays = self.structure_graph.arrays
+        self.graph_edge_gaussian_index = graph_arrays.node_gaussian_index[
+            graph_arrays.edge_index
+        ]
+        edge_components = graph_arrays.component_index[
+            graph_arrays.edge_index[:, 0]
+        ]
+        self.graph_edge_colors = _component_colors(edge_components)
         self.spectrum = SpectrumComparisonController(self.result)
 
     def coordinate(self, view_index: int, local_frame: int) -> np.ndarray:
@@ -195,7 +288,7 @@ class ModalViewerData:
     def deformed_means(self, q: np.ndarray, scale: float = 1.0) -> Tensor:
         """Apply the result's exact real(q*phi) foreground deformation."""
 
-        values = np.asarray(q, dtype=np.complex64)
+        values = np.array(q, dtype=np.complex64, copy=True)
         if values.shape != (len(self.frequencies_hz),):
             raise ValueError("Viewer modal coordinate has the wrong mode count")
         q_tensor = torch.from_numpy(values).to(self.device)
@@ -280,17 +373,18 @@ class ModalViserViewer:
         work_dir: str | Path,
         host: str = "0.0.0.0",
         port: int = 8080,
-        viewer_resolution: int = 1024,
+        viewer_resolution: int = 2048,
     ) -> None:
         self.data = data
         self.work_dir = Path(work_dir).expanduser().resolve()
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.server = viser.ViserServer(host=host, port=port, label="Modal Gaussians")
         self.server.gui.configure_theme(
-            control_layout="collapsible",
-            control_width="large",
-            show_logo=False,
+            control_width="medium",
+            dark_mode=True,
+            brand_color=(255, 211, 105),
         )
+        self.server.gui.main_panel.dock_right()
         self._viewer_resolution = int(viewer_resolution)
         self._last_client: viser.ClientHandle | None = None
         self._render_lock = threading.Lock()
@@ -299,6 +393,8 @@ class ModalViserViewer:
         self._selection_sync = False
         self._canonical_disabled_cache: list[bool] = []
         self._point_cloud: Any | None = None
+        self._component_graph_handle: Any | None = None
+        self._component_graph_edge_indices = np.empty((0,), dtype=np.int64)
         self._frustums: dict[str, Any] = {}
         all_means = torch.cat(
             (
@@ -351,7 +447,7 @@ class ModalViserViewer:
                 max=2048,
                 step=1,
                 initial_value=self._viewer_resolution,
-                hint="Maximum rendered image dimension.",
+                hint="Maximum resolution of the viewer rendered image.",
             )
             self.viewer_resolution.on_update(self.request_render)
 
@@ -385,7 +481,8 @@ class ModalViserViewer:
                 self.work_dir / "camera_paths",
                 self.timestep,
             )
-        with tabs.add_tab("Spectrum"):
+        self.spectrum_window = self.server.gui.add_panel()
+        with self.spectrum_window.add_tab("Spectrum"):
             self.spectrum_panel = ModalSpectrumPanel(
                 self.server,
                 self.data.spectrum,
@@ -396,6 +493,7 @@ class ModalViserViewer:
                 on_solo_selected=self._solo_mode,
                 on_enable_all=self._enable_all_modes,
             )
+        self.spectrum_window.float(x=16.0, y=16.0, width=720.0, height=800.0)
 
     def _on_playback_view(self, event: Any) -> None:
         """Clamp the local frame slider after changing playback view."""
@@ -565,9 +663,6 @@ class ModalViserViewer:
                 step=1,
                 initial_value=0,
             )
-            self.server.gui.add_markdown(
-                "**Observation colors:** ≤1 = orange | 2 = blue | ≥3 = green"
-            )
         self.color_mode.on_update(self.request_render)
         self.phase_mode.on_update(self._on_phase_mode)
         self.phase_component.on_update(self._on_phase_component)
@@ -677,12 +772,16 @@ class ModalViserViewer:
 
         gaussian_count = self.data.scene.foreground.count
         step = max(gaussian_count // 200, 1)
+        graph_edge_count = len(self.data.graph_edge_gaussian_index)
+        graph_edge_step = max(graph_edge_count // 200, 1)
         with self.server.gui.add_folder("Debug points"):
             self.hide_render = self.server.gui.add_checkbox(
                 "Hide Gaussian render", False
             )
-            self.hide_background = self.server.gui.add_checkbox(
-                "Hide background", False
+            self.hide_background = (
+                self.server.gui.add_checkbox("Hide background", False)
+                if self.data.scene.background.count > 0
+                else None
             )
             self.show_support = self.server.gui.add_checkbox(
                 "Show modal points by role", False
@@ -701,20 +800,46 @@ class ModalViserViewer:
                 step=0.0001,
                 initial_value=0.002,
             )
-            self.support_mode = self.server.gui.add_slider(
-                "Modal role mode",
-                min=0,
-                max=len(self.data.frequencies_hz) - 1,
-                step=1,
-                initial_value=0,
-            )
             self.server.gui.add_markdown(
-                "**Role colors:** trusted rigid = blue | promoted single-view "
-                "rigid = orange | pointwise KNN fill = green | unresolved = purple"
+                "**Role colors:** anchor = blue | filled = green | "
+                "unobserved = purple"
+            )
+            self.support_mode_labels = tuple(
+                f"Mode {index}: {frequency:.3f} Hz"
+                for index, frequency in enumerate(self.data.frequencies_hz)
+            )
+            self.support_mode = (
+                self.server.gui.add_dropdown(
+                    "Modal role mode",
+                    options=self.support_mode_labels,
+                    initial_value=self.support_mode_labels[0],
+                )
+                if len(self.support_mode_labels) > 1
+                else None
             )
             self.support_filters = tuple(
                 self.server.gui.add_checkbox(name.capitalize(), True)
                 for name in SUPPORT_DISPLAY_NAMES
+            )
+            self.server.gui.add_markdown(
+                "**Component graph:** edges are colored by connected component"
+            )
+            self.show_component_graph = self.server.gui.add_checkbox(
+                "Show component graph", False
+            )
+            self.component_graph_edge_count = self.server.gui.add_slider(
+                "Max visible graph edges",
+                min=0,
+                max=max(graph_edge_count, 1),
+                step=graph_edge_step,
+                initial_value=min(20_000, graph_edge_count),
+            )
+            self.component_graph_line_width = self.server.gui.add_slider(
+                "Graph line width",
+                min=0.1,
+                max=10.0,
+                step=0.1,
+                initial_value=1.0,
             )
         debug_handles = (
             self.hide_render,
@@ -724,15 +849,21 @@ class ModalViserViewer:
             self.support_size,
             self.support_mode,
             *self.support_filters,
+            self.show_component_graph,
+            self.component_graph_edge_count,
+            self.component_graph_line_width,
         )
         for handle in debug_handles:
-            handle.on_update(self._on_debug_update)
+            if handle is not None:
+                handle.on_update(self._on_debug_update)
 
     def _on_debug_update(self, event: Any) -> None:
         """Remove a stale cloud when hidden and refresh the Viewer."""
 
         if not bool(self.show_support.value):
             self._remove_support_cloud()
+        if not bool(self.show_component_graph.value):
+            self._remove_component_graph()
         self.request_render(event)
 
     def _remove_support_cloud(self) -> None:
@@ -742,13 +873,60 @@ class ModalViserViewer:
             self._point_cloud.remove()
             self._point_cloud = None
 
+    def _remove_component_graph(self) -> None:
+        """Remove the component-edge overlay and its cached edge subset."""
+
+        if self._component_graph_handle is not None:
+            self._component_graph_handle.remove()
+            self._component_graph_handle = None
+        self._component_graph_edge_indices = np.empty((0,), dtype=np.int64)
+
+    def _update_component_graph(self, means: Tensor) -> None:
+        """Display a bounded component-colored subset of observed graph edges."""
+
+        if not bool(self.show_component_graph.value):
+            return
+        edge_count = len(self.data.graph_edge_gaussian_index)
+        selected = _stable_uniform_indices(
+            edge_count, max(int(self.component_graph_edge_count.value), 0)
+        )
+        if len(selected) == 0:
+            self._remove_component_graph()
+            return
+        gaussian_edges = self.data.graph_edge_gaussian_index[selected]
+        points = means[torch.as_tensor(gaussian_edges, device=means.device)]
+        points_numpy = points.detach().cpu().numpy()
+        if (
+            self._component_graph_handle is None
+            or not np.array_equal(selected, self._component_graph_edge_indices)
+        ):
+            self._remove_component_graph()
+            edge_colors = self.data.graph_edge_colors[selected]
+            self._component_graph_handle = self.server.scene.add_line_segments(
+                "/debug/component_graph",
+                points=points_numpy,
+                colors=np.repeat(edge_colors[:, None, :], 2, axis=1),
+                thickness=float(self.component_graph_line_width.value),
+                thickness_units="screen",
+            )
+            self._component_graph_edge_indices = selected
+            return
+        self._component_graph_handle.points = points_numpy
+        self._component_graph_handle.thickness = float(
+            self.component_graph_line_width.value
+        )
+
     def _update_support_cloud(self, means: Tensor) -> None:
         """Display filtered completed-mode support roles at deformed positions."""
 
         if not bool(self.show_support.value):
             return
-        mode_index = int(self.support_mode.value)
-        classes = self.data.support_class[mode_index]
+        mode_index = (
+            self.support_mode_labels.index(str(self.support_mode.value))
+            if self.support_mode is not None
+            else 0
+        )
+        classes = self.data.display_class[mode_index]
         enabled = np.asarray(
             [bool(handle.value) for handle in self.support_filters], dtype=bool
         )
@@ -761,11 +939,10 @@ class ModalViserViewer:
         points = means.detach().cpu().numpy()[selected]
         colors = SUPPORT_COLORS[classes[selected]]
         self._point_cloud = self.server.scene.add_point_cloud(
-            "/debug/modal_support",
+            "/debug/modal_anchors",
             points=points,
             colors=colors,
             point_size=float(self.support_size.value),
-            point_shape="circle",
         )
 
     @staticmethod
@@ -928,11 +1105,12 @@ class ModalViserViewer:
 
     @torch.inference_mode()
     def _render(self, client: viser.ClientHandle) -> np.ndarray:
-        """Render one deformed frame and refresh the support-role point cloud."""
+        """Render one frame and refresh deformed point and graph overlays."""
 
         q, scale = self._current_coordinate()
         means = self.data.deformed_means(q, scale)
         self._update_support_cloud(means)
+        self._update_component_graph(means)
         camera = self._render_camera(client)
         if bool(self.hide_render.value):
             return np.full((camera.height, camera.width, 3), 255, dtype=np.uint8)
@@ -941,7 +1119,9 @@ class ModalViserViewer:
             camera,
             means,
             foreground_colors=colors,
-            include_background=not bool(self.hide_background.value),
+            include_background=(
+                self.hide_background is None or not bool(self.hide_background.value)
+            ),
         )["rgb"]
         return (
             rendered.clamp(0.0, 1.0).mul(255.0).round().byte().cpu().numpy()
@@ -963,10 +1143,13 @@ def run_modal_viewer(
     work_dir: str | Path,
     host: str = "0.0.0.0",
     port: int = 8080,
-    viewer_resolution: int = 1024,
+    viewer_resolution: int = 2048,
 ) -> None:
     """Load one complete modal result and run its full Viser interface."""
 
+    # Load the CUDA backend synchronously. Deferring this to a render worker
+    # leaves a connected but blank Viewer when compiler activation fails.
+    _load_gsplat_rasterization()
     data = ModalViewerData(result_dir)
     viewer = ModalViserViewer(
         data,

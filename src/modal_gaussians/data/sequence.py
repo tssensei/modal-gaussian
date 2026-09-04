@@ -95,7 +95,7 @@ class ImageMaskSequence:
     """Describe a validated, ordered image and mask sequence.
 
     The object stores lexicographically ordered paths, FPS, reference frame,
-    and dimensions. Pixel arrays are loaded later by ``read_arrays()``.
+    and dimensions. The pipeline decodes pixels one frame at a time.
     """
 
     image_dir: Path
@@ -114,6 +114,15 @@ class ImageMaskSequence:
         """Return the number of ordered frames; 120 images return ``120``."""
         return len(self.frame_names)
 
+    def read_frame(self, index: int) -> tuple[np.ndarray, np.ndarray]:
+        """Decode one grayscale frame and mask without allocating the video stack."""
+
+        image = read_color_image(self.image_paths[index])
+        if image.shape[:2] != (self.height, self.width):
+            raise ValueError(f"Image dimensions changed: {self.image_paths[index]}")
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        return gray, read_binary_mask(self.mask_paths[index], (self.height, self.width))
+
     def read_arrays(self) -> tuple[np.ndarray, np.ndarray]:
         """Load every image and mask in the discovered filename order.
 
@@ -127,20 +136,8 @@ class ImageMaskSequence:
         masks = np.empty(
             (self.frame_count, self.height, self.width), dtype=bool
         )
-        for index, (image_path, mask_path) in enumerate(
-            zip(self.image_paths, self.mask_paths)
-        ):
-            image = read_color_image(image_path)
-            if image.shape[:2] != (self.height, self.width):
-                raise ValueError(
-                    f"Image dimensions changed after validation: {image_path}"
-                )
-            gray[index] = (
-                cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-            )
-            masks[index] = read_binary_mask(
-                mask_path, (self.height, self.width)
-            )
+        for index in range(self.frame_count):
+            gray[index], masks[index] = self.read_frame(index)
         return gray, masks
 
 def validate_image_mask_sequence(

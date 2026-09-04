@@ -377,7 +377,8 @@ class CameraPath:
                 points=points_array,
                 color=(220, 220, 220),
                 closed=self.loop,
-                line_width=1.0,
+                thickness=1.0,
+                thickness_units="screen",
                 segments=points_array.shape[0] + 1,
             )
         )

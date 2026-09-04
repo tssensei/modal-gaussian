@@ -15,10 +15,12 @@ import tempfile
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from modal_gaussians.progress import Progress, report_progress
 
 from modal_gaussians.numpy_io import save_named_arrays
 
 from modal_gaussians import __version__
+from modal_gaussians.flow.storage import DenseArray, read_pixels
 from modal_gaussians.flow.artifact import (
     FlowAnalysisArtifact,
     flow_artifact_identity,
@@ -427,7 +429,7 @@ def load_direct_modal_coordinates(
 
 
 def _flow_matrix(
-    flow: np.ndarray,
+    flow: DenseArray,
     pixels: np.ndarray,
     start: int,
     end: int,
@@ -435,9 +437,8 @@ def _flow_matrix(
 ) -> np.ndarray:
     """Sample reference-relative `(u,v)` flow as `[2P,B]` float64."""
 
-    x, y = pixels[:, 0], pixels[:, 1]
-    values = np.asarray(flow[start:end][:, y, x, :], dtype=np.float64)
-    reference = np.asarray(flow[reference_index, y, x, :], dtype=np.float64)
+    values = read_pixels(flow, slice(start, end), pixels).astype(np.float64)
+    reference = read_pixels(flow, reference_index, pixels).astype(np.float64)
     values -= reference[None]
     if not np.isfinite(values).all():
         raise ValueError("Flow contains NaN or Inf at rendered-design pixels")
@@ -480,7 +481,7 @@ def solve_direct_coordinates_view(
     *,
     design: np.ndarray,
     pixels_xy: np.ndarray,
-    flow: np.ndarray,
+    flow: DenseArray,
     reference_frame_index: int,
     fps_hz: float,
     frequencies_hz: np.ndarray,
@@ -492,7 +493,7 @@ def solve_direct_coordinates_view(
     settings.validate()
     design_value = np.asarray(design)
     pixels = np.asarray(pixels_xy, dtype=np.int64)
-    flow_value = np.asarray(flow)
+    flow_value = flow
     frequencies = np.asarray(frequencies_hz, dtype=np.float64)
     if design_value.ndim != 3 or design_value.shape[1] != 2:
         raise ValueError("Direct-coordinate design must be [P,2,2K]")
@@ -573,6 +574,7 @@ def solve_direct_coordinates_view(
 
     frame_count = flow_value.shape[0]
     relative = np.empty((frame_count, mode_count), dtype=np.complex128)
+    progress = Progress("direct coordinate solve", frame_count, unit="frames")
     for start in range(0, frame_count, settings.frame_chunk_size):
         end = min(start + settings.frame_chunk_size, frame_count)
         rhs = np.zeros((column_count, end - start), dtype=np.float64)
@@ -599,6 +601,7 @@ def solve_direct_coordinates_view(
         )
         solution = scaled / column_scales[:, None]
         relative[start:end] = solution[0::2].T + 1j * solution[1::2].T
+        progress.update(end)
     if not np.isfinite(relative).all():
         raise ValueError("Direct-coordinate solve produced NaN or Inf")
     relative -= relative[reference_frame_index : reference_frame_index + 1]
@@ -608,6 +611,7 @@ def solve_direct_coordinates_view(
     residual_sq = np.zeros(frame_count, dtype=np.float64)
     flow_sq = np.zeros(frame_count, dtype=np.float64)
     reference_coordinates = coordinates[reference_frame_index]
+    progress = Progress("direct coordinate evaluation", frame_count, unit="frames")
     for start in range(0, frame_count, settings.frame_chunk_size):
         end = min(start + settings.frame_chunk_size, frame_count)
         q = coordinates[start:end] - reference_coordinates[None]
@@ -629,6 +633,7 @@ def solve_direct_coordinates_view(
             residual = block @ packed - observed
             residual_sq[start:end] += np.sum(residual * residual, axis=0)
             flow_sq[start:end] += np.sum(observed * observed, axis=0)
+        progress.update(end)
     per_frame_rmse = np.sqrt(residual_sq / normalizer)
     per_frame_relative = np.zeros(frame_count, dtype=np.float64)
     per_frame_r2 = np.ones(frame_count, dtype=np.float64)
@@ -779,6 +784,7 @@ def build_direct_modal_coordinates_artifact(
     offsets = design.samples["view_sample_offsets"]
     pixels = design.samples["sample_pixels_xy"]
     for index, (flow, record) in enumerate(zip(flows, view_records)):
+        report_progress(f"direct coordinates: view={record['label']} ({index + 1}/{len(view_records)})")
         lower, upper = int(offsets[index]), int(offsets[index + 1])
         coordinate, diagnostic = solve_direct_coordinates_view(
             design=design.design[lower:upper],

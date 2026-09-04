@@ -12,8 +12,8 @@ Keep the implementation simple and preserve the accepted scientific mainline. Th
 ## Start from the user's actual request
 
 - For a request to write, explain, or plan the workflow, produce the requested guide; do not start training.
-- For an authorized run-through, proceed across successful stages without asking for routine confirmation at each stage. Give concise progress updates and explain any repair. Follow a narrower user-selected stopping point when given.
-- Repair implementation defects within the requested repository when the user authorizes running and fixing the pipeline. Do not interpret persistence as permission to change the scientific model, spend money, overwrite data, or publish code.
+- For an authorized run-through, proceed across successful stages without asking for routine confirmation at each stage. Give concise progress updates. Follow a narrower user-selected stopping point when given.
+- During an actual experiment run, a program failure requires an immediate stop and report under the rules below. A general request to execute or finish the pipeline does not waive this gate. Ordinary user-requested code editing, debugging, and development checks are different: correct errors in that work within scope without stopping for each one. Do not interpret persistence as permission to change the scientific model, spend money, overwrite data, or publish code.
 - Work during the active task using the available process/session wait tools. This skill does not itself schedule future turns or guarantee unattended execution after the task ends. Only create a schedule if the user requests one.
 
 ## 1. Resolve the run contract
@@ -36,7 +36,7 @@ Keep run data under a dedicated absolute root, preferably outside the source tre
 
 Verify current CLI help against the command reference; source is authoritative if flags have changed. Record the code revision and current dirty diff, resolved settings, and environment. Run input and CUDA checks in the validation reference. Estimate RAM, VRAM, disk, and runtime before loading dense flows.
 
-Use the project's `modal-gaussian` conda environment with PyTorch CUDA **12.8**, gsplat **1.5.3**, and Viser **1.0.30**. COLMAP may remain in its separate `colmap` environment. The CLI's `--colmap-command` accepts a binary path/name, **not** `conda run ...` as a compound command.
+Use the project's `modal-gaussian` conda environment with PyTorch CUDA **12.8**, gsplat **1.5.3**, and Viser **1.1.0**. COLMAP may remain in its separate `colmap` environment. The CLI's `--colmap-command` accepts a binary path/name, **not** `conda run ...` as a compound command.
 
 On a cluster, use an authorized GPU allocation and its actual paths; do not train on a login node or invent scheduler parameters. Keep the environment consistent across compute stages. Installing dependencies or accessing remote machines still follows the current task's approval boundaries.
 
@@ -70,15 +70,17 @@ Run one stage at a time initially. Per-view flow and COLMAP are independent, but
 3. Monitor actual progress without duplicating a live process. Capture exit code and failure output; long computation without stdout alone is not a failure.
 4. Load the result strictly, inspect the stage-specific metrics and representative visual evidence, then record its identity and status.
 5. Continue if structurally valid and scientifically usable as a provisional candidate. A manifest saying `unapproved` is not itself a blocker. Never convert that status to approved automatically.
-6. On failure, apply the recovery rules below, fix the earliest demonstrated cause, and rerun only the affected dependency suffix.
+6. On a code-error failure, stop immediately and report; do not fix, retry, or launch subsequent stages. For other failures, apply the recovery rules below within the user's authorization.
 
 Maintain one concise `run-status.md` under the run root, updated after each stage and before ending a turn. Include stage/attempt, command and log, artifact path/identity, code/config used, checks and metrics, pending warnings, live process details, and the exact next action. Reuse this record on continuation; independently verify it against files and live processes. Do not build a separate tracking framework.
+
+Enable the CLI's global `--log-file` before the stage subcommand, using one path under `logs/` per stage/attempt, never inside an artifact target. Share that path and the live-tail command from the command reference. Text progress includes completed counts, training metrics, elapsed time and estimated remaining time; counts are local to each named phase, not a whole-pipeline percentage. Continue capturing process stdout/stderr as well, since third-party output is not all routed through the progress logger.
 
 ## Scientific invariants
 
 - Ready binary masks are inputs; do not add segmentation or masking services. RGB/mask/reference pixel geometry and FPS must remain consistent. Stabilization and smoothing are explicit choices.
 - COLMAP sees sampled sweep RGB and one reference per fixed view, with full-image features. Semantic masks classify static FG/BG only. Keep raw and normalized camera conventions intact. Current grouping shares intrinsics within sweep and within references; flag incompatible input cameras instead of silently accepting them.
-- Static training uses fixed cameras, separate FG/BG parameter domains, joint depth-ordered rasterization, direct RGB, and **RGB L1 + SSIM only**. Do not restore scale regularization, dynamic state, mask/depth/track loss, or Shape-of-Motion dependencies.
+- Static training uses fixed cameras, separate FG/BG parameter domains, joint depth-ordered rasterization, direct RGB, RGB L1 + SSIM, and the accepted eroded semantic-mask loss. BG densification stops earlier than FG and obeys its configured hard count cap. Depth supervision is still disabled until the aligned-depth artifact is specified; do not invent depth inputs or restore scale/dynamic/track state or Shape-of-Motion dependencies.
 - Freeze final foreground indexing. Preserve static-scene, foreground, reference-camera, flow, and downstream identities. Never repair a mismatch by rewriting hashes or weakening validation.
 - Preserve view order and greedy mode slots everywhere. Frequency-sorted GUI labels must map back to immutable greedy slots, not reorder arrays.
 - Retain dense rFFT for the spectrum GUI. Selected dense modes are negative-exponent exact DFT with temporal-mean detrend, symmetric Hann, complex64, `(u,v)` order, and no mask/clamp/amplitude normalization.
@@ -88,15 +90,23 @@ Maintain one concise `run-status.md` under the run root, updated after each stag
 
 ## Repair and stopping rules
 
-Use [validation-recovery.md](references/validation-recovery.md) for exact resume support and diagnosis. Prefer small, evidence-backed fixes with inline or temporary regression checks. Remove only agent-created disposable test files after checking their exact paths; keep useful run logs and QA. Do not add a permanent `tests/` directory for this workflow.
+**Program error during an actual modal-gaussian experiment run -> stop immediately -> report -> wait for explicit user instructions.** This covers the run's compute stages and program failures in its validation/preflight checks, including exceptions, assertion failures, API/type/shape/import errors, and native-code crashes. If such a failure has an unclear cause, stop rather than assuming it is safe to retry.
 
-Do not repeatedly rerun an unchanged deterministic failure. Exhaust safe, materially different checks within scope. Pause with the failure evidence, preserved progress, and smallest required decision when a fix requires missing data, access, a different scientific choice, an unavailable resource, or expanded authorization. Resource limits are not permission to silently reduce K, resolution, training, or view count. No automatic commit, push, upload, package downgrade, input deletion, or broad cache cleanup.
+This gate does **not** apply to ordinary conversational code editing/debugging: shell-command typos, file-inspection mistakes, type-checker findings, and temporary development/regression-test failures may be corrected and checked again within the requested change. Distinguish a development check from running the user's experiment; do not relabel a failed real pipeline stage as a development check to bypass the gate.
+
+- Do not automatically edit code/config/environment, retry the failed command, skip the failed check, or continue later stages. Do not delay the report for debugging or a reproduction run.
+- Preserve logs, checkpoints, and existing outputs. Report the failed stage/command, exact error or traceback and log path, completed progress, and any remaining live processes. State an unknown cause as unknown. Mark the stage `failed` in `run-status.md` with next action `awaiting_user_instruction`, then end the turn.
+- Only after the user gives explicit instructions for that experiment failure may diagnosis, repair, retry, or continuation proceed, and only to the extent authorized. Approval to diagnose alone is not approval to fix or resume. Authorized repair may include iterative development checks; a new program failure when resuming the actual experiment triggers this stop-and-report gate again.
+
+Use [validation-recovery.md](references/validation-recovery.md) for exact resume support and authorized diagnosis. Once repair is authorized, prefer small, evidence-backed fixes with inline or temporary regression checks. Remove only agent-created disposable test files after checking their exact paths; keep useful run logs and QA. Do not add a permanent `tests/` directory for this workflow.
+
+Do not repeatedly rerun an unchanged deterministic failure. For non-code failures, use safe, materially different checks within scope; these checks never override the code-error stop gate. Pause with the failure evidence, preserved progress, and smallest required decision when a fix requires missing data, access, a different scientific choice, an unavailable resource, or expanded authorization. Resource limits are not permission to silently reduce K, resolution, training, or view count. No automatic commit, push, upload, package downgrade, input deletion, or broad cache cleanup.
 
 Changing output-affecting code invalidates the affected artifact and its descendants even if old hashes still validate. Keep validated unaffected ancestors. Use new attempt paths, or a fresh run root for a broad upstream change; update every downstream link. Never mix experiments under one apparent result.
 
 ## Finish with evidence
 
-Completion means every real-data compute stage is validated, the materialized result strictly loads, and the headless readiness check in the reference can load the scene, modes, coordinates, cameras, spectra, measurements, topology, and original reference RGBs. The CUDA preflight and static QA must also have passed. No Viser server or browser test is required or authorized by this workflow.
+Completion means every real-data compute stage is validated, the materialized result strictly loads, and the headless readiness check in the reference can load the scene, modes, coordinates, cameras, spectra, measurements, topology, and original reference RGBs and rasterize a real deformed frame through the same gsplat path used by Viewer. The CUDA preflight and static QA must also have passed. No Viser server or browser test is required or authorized by this workflow.
 
 Report `viser_ready / viewer_not_started` when these gates pass. If the computation is complete but required viewer data or its execution environment is unavailable, name that limitation rather than claiming readiness. Launching Viser later is a separate user action/request.
 

@@ -2,6 +2,8 @@
 
 These commands follow `src/modal_gaussians/cli.py`. Check current `--help` before a run; do not guess new flags. Run them separately and apply the stage gates in [validation-recovery.md](validation-recovery.md). This document is not a script to execute wholesale.
 
+If a program fails while executing an actual experiment, follow the [immediate stop-and-report rule](../SKILL.md#repair-and-stopping-rules). Do not execute a repair, retry/resume command, or subsequent stage until the user explicitly directs that action for the reported failure. All experiment recovery examples below are subject to this gate; ordinary development work and inspection-command mistakes may be corrected within scope.
+
 ## Bind inputs once
 
 Copy the skill's JSON template to a run-owned `run-spec.json`, resolve its required nulls, and add/remove view records to match the dataset. The two template views are illustrative, not a mandatory view count. For the intended multi-view rigid mainline, validate that sufficient independent camera observations actually exist.
@@ -26,6 +28,20 @@ foreach ($View in $Spec.views) {
 ```
 
 Use native argument-array splatting. Do not concatenate input paths into executable shell strings or use `Invoke-Expression`. This avoids broken quoting and accidental shell interpretation of filenames. If a later attempt changes an artifact path, rebuild all argument arrays that refer to it.
+
+## Live text progress
+
+For each compute command below, insert `--log-file "$RunRoot/logs/STAGE_ATTEMPT.log"` immediately after `-m modal_gaussians.cli`, before `flow`, `static`, or another subcommand. Choose the actual stage/attempt name, record it in `run-status.md`, and keep logs outside artifact output directories. Logs append rather than overwrite; use a new attempt name after an authorized retry. Continue retaining stdout/stderr for output from third-party libraries.
+
+Training reports step/epoch/batch, loss, PSNR, SSIM and FG/BG counts; other instrumented loops report frames, columns, selected frequencies, views or modes. Reports flush immediately, normally at most once per five seconds, plus the first completed unit and phase/epoch/mode boundaries. ETA uses this process's completed work (not pre-resume steps) and is an estimate. A phase's `100%` is not artifact validation or whole-pipeline completion.
+
+After the log exists, the user can follow it in another PowerShell terminal:
+
+```powershell
+Get-Content -LiteralPath "$RunRoot/logs/static_train_attempt01.log" -Tail 20 -Wait
+```
+
+Ctrl+C ends only this log follower. No preview images, server, or Viser launch is needed for numeric monitoring.
 
 ## 0. Environment and input preflight
 
@@ -55,7 +71,9 @@ if ($View.stabilize) { $StabilizeArgs = @('--stabilize') }
 & $MgPython -m modal_gaussians.cli flow analyze --images $View.images --masks $View.masks --fps $View.fps --reference-frame $View.reference_frame --smoothing $View.smoothing --sigma-b-px $View.sigma_b_px --sigma-c-px $View.sigma_c_px @StabilizeArgs --output "$RunRoot/flow/$($View.label)"
 ```
 
-Output: per-view `manifest.json`, `flow.npy` `[T,H,W,2] float32`, `mask_union.npy`, and `spectrum.npy` `[floor(T/2)+1,H,W,2] complex64`, plus optional stabilization data. `none` and `weighted-gaussian` are the smoothing choices. Keep the full rFFT for the future/current spectrum panel; dense selected modes below do not replace it.
+Output: version-7 per-view `manifest.json`, `flow.zarr/` `[T,H,W,2] float32`, `mask_union.npy`, and `spectrum.zarr/` `[floor(T/2)+1,H,W,2] complex64`, plus optional stabilization data. The Zarr v3 directories use lossless Zstd compression and sharding; every pixel and rFFT bin is retained. `none` and `weighted-gaussian` are the unchanged smoothing choices. Keep the full rFFT for the spectrum panel; dense selected modes below do not replace it.
+
+Use the repository artifact loader, not hardcoded `.npy` paths. It still accepts version-6 NPY artifacts without changing their identities. New runs require the pinned `zarr==3.1.6`; CLI arguments and run-spec fields are unchanged. Flow generation streams frames, and transforms/consumers read bounded tiles or selected pixels. Do not call `np.asarray` on a complete Zarr array. Copy entire `.zarr` directories, including all shards and metadata. Compression ratio depends on the data; estimate disk headroom conservatively, not from a previous sparse-mask experiment. Existing outputs are not automatically converted, and a new flow identity cannot replace an old result's ancestor without rebuilding its descendants.
 
 ## 2. Joint COLMAP
 
@@ -68,16 +86,16 @@ Output: copied RGB/semantic masks, `sparse/0/{cameras.bin,images.bin,points3D.bi
 ## 3. Static 3DGS training
 
 ```powershell
-& $MgPython -m modal_gaussians.cli static train --input "$RunRoot/joint_colmap" --work-dir "$RunRoot/work/static" --output "$RunRoot/static_scene" --epochs $Spec.static.epochs --batch-size $Spec.static.batch_size --num-fg $Spec.static.num_fg --num-bg $Spec.static.num_bg --seed $Spec.static.seed
+& $MgPython -m modal_gaussians.cli static train --input "$RunRoot/joint_colmap" --work-dir "$RunRoot/work/static" --output "$RunRoot/static_scene" --epochs $Spec.static.epochs --batch-size $Spec.static.batch_size --num-fg $Spec.static.num_fg --num-bg $Spec.static.num_bg --mask-weight $Spec.static.mask_weight --fg-densify-stop-step $Spec.static.fg_densify_stop_step --bg-densify-stop-step $Spec.static.bg_densify_stop_step --max-bg-gaussians $Spec.static.max_bg_gaussians --seed $Spec.static.seed
 ```
 
-Output: `static_scene/{manifest.json,tensors.pt,training_summary.json}`. Work state: `work/static/resume.pt`. Training also renders `work/static/qa` automatically. Defaults: 100 epochs, batch 8, initialization caps FG 40,000 / BG 100,000, seed 42. Loss is RGB-only `0.8*L1 + 0.2*(1-SSIM)`, with no scale regularizer.
+Output: `static_scene/{manifest.json,tensors.pt,training_summary.json}`. Work state: `work/static/resume.pt`. Training also renders `work/static/qa` automatically. Defaults: 100 epochs, batch 8, initialization caps FG 40,000 / BG 80,000, seed 42. The objective is `0.8*L1 + 0.2*(1-SSIM) + 1.0*trimmed_L1(FG-mask)`, with a 7×7 erosion kernel and no scale regularizer. BG densification stops at step 1,000 and is capped at 160,000 Gaussians; FG densification stops at 4,000. Depth supervision remains disabled until its input artifact is specified and implemented.
 
-To resume interrupted training, append `--resume` to this exact command only after checking unchanged input/config and that the final bundle does not already exist. If export succeeded but QA failed, validate that bundle and rerender QA; do not retrain merely because the original command failed after export.
+When continuation is authorized, resume interrupted training by appending `--resume` to this exact command only after checking unchanged input/config and that the final bundle does not already exist. If export succeeded but QA failed with a code error, stop and report first; after authorized recovery, validate that bundle and rerender QA rather than retraining merely because the original command failed after export.
 
 ## 4. Inspect static QA; render only if needed
 
-Review the existing `work/static/qa/metrics.json` and images first. For missing/failed QA or a fresh comparison, use a new directory:
+Review the existing `work/static/qa/metrics.json` and images first. When a QA rerender is authorized (including explicit direction after a code-error failure), use a new directory for missing/failed QA or a fresh comparison:
 
 ```powershell
 & $MgPython -m modal_gaussians.cli static render --scene "$RunRoot/static_scene" --output "$RunRoot/work/static_qa_retry01" --role all

@@ -16,6 +16,7 @@ import tempfile
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from modal_gaussians.progress import Progress, report_progress
 
 from modal_gaussians.numpy_io import save_named_arrays
 
@@ -34,7 +35,7 @@ from modal_gaussians.topology import load_observation_topology
 EPSILON = 1.0e-8
 CONVERGED_LSMR_CODES = frozenset({0, 1, 2, 4, 5})
 COMPLETED_MODES_FORMAT = "modal_gaussians.completed_modes"
-COMPLETED_MODES_VERSION = 1
+COMPLETED_MODES_VERSION = 2
 COMPLETED_MODES_FILENAME = "completed_modes.npz"
 
 SUPPORT_TRUSTED_RIGID = 0
@@ -1364,7 +1365,7 @@ def _arrays_identity(arrays: Mapping[str, np.ndarray]) -> str:
 def _run_identity_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
     """Select immutable upstream identities, modes, views, graph, and config."""
 
-    return {
+    payload = {
         "static_scene_identity": manifest["static_scene_identity"],
         "foreground_identity": manifest["foreground_identity"],
         "topology_identity": manifest["topology_identity"],
@@ -1380,6 +1381,9 @@ def _run_identity_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "motion_fill": manifest["motion_fill"],
         "fill_graph_identity": manifest["fill_graph_identity"],
     }
+    if "mode_selection" in manifest:
+        payload["mode_selection"] = manifest["mode_selection"]
+    return payload
 
 
 def _artifact_identity_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -1389,7 +1393,7 @@ def _artifact_identity_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
     payload.update(
         {
             "format": COMPLETED_MODES_FORMAT,
-            "version": COMPLETED_MODES_VERSION,
+            "version": manifest["version"],
             "semantics": manifest["semantics"],
             "quality_gate": manifest["quality_gate"],
             "counts": manifest["counts"],
@@ -1397,6 +1401,110 @@ def _artifact_identity_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
         }
     )
     return payload
+
+
+def resolve_source_mode_slots(
+    modes: Sequence[Mapping[str, Any]], source_modes: Sequence[Mapping[str, Any]]
+) -> np.ndarray:
+    """Validate local-to-original slots without sorting or guessing by frequency."""
+
+    if not modes or not source_modes:
+        raise ValueError("Mode mapping requires non-empty local and source modes")
+    mapped = any("source_mode_slot" in mode for mode in modes)
+    if not mapped:
+        if list(modes) != list(source_modes):
+            raise ValueError("Unmapped modes must exactly match the complete source prefix")
+        return np.arange(len(modes), dtype=np.int64)
+    slots: list[int] = []
+    for local_slot, mode in enumerate(modes):
+        source_slot = mode.get("source_mode_slot")
+        if (
+            isinstance(source_slot, bool)
+            or not isinstance(source_slot, int)
+            or not 0 <= source_slot < len(source_modes)
+            or (slots and source_slot <= slots[-1])
+        ):
+            raise ValueError("Source mode slots must be unique, increasing and in range")
+        parent = source_modes[source_slot]
+        if parent.get("mode_slot") != source_slot or dict(mode) != {
+            **parent, "mode_slot": local_slot, "source_mode_slot": source_slot
+        }:
+            raise ValueError("Mode mapping differs from the original candidate/frequency")
+        slots.append(source_slot)
+    return np.asarray(slots, dtype=np.int64)
+
+
+def _select_rigid_modes(
+    rigid: RigidModesArtifact, valid_modes_only: bool
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Optionally omit zero-seed modes while retaining exact greedy provenance."""
+
+    if not isinstance(valid_modes_only, bool):
+        raise ValueError("valid_modes_only must be boolean")
+    source_modes = rigid.manifest["modes"]
+    seed_counts = np.count_nonzero(rigid.arrays["trusted_seed_mask"], axis=1)
+    if len(seed_counts) != len(source_modes):
+        raise ValueError("Rigid mode metadata and trusted-seed counts differ")
+    rejected_slots = np.flatnonzero(seed_counts == 0).tolist()
+    if rejected_slots and not valid_modes_only:
+        raise ValueError(
+            f"Modes {rejected_slots} have no trusted rigid seeds; "
+            "use --valid-modes-only only when a smaller final mode count is allowed"
+        )
+    kept_slots = np.flatnonzero(seed_counts > 0).tolist()
+    if not kept_slots:
+        raise ValueError("No modes have trusted rigid seeds; motion fill cannot proceed")
+    modes = [
+        {**source_modes[source_slot], "mode_slot": slot, "source_mode_slot": source_slot}
+        for slot, source_slot in enumerate(kept_slots)
+    ]
+    resolve_source_mode_slots(modes, source_modes)
+    selection = {
+        "policy": "trusted_seed_nonempty" if valid_modes_only else "all",
+        "source_mode_count": len(source_modes),
+        "source_mode_slots": kept_slots,
+        "rejected_modes": [
+            {
+                **source_modes[slot],
+                "reason": "no_trusted_rigid_seeds",
+                "alpha_exclusion_reason": rigid.arrays["alpha_exclusion_reason"][slot].tolist(),
+            }
+            for slot in rejected_slots
+        ],
+    }
+    return modes, selection
+
+
+def _validate_mode_selection(
+    manifest: Mapping[str, Any], arrays: Mapping[str, np.ndarray], rigid: RigidModesArtifact
+) -> None:
+    """Bind the subset, exclusions and unchanged seed tensors to the rigid parent."""
+
+    for key in (
+        "static_scene_identity", "foreground_identity", "topology_identity",
+        "gaussian_measurements_identity", "observed_structure_graph_identity",
+        "rigid_modes_identity",
+    ):
+        if manifest.get(key) != rigid.manifest.get(key):
+            raise ValueError(f"Completed-mode parent {key} differs")
+    selection = manifest.get("mode_selection")
+    if not isinstance(selection, dict) or selection.get("policy") not in {"all", "trusted_seed_nonempty"}:
+        raise ValueError("Completed-mode selection policy is invalid")
+    expected_modes, expected_selection = _select_rigid_modes(
+        rigid, selection["policy"] == "trusted_seed_nonempty"
+    )
+    if manifest.get("modes") != expected_modes or selection != expected_selection:
+        raise ValueError("Completed-mode subset or rejection metadata differs from rigid parent")
+    if manifest.get("views") != rigid.manifest["views"]:
+        raise ValueError("Completed-mode views differ from rigid parent")
+    if manifest["counts"]["modes"] != len(expected_modes):
+        raise ValueError("Completed-mode count differs from selected modes")
+    slots = resolve_source_mode_slots(expected_modes, rigid.manifest["modes"])
+    trusted = rigid.arrays["trusted_seed_mask"][slots]
+    if not np.array_equal(arrays["trusted_seed_mask"], trusted):
+        raise ValueError("Completed-mode trusted seed masks differ from their source slots")
+    if not np.array_equal(arrays["phi"][trusted], rigid.arrays["trusted_phi"][slots][trusted]):
+        raise ValueError("Completed-mode trusted seed displacements changed")
 
 
 def _load_sources(
@@ -1407,6 +1515,7 @@ def _load_sources(
     observed_graph_dir: str | Path,
     rigid_modes_dir: str | Path,
     config: MotionFillConfig,
+    valid_modes_only: bool = False,
 ) -> tuple[dict[str, Any], Any, Any, Any, Any, RigidModesArtifact, KnnGraph, np.ndarray]:
     """Load the complete identity chain and build its deterministic fill graph."""
 
@@ -1480,6 +1589,12 @@ def _load_sources(
             raise ValueError(f"Observed graph camera identity for {label!r} differs")
         view_records.append(dict(rigid_view))
 
+    modes, mode_selection = _select_rigid_modes(rigid, valid_modes_only)
+    report_progress(
+        f"motion mode selection: kept={len(modes)}/{len(rigid.manifest['modes'])} "
+        f"source_slots={mode_selection['source_mode_slots']} "
+        f"rejected={mode_selection['rejected_modes']}"
+    )
     points = (
         scene.foreground.active()["means"].detach().cpu().numpy().astype(np.float32)
     )
@@ -1513,7 +1628,8 @@ def _load_sources(
         "observed_structure_graph_identity": observed_graph_identity,
         "rigid_modes": str(rigid.path),
         "rigid_modes_identity": rigid.manifest["rigid_modes_identity"],
-        "modes": [dict(mode) for mode in rigid.manifest["modes"]],
+        "modes": modes,
+        "mode_selection": mode_selection,
         "views": view_records,
         "motion_fill": config.to_dict(),
         "fill_graph_identity": fill_graph_identity,
@@ -1671,7 +1787,7 @@ def load_completed_modes(path: str | Path) -> CompletedModesArtifact:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("format") != COMPLETED_MODES_FORMAT:
         raise ValueError("Unsupported completed-mode format")
-    if manifest.get("version") != COMPLETED_MODES_VERSION:
+    if manifest.get("version") not in (1, COMPLETED_MODES_VERSION):
         raise ValueError("Unsupported completed-mode version")
     if manifest.get("quality_gate") != {
         "required": True,
@@ -1712,6 +1828,13 @@ def load_completed_modes(path: str | Path) -> CompletedModesArtifact:
     ).hexdigest()
     if manifest.get("completed_modes_identity") != expected_artifact:
         raise ValueError("Completed-mode artifact identity differs")
+    if manifest["version"] == 1:
+        if "mode_selection" in manifest or any(
+            "source_mode_slot" in mode for mode in manifest["modes"]
+        ):
+            raise ValueError("Legacy completed modes cannot contain subset metadata")
+    else:
+        _validate_mode_selection(manifest, arrays, load_rigid_modes(manifest["rigid_modes"]))
     return CompletedModesArtifact(root, manifest, arrays)
 
 
@@ -1725,6 +1848,7 @@ def build_completed_modes_artifact(
     work_dir: str | Path,
     output_dir: str | Path,
     config: MotionFillConfig | None = None,
+    valid_modes_only: bool = False,
     command: Sequence[str] = (),
 ) -> CompletedModesArtifact:
     """Run resumable sequential fill for every greedy mode and publish atomically."""
@@ -1751,6 +1875,7 @@ def build_completed_modes_artifact(
         observed_graph_dir=observed_graph_dir,
         rigid_modes_dir=rigid_modes_dir,
         config=settings,
+        valid_modes_only=valid_modes_only,
     )
     _prepare_work_dir(work, source)
     rigid_arrays = rigid.arrays
@@ -1759,9 +1884,13 @@ def build_completed_modes_artifact(
     phase_samples = int(rigid.manifest["rigid_components"]["phase_samples"])
     view_labels = tuple(view["label"] for view in source["views"])
     mode_results: list[dict[str, np.ndarray]] = []
+    progress = Progress("motion fill", len(source["modes"]), unit="modes")
     for mode in source["modes"]:
         slot = int(mode["mode_slot"])
+        source_slot = int(mode["source_mode_slot"])
         checkpoint = work / f"mode_{slot:03d}.npz"
+        reused = checkpoint.is_file()
+        report_progress(f"motion fill: mode_slot={slot} source_mode_slot={source_slot} {'loading checkpoint' if reused else 'solving'}")
         if checkpoint.is_file():
             result = _load_mode_checkpoint(
                 checkpoint,
@@ -1772,23 +1901,23 @@ def build_completed_modes_artifact(
             prepared = prepare_observations(
                 points=points,
                 topology=topology.arrays,
-                sample_measurements=np.asarray(measurements.measurements[slot]),
+                sample_measurements=np.asarray(measurements.measurements[source_slot]),
                 view_labels=view_labels,
             )
             completed = apply_sequential_motion_fill(
                 points=points,
                 prepared=prepared,
-                alphas=rigid_arrays["alphas"][slot],
-                identifiable=rigid_arrays["alpha_identifiable_mask"][slot],
-                trusted_phi=rigid_arrays["trusted_phi"][slot],
-                trusted_seed_mask=rigid_arrays["trusted_seed_mask"][slot],
+                alphas=rigid_arrays["alphas"][source_slot],
+                identifiable=rigid_arrays["alpha_identifiable_mask"][source_slot],
+                trusted_phi=rigid_arrays["trusted_phi"][source_slot],
+                trusted_seed_mask=rigid_arrays["trusted_seed_mask"][source_slot],
                 point_component=rigid_arrays["point_component_index"],
                 component_centroid=rigid_arrays["component_centroid"],
                 component_radius=rigid_arrays["component_radius"],
                 component_supported_view_count=rigid_arrays[
                     "component_supported_valid_view_count"
-                ][slot],
-                component_retained_mask=rigid_arrays["component_retained_mask"][slot],
+                ][source_slot],
+                component_retained_mask=rigid_arrays["component_retained_mask"][source_slot],
                 edge_component=rigid_arrays["edge_component_index"],
                 observed_graph=observed_graph.arrays,
                 fill_graph=fill_graph,
@@ -1810,6 +1939,7 @@ def build_completed_modes_artifact(
                 solver_run_identity=source["solver_run_identity"],
             )
         mode_results.append(result)
+        progress.update(len(mode_results), f"mode_slot={slot} reused={reused}", force=True)
 
     final_arrays = {
         name: np.stack([result[name] for result in mode_results], axis=0)
@@ -1921,4 +2051,5 @@ __all__ = [
     "build_completed_modes_artifact",
     "build_motion_fill_graph",
     "load_completed_modes",
+    "resolve_source_mode_slots",
 ]

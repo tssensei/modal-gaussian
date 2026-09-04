@@ -14,6 +14,7 @@ import tempfile
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from modal_gaussians.progress import Progress
 
 from modal_gaussians.numpy_io import save_named_arrays
 
@@ -24,6 +25,7 @@ from modal_gaussians.flow.artifact import (
     load_flow_analysis_artifact,
 )
 from modal_gaussians.flow.spectrum import exact_dft_basis
+from modal_gaussians.flow.storage import read_pixels
 from modal_gaussians.topology import load_observation_topology
 
 
@@ -226,11 +228,11 @@ def _accumulate_view_statistics(
     cross_flow = np.zeros((column_count, frame_count), dtype=np.float64)
     energy_per_frame = np.zeros(frame_count, dtype=np.float64)
 
+    progress = Progress(f"frequency exact DFT {label}", len(pixels_xy), unit="pixels")
     for lower in range(0, len(pixels_xy), PIXEL_CHUNK_SIZE):
         current = pixels_xy[lower : lower + PIXEL_CHUNK_SIZE]
-        x, y = current[:, 0], current[:, 1]
-        raw_u = np.asarray(flow[:, y, x, 0], dtype=np.float32)
-        raw_v = np.asarray(flow[:, y, x, 1], dtype=np.float32)
+        raw_u = read_pixels(flow, slice(None), current, 0)
+        raw_v = read_pixels(flow, slice(None), current, 1)
         if not np.isfinite(raw_u).all() or not np.isfinite(raw_v).all():
             raise ValueError(f"Flow artifact for {label!r} contains NaN or Inf")
 
@@ -256,6 +258,7 @@ def _accumulate_view_statistics(
         gram += design.T @ design
         cross_flow += design.T @ target
         energy_per_frame += np.sum(target * target, axis=0)
+        progress.update(lower + len(current))
 
     flow_energy = float(np.sum(energy_per_frame))
     if not math.isfinite(flow_energy) or flow_energy <= np.finfo(np.float64).eps:
@@ -351,6 +354,7 @@ def _greedy_select(
     gains = np.empty(count, dtype=np.float64)
     previous_macro = 0.0
 
+    progress = Progress("greedy selection", count, unit="frequencies")
     for step in range(count):
         best_candidate: int | None = None
         best_macro = -np.inf
@@ -378,6 +382,12 @@ def _greedy_select(
         selected.append(best_candidate)
         available.remove(best_candidate)
         previous_macro = best_macro
+        progress.update(
+            step + 1,
+            f"selected_hz={frequencies_hz[best_candidate]:.6g} "
+            f"macro_r2={best_macro:.6f} gain={gains[step]:.6f}",
+            force=True,
+        )
 
     energy = np.asarray(
         [statistics.flow_energy for statistics in view_statistics], dtype=np.float64

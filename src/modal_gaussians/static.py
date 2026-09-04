@@ -14,6 +14,8 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
+import threading
 from typing import Any, Literal, Mapping, Sequence
 
 import cv2
@@ -25,6 +27,7 @@ import torch.nn.functional as F
 
 Composition = Literal["all", "foreground", "background"]
 CameraRole = Literal["sweep", "reference"]
+_WINDOWS_EXTENSION_ENVIRONMENT_LOCK = threading.Lock()
 GAUSSIAN_FIELDS = (
     "means",
     "quaternions",
@@ -321,16 +324,49 @@ class ForegroundBackgroundScene(nn.Module):
         *,
         composition: Composition = "all",
         retain_screen_grad: bool = False,
+        return_foreground_mask: bool = False,
     ) -> tuple[dict[str, Tensor], Mapping[str, Tensor]]:
-        """Rasterize same-resolution cameras and return RGB, alpha, and expected depth."""
+        """Rasterize cameras, optionally carrying FG identity through compositing."""
 
         if not cameras:
             raise ValueError("At least one camera is required")
         width, height = cameras[0].width, cameras[0].height
         if any(camera.width != width or camera.height != height for camera in cameras):
             raise ValueError("render_batch cameras must share one image resolution")
+        if return_foreground_mask and composition != "all":
+            raise ValueError("Foreground-mask rendering requires composition='all'")
         active = self._active_for(composition)
         device = active["means"].device
+        colors = active["colors"]
+        backgrounds = torch.ones((len(cameras), 3), device=device)
+        if return_foreground_mask:
+            foreground_feature = torch.cat(
+                [
+                    torch.ones(
+                        (self.foreground.count, 1),
+                        device=device,
+                        dtype=colors.dtype,
+                    ),
+                    torch.zeros(
+                        (self.background.count, 1),
+                        device=device,
+                        dtype=colors.dtype,
+                    ),
+                ],
+                dim=0,
+            )
+            colors = torch.cat([colors, foreground_feature], dim=-1).contiguous()
+            backgrounds = torch.cat(
+                [
+                    backgrounds,
+                    torch.zeros(
+                        (len(cameras), 1),
+                        device=device,
+                        dtype=backgrounds.dtype,
+                    ),
+                ],
+                dim=-1,
+            )
         Ks = torch.stack([camera.K.to(device) for camera in cameras], dim=0)
         viewmats = torch.stack(
             [camera.world_to_camera.to(device) for camera in cameras], dim=0
@@ -341,13 +377,13 @@ class ForegroundBackgroundScene(nn.Module):
             quats=active["quaternions"],
             scales=active["scales"],
             opacities=active["opacities"],
-            colors=active["colors"],
+            colors=colors,
             viewmats=viewmats,
             Ks=Ks,
             width=width,
             height=height,
             packed=False,
-            backgrounds=torch.ones((len(cameras), 3), device=device),
+            backgrounds=backgrounds,
             render_mode="RGB+ED",
             rasterize_mode="classic",
             camera_model="pinhole",
@@ -359,9 +395,13 @@ class ForegroundBackgroundScene(nn.Module):
             means2d.retain_grad()
         rgb = rendered[..., :3]
         alpha = alphas[..., 0]
-        depth = rendered[..., 3]
+        depth_index = 4 if return_foreground_mask else 3
+        depth = rendered[..., depth_index]
         depth = torch.where(alpha > 1e-8, depth, torch.zeros_like(depth))
-        return {"rgb": rgb, "alpha": alpha, "expected_depth": depth}, info
+        outputs = {"rgb": rgb, "alpha": alpha, "expected_depth": depth}
+        if return_foreground_mask:
+            outputs["foreground_mask"] = rendered[..., 3]
+        return outputs, info
 
     def render(
         self,
@@ -568,55 +608,113 @@ def _load_gsplat_rasterization() -> Any:
     return rasterization
 
 
+@lru_cache(maxsize=1)
 def _prepare_windows_extension_environment() -> None:
-    """Expose conda Ninja and the detected MSVC environment to gsplat's JIT build."""
+    """Expose Ninja and one working x64 MSVC environment before gsplat imports."""
 
-    path_value = os.environ.get("PATH", "")
-    if shutil.which("ninja") is None:
-        scripts = Path(sys.executable).parent / "Scripts"
-        if (scripts / "ninja.exe").is_file():
-            path_value = f"{scripts};{path_value}"
-            os.environ["PATH"] = path_value
-    if shutil.which("cl") is not None:
-        return
-    program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-    candidates = [
-        *program_files.glob(
-            "Microsoft Visual Studio/2022/*/VC/Auxiliary/Build/vcvars64.bat"
-        ),
-        *program_files.glob(
-            "Microsoft Visual Studio/18/*/VC/Auxiliary/Build/vcvars64.bat"
-        ),
-    ]
-    if not candidates:
-        raise RuntimeError(
-            "gsplat's Windows JIT build requires Visual Studio C++ Build Tools"
+    with _WINDOWS_EXTENSION_ENVIRONMENT_LOCK:
+        path_value = os.environ.get("PATH", "")
+        if shutil.which("ninja") is None:
+            scripts = Path(sys.executable).parent / "Scripts"
+            if (scripts / "ninja.exe").is_file():
+                path_value = f"{scripts};{path_value}"
+                os.environ["PATH"] = path_value
+        if shutil.which("ninja") is None:
+            raise RuntimeError(
+                "gsplat's Windows JIT build requires ninja.exe in the active "
+                "Python environment"
+            )
+        if shutil.which("cl") is not None:
+            return
+
+        roots = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")),
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
+        ]
+        patterns = (
+            "Microsoft Visual Studio/2022/*/VC/Auxiliary/Build/vcvars64.bat",
+            "Microsoft Visual Studio/18/*/VC/Auxiliary/Build/vcvars64.bat",
+            "Microsoft Visual Studio/2019/*/VC/Auxiliary/Build/vcvars64.bat",
         )
-    process = subprocess.run(
-        f'call "{candidates[0]}" >nul && set',
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    if process.returncode != 0:
+        candidates: list[Path] = []
+        for pattern in patterns:
+            for root in roots:
+                for candidate in sorted(root.glob(pattern)):
+                    if candidate not in candidates:
+                        candidates.append(candidate)
+        if not candidates:
+            raise RuntimeError(
+                "gsplat's Windows JIT build requires Visual Studio C++ Build Tools"
+            )
+
+        command_prompt = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        failures: list[str] = []
+        marker = "__MODAL_GAUSSIANS_MSVC_ENVIRONMENT__"
+        for candidate in candidates:
+            script_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    suffix=".cmd",
+                    encoding="utf-8",
+                    newline="\r\n",
+                    delete=False,
+                ) as script:
+                    script.write(
+                        "@echo off\n"
+                        f'call "{candidate}"\n'
+                        "if errorlevel 1 exit /b %errorlevel%\n"
+                        f"echo {marker}\n"
+                        "set\n"
+                    )
+                    script_path = Path(script.name)
+                activation_environment = os.environ.copy()
+                # Conda's legacy VS compiler activation can leave an invalid
+                # VSINSTALLDIR behind even though cl.exe is unavailable.  A
+                # modern vcvars64.bat then trusts that stale path and aborts
+                # initialization, sometimes while still returning exit code 0.
+                # The candidate path is already resolved above, so make this
+                # child activation independent of that inherited hint.
+                activation_environment.pop("VSINSTALLDIR", None)
+                process = subprocess.run(
+                    [command_prompt, "/d", "/s", "/c", str(script_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                    env=activation_environment,
+                )
+            finally:
+                if script_path is not None:
+                    script_path.unlink(missing_ok=True)
+            before, separator, environment_text = process.stdout.partition(marker)
+            if process.returncode != 0 or not separator:
+                diagnostic = before.strip().replace("\n", " ")[-500:]
+                failures.append(
+                    f"{candidate} (exit {process.returncode}): "
+                    f"{diagnostic or 'no output'}"
+                )
+                continue
+            vc_environment: dict[str, str] = {}
+            for line in environment_text.splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    normalized_key = key.upper()
+                    if normalized_key not in vc_environment or key == normalized_key:
+                        vc_environment[normalized_key] = value
+            compiler = shutil.which("cl", path=vc_environment.get("PATH", ""))
+            if compiler is None:
+                failures.append(f"{candidate} (exit 0): cl.exe was not exposed")
+                continue
+            os.environ.update(vc_environment)
+            return
+
         raise RuntimeError(
-            "Could not activate Visual Studio C++ Build Tools for gsplat: "
-            + process.stderr.strip()
+            "Could not activate any Visual Studio C++ Build Tools installation "
+            "for gsplat. " + " | ".join(failures)
         )
-    vc_environment: dict[str, str] = {}
-    for line in process.stdout.splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            normalized_key = key.upper()
-            if normalized_key not in vc_environment or key == normalized_key:
-                vc_environment[normalized_key] = value
-    os.environ.update(vc_environment)
-    if shutil.which("cl") is None:
-        raise RuntimeError("Visual Studio environment did not expose cl.exe")
 
 
 def _read_exact(stream: Any, size: int, path: Path) -> bytes:

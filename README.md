@@ -25,7 +25,45 @@ import PyTorch or require a Python COLMAP module.
 On Windows, the first static render compiles gsplat's CUDA extension once. The
 loader discovers Conda's Ninja and Visual Studio 2022 C++ Build Tools, and
 translates the two GCC-only flags emitted by gsplat 1.5.3. Linux cluster runs do
-not use this compatibility path.
+not use this compatibility path. Viewer performs this compiler/backend setup
+synchronously before opening its server, so a setup problem fails at startup
+instead of leaving a connected browser whose background renders repeatedly fail.
+
+## Live text progress
+
+CLI stages report start/completion/failure immediately. Static training reports
+step/epoch/batch, loss, PSNR, SSIM, FG/BG Gaussian counts, and density-control
+events. Offline QA reports completed cameras; flow/FFT, greedy selection, dense
+DFT, rigid/fill, rendered design, and coordinate loops report their completed
+units. COLMAP output streams as the executable emits lines.
+
+Progress is normally throttled to five seconds, with immediate first/last-unit
+and epoch/mode reports. Elapsed time and ETA refer to the named phase, not the
+entire pipeline; resumed training estimates speed only from newly completed
+steps. One phase reaching 100% does not bypass artifact validation/publication.
+No new rendering previews or viewer are started for monitoring.
+
+Optionally append these progress messages and Python failure tracebacks to an
+external UTF-8 log. Place `--log-file` **before** the subcommand and outside the
+artifact target (which must not already exist):
+
+```powershell
+modal-gaussians --log-file C:\outputs\scene_run\logs\static_train_attempt01.log static train `
+  --input C:\data\joint_colmap `
+  --work-dir C:\outputs\scene_run\work\static `
+  --output C:\outputs\scene_run\static_scene
+```
+
+After the log is created, follow it from another PowerShell terminal:
+
+```powershell
+Get-Content -LiteralPath C:\outputs\scene_run\logs\static_train_attempt01.log -Tail 20 -Wait
+```
+
+Ctrl+C stops only the log follower. Logs append; use separate files for separate
+stage attempts. This progress log is not a full stdout/stderr capture of every
+third-party library, so retain process output too when debugging. Logging does
+not change scientific configuration, array ordering, or resume state.
 
 ## Optional video and mask preparation
 
@@ -76,8 +114,14 @@ and Gradio usage analytics disabled; no video upload is needed. CUDA is the defa
 `--device cpu` is an explicit, slower alternative. This is a single-editor app:
 do not edit the same prompt in multiple browser tabs.
 
+Extraction and mask tracking share one page. Wide windows show three columns:
+video extraction on the left, frame selection and point prompting in the middle,
+and the current mask preview plus tracking controls on the right. Narrow windows
+wrap the columns automatically. The middle image stays unmodified; clicks update
+the mask overlay and point markers in the right-hand preview.
+
 1. **Extract video (optional):** enter a local MOV/MP4 path (for example
-   `C:\Users\zitengsong\Documents\school\research\modal-gaussian\data\corn1.mov`),
+   `C:\Users\zitengsong\Documents\school\research\modal-gaussian\data\videos\corn1.mov`),
    a sequence name such as `corn1`, and the desired output FPS. FPS is required;
    choose it for your experiment, not a guessed default. Blank end uses the
    rest of the video; blank height preserves resolution. FFmpeg honors rotation
@@ -159,6 +203,49 @@ Image filenames are sorted lexicographically to define temporal order, and mask
 stems must match them exactly. The command never overwrites a completed output
 directory.
 
+### Lossless chunked flow storage
+
+New flow artifacts use format version 7:
+
+```text
+flow_analysis/
+├── manifest.json
+├── flow.zarr/       # [T,H,W,2] float32
+├── spectrum.zarr/   # [floor(T/2)+1,H,W,2] complex64
+└── mask_union.npy   # [H,W] bool
+```
+
+The Zarr v3 directories use lossless Zstd compression and sharding (multiple
+chunks per file). They retain **every pixel, frequency and numerical bit**;
+there is no float16 conversion, resolution reduction, ROI crop or new masking.
+The existing smoothing option still applies its original mask rule. Compression
+savings depend on the data; unsmoothed background flow is generally less
+compressible. Copy each entire `.zarr` directory, not just `zarr.json`.
+
+PNG decoding, Farneback and smoothing now run frame-by-frame in small batches.
+Optional stabilization uses temporary compressed arrays. Full rFFT and selected
+exact-DFT exports read spatial tiles with a target input budget of 32 MiB per
+tile, plus transform/codec working memory. Downstream solvers and the spectrum
+panel read only their requested pixels; they do not expand the complete store.
+The full rFFT remains available to the GUI, and selected dense mode files remain
+ordinary memory-mapped `.npy` arrays.
+
+Use `load_flow_analysis_artifact(path)` to obtain lazy `arrays.flow` and
+`arrays.spectrum` handles; slice them instead of calling `np.asarray` on the
+complete array. For paired `(x,y)` samples use `flow.storage.read_pixels`, which
+supports both storage formats and preserves the legacy sampling layout.
+The manifest records shape, dtype, chunk/shard layout and per-store SHA-256.
+Incomplete or damaged stores fail validation; publication remains atomic and
+non-overwriting.
+
+Existing version-6 `flow.npy` / `spectrum.npy` artifacts and their identities
+remain readable without conversion, including existing downstream results.
+Existing experiments are not modified or reduced in size automatically. New
+version-7 artifacts have new identities: do not replace an ancestor of an old
+result with a newly generated flow store or rewrite its hashes to match.
+CLI arguments and experiment JSON settings are unchanged. Zarr 3.1.6 is pinned
+in `pyproject.toml` and uses the existing Python 3.11 environment.
+
 ## Joint COLMAP preparation
 
 Before static 3D Gaussian training, prepare one joint COLMAP reconstruction from
@@ -227,11 +314,20 @@ modal-gaussians static train `
 ```
 
 The accepted defaults are 100 epochs, batch size 8, at most 40,000 initial
-foreground points, at most 100,000 initial background points, and random seed
-42. Both sampled sweep frames and registered reference frames participate in
-the RGB loss. Their COLMAP K and poses remain fixed. Masks affect only the
-initial foreground/background point classification; there is no mask, alpha,
-or depth supervision.
+foreground points, at most 80,000 initial background points, and random seed
+42. Foreground densification stops at step 4,000; background densification
+stops earlier at step 1,000 and background growth is capped at 160,000
+Gaussians. With the planned full-20-FPS COLMAP training set this is expected to
+produce roughly 4,800 optimizer steps, leaving about 800 final steps without
+densification.
+
+Both sampled sweep frames and registered reference frames participate in the
+RGB loss. Their COLMAP K and poses remain fixed. The semantic masks supervise a
+jointly depth-ordered foreground-membership channel with weight 1.0, using the
+same 7×7 erosion kernel and 98% trimmed L1 convention as the accepted old static
+run. RGB is ignored only in the uncertain eroded mask boundary. Depth inputs
+and the inverse-depth losses are deliberately not connected yet; all depth
+weights remain zero until the aligned-depth artifact is specified.
 
 The work directory stores `resume.pt` and, after training, an offline `qa/`
 render set. Resume only when the joint-COLMAP input and all resolved training
@@ -503,6 +599,24 @@ modal-gaussians motion fill `
   --output C:\outputs\completed_modes
 ```
 
+When the selected K is an **upper limit**, append `--valid-modes-only` to
+`motion fill`. This omits only modes with zero trusted rigid Gaussian seeds;
+it does not relax alpha/rigidity thresholds or select replacements to reach K.
+Without the flag, every selected mode must have trusted seeds. An empty usable
+subset always fails before completion begins.
+
+Completion format v2 records `mode_selection` (policy, original count, retained
+source slots and rejected-mode reasons). Its local `mode_slot=0..K_valid-1`
+records include `source_mode_slot`, while candidate indices/frequencies and
+their relative greedy order stay unchanged. Original dense DFT, measurements,
+and rigid artifacts are retained without copying or editing. The downstream
+design, coordinates and result carry these mode records; the spectrum panel
+uses the source-slot mapping to read the original dense fields. Loaders check
+the mapping and exact trusted seed values against the bound rigid parent.
+Legacy format v1 full-prefix completion artifacts remain readable. Changed
+selection policies/maps invalidate work-directory identity and cannot resume
+an incompatible checkpoint.
+
 This migrates only the accepted sequential rigid branch. It first revisits
 rigid components that have one supported view but failed the trusted-seed gate.
 The reliably observable twist directions are kept; weak or viewing-ray-
@@ -728,9 +842,12 @@ The accepted old modal-Viewer functions are available together:
   per-mode enable, gain, phase, solo, disable-all, and enable-all controls;
 - RGB, calibrated projected modal phase, and unique-topology-view observation-
   count Gaussian coloring;
-- support-role point clouds for trusted rigid, promoted single-view rigid,
-  pointwise KNN fill, and unresolved foreground Gaussians, including mode,
-  role, count, and point-size filters;
+- legacy display-role point clouds with Anchor, Partial, Filled, Unobserved,
+  and Excluded filters, in that order. In the accepted sequential rigid-fill
+  route, Anchor combines trusted seeds and promoted single-view components;
+  Filled is pointwise KNN completion; Unobserved is unresolved. Partial and
+  Excluded are empty for this route. The artifact's four scientific support
+  classes remain unchanged;
 - calibrated camera frustums, camera jumps, orbit-center reset, foreground-only
   rendering, and complete-render hiding;
 - synchronized original dense-rFFT and reconstructed selected-mode spectra,
@@ -740,10 +857,20 @@ The accepted old modal-Viewer functions are available together:
   timing/FPS settings, JSON load/save, and up-direction reset. Camera-path JSON
   is written below `viewer_work/camera_paths/`.
 
-Viser 1.0.30 does not expose the custom floating-panel extension used by the
-old experiment environment, so the same spectrum controls are hosted in the
-standard `Spectrum` tab. This changes only panel placement, not the data,
-controls, or synchronization behavior. The obsolete Shape-of-Motion dynamic
+Viser is pinned to 1.1.0. `Spectrum` uses its standalone floating-panel API,
+matching the old Viewer: initial position (16, 16), size 720 x 800 CSS pixels,
+with dragging, resizing, and docking. `Render` remains in the main control
+panel. This layout does not change scientific artifacts. Restart the
+Viewer after upgrading and hard-refresh the browser to load the matching client.
+The main controls follow the final old `run_rendering.py` Viewer order:
+Rendering → Time → Cameras → Gaussian color → Modal playback → Debug points
+→ Render. Debug points uses the old frequency-labelled `Modal role mode`
+dropdown (only when there is more than one mode), color legend, and five role
+checkboxes; `Hide background` appears only when background Gaussians exist.
+The dark theme, yellow accent, medium control width, and default Viewer Res
+of 2048 also match the old Viewer. Explicit `--viewer-res` settings still take
+precedence, so an existing run configured with 1024 keeps that resolution.
+The obsolete Shape-of-Motion dynamic
 track overlay is intentionally absent: the standalone modal result contains no
 dynamic trajectories or track state.
 

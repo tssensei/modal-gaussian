@@ -10,10 +10,12 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from collections import deque
 from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
+from modal_gaussians.progress import report_progress
 
 
 LABEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
@@ -158,29 +160,36 @@ def _copy_input(
 
 
 def _run_command(command: Sequence[str], log_path: Path) -> None:
-    """Run one COLMAP command and append its complete output to a log."""
+    """Stream one COLMAP command to the terminal and log, retaining its error tail."""
 
-    process = subprocess.run(
-        list(command),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    output = process.stdout or ""
+    report_progress(f"COLMAP START {shlex.join(command)}")
+    tail: deque[str] = deque(maxlen=20)
     with log_path.open("a", encoding="utf-8") as stream:
         stream.write(f"$ {shlex.join(command)}\n")
-        stream.write(output)
-        if output and not output.endswith("\n"):
-            stream.write("\n")
+        stream.flush()
+        with subprocess.Popen(
+            list(command), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        ) as process:
+            try:
+                assert process.stdout is not None
+                for line in process.stdout:
+                    stream.write(line)
+                    stream.flush()
+                    tail.append(line.rstrip())
+                    report_progress(f"COLMAP | {line.rstrip()}")
+                process.wait()
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
     if process.returncode != 0:
-        tail = "\n".join(output.splitlines()[-20:])
+        error_tail = "\n".join(tail)
         raise RuntimeError(
             f"COLMAP command failed with exit code {process.returncode}: "
-            f"{shlex.join(command)}\n{tail}"
+            f"{shlex.join(command)}\n{error_tail}"
         )
+    report_progress(f"COLMAP COMPLETE {command[1]}")
 
 
 def _run_reconstruction(
