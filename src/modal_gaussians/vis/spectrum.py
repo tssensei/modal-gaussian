@@ -21,7 +21,7 @@ from modal_gaussians.flow.artifact import (
 )
 from modal_gaussians.measurements import load_gaussian_measurements
 from modal_gaussians.modes import Complex2DModesArtifact, load_complex_2d_modes
-from modal_gaussians.motion_fill import resolve_source_mode_slots
+from modal_gaussians.motion.common.mode_mapping import resolve_source_mode_slots
 from modal_gaussians.result import ModalResultArtifact
 from modal_gaussians.topology import load_observation_topology
 
@@ -110,16 +110,23 @@ def _mean_image_plane_power(
     return result.astype(np.float32)
 
 
-class SpectrumComparisonController:
-    """Compare bound dense flow spectra with rendered 3D modal projections."""
+def _completed_dense_modes(completed: Any) -> Complex2DModesArtifact:
+    """Bind display targets to the method's declared dense modal source."""
 
-    def __init__(self, result: ModalResultArtifact) -> None:
-        self.result = result
-        self.frequencies_hz = np.asarray(
-            [mode["frequency_hz"] for mode in result.manifest["modes"]],
-            dtype=np.float64,
-        )
-        completed = result.completed_modes
+    if completed.manifest.get("version") in (8, 9):
+        method = ("neural_fragment_motion_propagation" if completed.manifest["version"] == 9
+                  else "neural_complex_displacement_field")
+        if completed.manifest.get("completion_method") != method:
+            raise ValueError("Unsupported neural spectrum source contract")
+        source = completed.manifest.get("complex_2d_modes")
+        if not isinstance(source, str) or not source:
+            raise ValueError("Neural completed modes do not identify dense 2D modes")
+        dense = load_complex_2d_modes(source)
+        if dense.manifest["complex_2d_modes_identity"] != completed.manifest.get("complex_2d_modes_identity"):
+            raise ValueError("Neural Viewer dense-mode identity differs")
+        if dense.manifest["topology_identity"] != completed.manifest.get("topology_identity"):
+            raise ValueError("Neural Viewer dense-mode topology identity differs")
+    else:
         measurement_path = Path(completed.manifest["measurements"])
         measurements = load_gaussian_measurements(measurement_path)
         dense = load_complex_2d_modes(measurements.manifest["complex_2d_modes"])
@@ -130,13 +137,26 @@ class SpectrumComparisonController:
             raise ValueError("Viewer dense-mode identity differs from measurements")
         if dense.manifest["modes"] != measurements.manifest["modes"]:
             raise ValueError("Viewer dense-mode order differs from measurements")
+        if topology.manifest["topology_identity"] != completed.manifest["topology_identity"]:
+            raise ValueError("Viewer topology identity differs from modal result")
+    resolve_source_mode_slots(completed.manifest["modes"], dense.manifest["modes"])
+    return dense
+
+
+class SpectrumComparisonController:
+    """Compare bound dense flow spectra with rendered 3D modal projections."""
+
+    def __init__(self, result: ModalResultArtifact) -> None:
+        self.result = result
+        self.frequencies_hz = np.asarray(
+            [mode["frequency_hz"] for mode in result.manifest["modes"]],
+            dtype=np.float64,
+        )
+        completed = result.completed_modes
+        dense = _completed_dense_modes(completed)
         self._source_mode_slots = resolve_source_mode_slots(
             result.manifest["modes"], dense.manifest["modes"]
         )
-        if topology.manifest["topology_identity"] != completed.manifest[
-            "topology_identity"
-        ]:
-            raise ValueError("Viewer topology identity differs from modal result")
         self.dense_modes: Complex2DModesArtifact = dense
         self._states: dict[str, SpectrumViewState] = {}
         self._global_magnitude_cache: dict[tuple[str, int], float] = {}
@@ -206,6 +226,10 @@ class SpectrumComparisonController:
                 not math.isfinite(denominator)
                 or denominator <= np.finfo(np.float64).tiny
             ):
+                if self.result.completed_modes.manifest.get("version") in (8, 9):
+                    if math.isfinite(denominator):
+                        # Unresolved neural modes remain explicit zero fields.
+                        continue
                 raise ValueError(
                     "Rendered projected mode has zero image-plane energy for "
                     f"mode {mode_index} at "

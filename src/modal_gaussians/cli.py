@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 import sys
@@ -293,10 +294,175 @@ def build_parser() -> argparse.ArgumentParser:
     rigid_solve.add_argument("--work-dir", required=True, type=Path)
     rigid_solve.add_argument("--output", required=True, type=Path)
     motion_parser = command_parsers.add_parser(
-        "motion", help="Sequential full-foreground modal motion completion"
+        "motion", help="Full-foreground modal motion construction"
     )
     motion_commands = motion_parser.add_subparsers(
         dest="motion_command", required=True
+    )
+    propagate_fragments = motion_commands.add_parser(
+        "propagate-fragments", help="Attach compact fragments to fixed local v8 neural motions",
+    )
+    for name in ("parent", "output"):
+        propagate_fragments.add_argument(f"--{name}", required=True, type=Path)
+    for name, default in (("max-fragment-nodes", 16), ("core-degree", 3), ("min-anchors", 3)):
+        propagate_fragments.add_argument(f"--{name}", type=_positive_int, default=default)
+    for name, default in (("max-fragment-extent", 0.016), ("attachment-distance", 0.008),
+                          ("patch-radius", 0.008), ("host-size-ratio", 4.0), ("ambiguity-ratio", 1.25)):
+        propagate_fragments.add_argument(f"--{name}", type=_positive_float, default=default)
+    fit_neural = motion_commands.add_parser(
+        "fit-neural", help="Fit full-foreground complex displacement fields",
+    )
+    for name in ("scene", "topology", "measurements", "graph", "alignment-from", "work-dir", "output"):
+        fit_neural.add_argument(f"--{name}", required=True, type=Path)
+    for name, default in (
+        ("graph-neighbors", 8), ("max-controls", 2048), ("hidden-dim", 64),
+        ("message-layers", 3), ("pixel-sample-stride", 2),
+        ("max-iterations", 2000), ("convergence-patience", 50),
+        ("checkpoint-every", 100),
+    ):
+        fit_neural.add_argument(f"--{name}", type=_positive_int, default=default)
+    for name, default in (("mask-erosion-iterations", 1), ("seed", 1729)):
+        fit_neural.add_argument(f"--{name}", type=_non_negative_int, default=default)
+    for name, default in (
+        ("graph-max-distance", 0.008), ("unknown-max-distance", 0.004),
+        ("unknown-edge-weight", 0.1), ("control-radius-fraction", 0.03),
+        ("alpha-minimum", 0.05), ("energy-floor-fraction", 0.05),
+        ("huber-delta", 1.0), ("rotation-length-fraction", 0.05),
+        ("learning-rate", 0.001), ("gradient-clip", 1.0),
+    ):
+        fit_neural.add_argument(f"--{name}", type=_positive_float, default=default)
+    for name, default in (
+        ("deformation-weight", 1.0), ("rotation-weight", 0.1),
+        ("relative-tolerance", 1.0e-6),
+    ):
+        fit_neural.add_argument(f"--{name}", type=_non_negative_float, default=default)
+    fit_neural.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    fit_neural.add_argument("--graph-edge-filter", choices=("depth", "none"), default="depth",
+                            help="Use depth/path filtering, or retain every spatial mutual-KNN candidate")
+    fit_neural.add_argument(
+        "--resume", action="store_true",
+        help="Resume only when sources, model, geometry and optimizer settings match",
+    )
+    export_neural_prefix = motion_commands.add_parser(
+        "export-neural-prefix", help="Export completed prefix checkpoints without training",
+    )
+    for name in ("scene", "topology", "measurements", "graph", "alignment-from", "work-dir", "output"):
+        export_neural_prefix.add_argument(f"--{name}", required=True, type=Path)
+    export_neural_prefix.add_argument("--count", type=_positive_int, required=True)
+    fit_bases = motion_commands.add_parser(
+        "fit-bases",
+        help="Fit per-Gaussian weights over selected rigid motion bases",
+    )
+    fit_bases.add_argument("--scene", required=True, type=Path)
+    fit_bases.add_argument("--topology", required=True, type=Path)
+    fit_bases.add_argument("--measurements", required=True, type=Path)
+    fit_bases.add_argument("--graph", required=True, type=Path)
+    fit_bases.add_argument("--rigid", required=True, type=Path)
+    fit_bases.add_argument("--work-dir", required=True, type=Path)
+    fit_bases.add_argument("--output", required=True, type=Path)
+    fit_bases.add_argument(
+        "--weight-sharing",
+        choices=("shared", "per-frequency"),
+        default="shared",
+        help="Share weights across modes or fit a separate weight field per mode",
+    )
+    fit_bases.add_argument(
+        "--rigid-basis-count", type=_positive_int, default=None,
+        help="Exact pool size (legacy policies default to 6); omit for trusted_per_mode",
+    )
+    fit_bases.add_argument(
+        "--basis-selection-policy",
+        choices=("trusted_all_modes", "all_rigid_components", "trusted_per_mode"),
+        default="trusted_all_modes",
+        help="Select trust across all modes, independently per mode, or all solved components",
+    )
+    fit_bases.add_argument(
+        "--local-rigid-basis-count", type=_positive_int, default=4
+    )
+    fit_bases.add_argument("--graph-neighbors", type=_positive_int, default=8)
+    fit_bases.add_argument(
+        "--graph-max-distance", type=_positive_float, default=0.008
+    )
+    fit_bases.add_argument(
+        "--distance-temperature", type=_positive_float, default=0.02
+    )
+    fit_bases.add_argument(
+        "--zero-prior-score", type=_positive_float, default=0.05
+    )
+    fit_bases.add_argument(
+        "--smooth-weight", type=_non_negative_float, default=0.01
+    )
+    fit_bases.add_argument(
+        "--prior-weight", type=_non_negative_float, default=0.001
+    )
+    fit_bases.add_argument(
+        "--energy-floor-fraction", type=_positive_float, default=0.05
+    )
+    fit_bases.add_argument("--max-iterations", type=_positive_int, default=1_000)
+    fit_bases.add_argument(
+        "--relative-tolerance", type=_non_negative_float, default=1.0e-8
+    )
+    fit_bases.add_argument(
+        "--projected-gradient-tolerance",
+        type=_non_negative_float,
+        default=1.0e-6,
+    )
+    fit_bases.add_argument(
+        "--convergence-patience", type=_positive_int, default=10
+    )
+    fit_bases.add_argument(
+        "--initial-lipschitz", type=_positive_float, default=1.0
+    )
+    fit_bases.add_argument(
+        "--backtracking-factor", type=_positive_float, default=2.0
+    )
+    fit_bases.add_argument("--checkpoint-every", type=_positive_int, default=25)
+    fit_bases.add_argument(
+        "--mode-chunk-size", type=_positive_int, default=4
+    )
+    fit_bases.add_argument(
+        "--sample-chunk-size", type=_positive_int, default=16_384
+    )
+    fit_bases.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
+    fit_bases.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume only when every input and resolved solver setting matches",
+    )
+    refine_green = motion_commands.add_parser(
+        "refine-green",
+        help="Refine graph-propagated weights with observation-supported weights fixed",
+    )
+    refine_green.add_argument("--input", required=True, type=Path)
+    refine_green.add_argument("--work-dir", required=True, type=Path)
+    refine_green.add_argument("--output", required=True, type=Path)
+    refine_green.add_argument(
+        "--blue-green-multiplier", type=_positive_float, default=1.0,
+        help="Multiply the parent's graph penalty on blue-green edges",
+    )
+    refine_green.add_argument(
+        "--green-prior-multiplier", type=_non_negative_float, default=1.0,
+        help="Multiply the parent's distance-prior penalty on green points",
+    )
+    refine_green.add_argument("--max-iterations", type=_positive_int, default=3_000)
+    refine_green.add_argument(
+        "--relative-tolerance", type=_non_negative_float, default=1.0e-8
+    )
+    refine_green.add_argument(
+        "--projected-gradient-tolerance", type=_non_negative_float, default=1.0e-6
+    )
+    refine_green.add_argument(
+        "--convergence-patience", type=_positive_int, default=10
+    )
+    refine_green.add_argument("--checkpoint-every", type=_positive_int, default=50)
+    refine_green.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto"
+    )
+    refine_green.add_argument(
+        "--resume", action="store_true",
+        help="Resume only when the parent identity and refinement settings match",
     )
     motion_fill = motion_commands.add_parser(
         "fill",
@@ -631,7 +797,7 @@ def _dispatch(
             )
             return 0
         if args.command == "graph" and args.graph_command == "build":
-            from modal_gaussians.structure_graph import (
+            from modal_gaussians.motion.rigid.structure_graph import (
                 ObservedStructureGraphConfig,
                 build_observed_structure_graph_artifact,
             )
@@ -667,7 +833,7 @@ def _dispatch(
             )
             return 0
         if args.command == "rigid" and args.rigid_command == "solve":
-            from modal_gaussians.rigid import build_rigid_modes_artifact
+            from modal_gaussians.motion.rigid.rigid import build_rigid_modes_artifact
 
             artifact = build_rigid_modes_artifact(
                 scene_dir=args.scene,
@@ -695,8 +861,194 @@ def _dispatch(
             print("quality gate: unified visualization approval required")
             print(f"identity: {artifact.manifest['rigid_modes_identity']}")
             return 0
+        if args.command == "motion" and args.motion_command == "propagate-fragments":
+            from modal_gaussians.motion.neural.fragment_propagation import (
+                FragmentPropagationConfig,
+                build_fragment_modes,
+            )
+
+            names = ("max_fragment_nodes", "core_degree", "min_anchors", "max_fragment_extent",
+                     "attachment_distance", "patch_radius", "host_size_ratio", "ambiguity_ratio")
+            artifact = build_fragment_modes(
+                parent_dir=args.parent, output_dir=args.output,
+                config=FragmentPropagationConfig(**{name: getattr(args, name) for name in names}),
+                command=[parser.prog, *arguments],
+            )
+            print(f"fragment-propagated modal candidate: {artifact.path}")
+            print(f"identity: {artifact.manifest['completed_modes_identity']}")
+            print(json.dumps(artifact.manifest["diagnostics"]))
+            return 0
+        if args.command == "motion" and args.motion_command == "fit-neural":
+            from modal_gaussians.motion.neural.neural_modes import (
+                NeuralModesConfig,
+                build_neural_modes_artifact,
+            )
+
+            config_names = (
+                "graph_neighbors", "graph_max_distance", "graph_edge_filter", "unknown_max_distance",
+                "unknown_edge_weight", "control_radius_fraction", "max_controls",
+                "hidden_dim", "message_layers", "pixel_sample_stride", "alpha_minimum",
+                "mask_erosion_iterations", "energy_floor_fraction", "huber_delta",
+                "deformation_weight", "rotation_weight", "rotation_length_fraction",
+                "learning_rate", "max_iterations", "gradient_clip", "seed",
+                "convergence_patience", "relative_tolerance", "checkpoint_every", "device",
+            )
+            artifact = build_neural_modes_artifact(
+                scene_dir=args.scene, topology_dir=args.topology,
+                measurements_dir=args.measurements, graph_dir=args.graph,
+                alignment_from=args.alignment_from, work_dir=args.work_dir,
+                output_dir=args.output, resume=bool(args.resume),
+                config=NeuralModesConfig(**{name: getattr(args, name) for name in config_names}),
+                command=[parser.prog, *arguments],
+            )
+            counts = artifact.manifest["counts"]
+            print(f"neural modal candidate: {artifact.path.resolve()}")
+            print(f"modes/foreground: {counts['modes']}/{counts['foreground_gaussians']}")
+            print("quality gate: unified visualization approval required")
+            print(f"identity: {artifact.manifest['completed_modes_identity']}")
+            return 0
+        if args.command == "motion" and args.motion_command == "export-neural-prefix":
+            from modal_gaussians.motion.neural.neural_modes import export_neural_prefix_artifact
+
+            artifact = export_neural_prefix_artifact(
+                scene_dir=args.scene, topology_dir=args.topology,
+                measurements_dir=args.measurements, graph_dir=args.graph,
+                alignment_from=args.alignment_from, work_dir=args.work_dir,
+                output_dir=args.output, count=args.count, command=[parser.prog, *arguments],
+            )
+            counts = artifact.manifest["counts"]
+            print(f"neural prefix candidate: {artifact.path.resolve()}")
+            print(f"modes/foreground: {counts['modes']}/{counts['foreground_gaussians']}")
+            print("quality gate: unified visualization approval required")
+            print(f"identity: {artifact.manifest['completed_modes_identity']}")
+            return 0
+        if args.command == "motion" and args.motion_command == "fit-bases":
+            from modal_gaussians.motion.rigid.motion_basis import (
+                MotionBasisConfig,
+                build_motion_basis_modes_artifact,
+            )
+
+            if args.basis_selection_policy == "trusted_per_mode":
+                if args.weight_sharing != "per-frequency":
+                    parser.error("trusted_per_mode requires --weight-sharing per-frequency")
+                if args.rigid_basis_count is not None:
+                    parser.error("trusted_per_mode determines its pool automatically; omit --rigid-basis-count")
+                rigid_basis_count = None
+            else:
+                rigid_basis_count = 6 if args.rigid_basis_count is None else int(args.rigid_basis_count)
+            if args.weight_sharing == "per-frequency":
+                from modal_gaussians.motion.rigid.motion_basis_frequency import build_frequency_motion_basis_modes_artifact
+
+                build_basis_artifact = build_frequency_motion_basis_modes_artifact
+            else:
+                build_basis_artifact = build_motion_basis_modes_artifact
+            artifact = build_basis_artifact(
+                scene_dir=args.scene,
+                topology_dir=args.topology,
+                measurements_dir=args.measurements,
+                observed_graph_dir=args.graph,
+                rigid_modes_dir=args.rigid,
+                work_dir=args.work_dir,
+                output_dir=args.output,
+                resume=bool(args.resume),
+                config=MotionBasisConfig(
+                    rigid_basis_count=rigid_basis_count,
+                    basis_selection_policy=str(args.basis_selection_policy),
+                    local_rigid_basis_count=int(args.local_rigid_basis_count),
+                    graph_neighbors=int(args.graph_neighbors),
+                    graph_max_distance=float(args.graph_max_distance),
+                    distance_temperature=float(args.distance_temperature),
+                    zero_prior_score=float(args.zero_prior_score),
+                    smooth_weight=float(args.smooth_weight),
+                    prior_weight=float(args.prior_weight),
+                    energy_floor_fraction=float(args.energy_floor_fraction),
+                    max_iterations=int(args.max_iterations),
+                    relative_tolerance=float(args.relative_tolerance),
+                    projected_gradient_tolerance=float(
+                        args.projected_gradient_tolerance
+                    ),
+                    convergence_patience=int(args.convergence_patience),
+                    initial_lipschitz=float(args.initial_lipschitz),
+                    backtracking_factor=float(args.backtracking_factor),
+                    checkpoint_every=int(args.checkpoint_every),
+                    mode_chunk_size=int(args.mode_chunk_size),
+                    sample_chunk_size=int(args.sample_chunk_size),
+                    device=cast(
+                        Literal["auto", "cpu", "cuda"], str(args.device)
+                    ),
+                ),
+                command=[parser.prog, *arguments],
+            )
+            counts = artifact.manifest["counts"]
+            print(f"motion-basis modal candidate: {artifact.path.resolve()}")
+            print(f"weight sharing: {args.weight_sharing}")
+            print(
+                "modes/foreground/rigid bases/total bases: "
+                f"{counts['modes']}/{counts['foreground_gaussians']}/"
+                f"{counts['rigid_bases']}/{counts['bases']}"
+            )
+            if "basis_active_mask" in artifact.arrays:
+                print("trusted rigid bases per source mode: " + ", ".join(
+                    str(int(value)) for value in artifact.arrays["basis_active_mask"][:, :-1].sum(axis=1)
+                ))
+            role_count_scope = (
+                " (union over modes)" if args.weight_sharing == "per-frequency" else ""
+            )
+            print(
+                "measurement-supported/graph-propagated/zero-fallback Gaussians"
+                f"{role_count_scope}: "
+                f"{counts['measurement_supported_gaussians']}/"
+                f"{counts['graph_propagated_gaussians']}/"
+                f"{counts['zero_fallback_gaussians']}"
+            )
+            print(f"full-foreground spatial edges: {counts['spatial_edges']}")
+            print("quality gate: unified visualization approval required")
+            print(f"identity: {artifact.manifest['completed_modes_identity']}")
+            return 0
+        if args.command == "motion" and args.motion_command == "refine-green":
+            from modal_gaussians.motion.rigid.motion_basis_green import (
+                GreenRefinementConfig,
+                build_green_refined_motion_basis_artifact,
+            )
+
+            artifact = build_green_refined_motion_basis_artifact(
+                parent_dir=args.input,
+                work_dir=args.work_dir,
+                output_dir=args.output,
+                resume=bool(args.resume),
+                config=GreenRefinementConfig(
+                    blue_green_multiplier=float(args.blue_green_multiplier),
+                    green_prior_multiplier=float(args.green_prior_multiplier),
+                    max_iterations=int(args.max_iterations),
+                    relative_tolerance=float(args.relative_tolerance),
+                    projected_gradient_tolerance=float(
+                        args.projected_gradient_tolerance
+                    ),
+                    convergence_patience=int(args.convergence_patience),
+                    checkpoint_every=int(args.checkpoint_every),
+                    device=cast(Literal["auto", "cpu", "cuda"], str(args.device)),
+                ),
+                command=[parser.prog, *arguments],
+            )
+            counts = artifact.manifest["counts"]
+            print(f"green-refined modal candidate: {artifact.path.resolve()}")
+            print(
+                "modes/foreground: "
+                f"{counts['modes']}/{counts['foreground_gaussians']}"
+            )
+            print("measurement-supported weights: fixed to parent")
+            print(
+                "fixed measurement-supported/refined graph-propagated/"
+                "zero-fallback Gaussians (union over modes): "
+                f"{counts['measurement_supported_gaussians']}/"
+                f"{counts['graph_propagated_gaussians']}/"
+                f"{counts['zero_fallback_gaussians']}"
+            )
+            print("quality gate: unified visualization approval required")
+            print(f"identity: {artifact.manifest['completed_modes_identity']}")
+            return 0
         if args.command == "motion" and args.motion_command == "fill":
-            from modal_gaussians.motion_fill import (
+            from modal_gaussians.motion.rigid.motion_fill import (
                 MotionFillConfig,
                 build_completed_modes_artifact,
             )

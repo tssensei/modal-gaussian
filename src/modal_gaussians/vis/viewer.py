@@ -16,15 +16,14 @@ import viser
 import viser.transforms as vtf
 
 from modal_gaussians.result import ModalResultArtifact, load_modal_result
+from modal_gaussians.motion.common.mode_mapping import resolve_source_mode_slots
+from modal_gaussians.motion.rigid.rigid import load_rigid_modes
 from modal_gaussians.static import (
     Camera,
     _load_gsplat_rasterization,
     cameras_from_scene_manifest,
 )
-from modal_gaussians.structure_graph import (
-    ObservedStructureGraphArtifact,
-    load_observed_structure_graph,
-)
+from modal_gaussians.motion.rigid.structure_graph import load_observed_structure_graph
 from modal_gaussians.topology import load_observation_topology
 from modal_gaussians.vis.playback_panel import add_gui_playback_group
 from modal_gaussians.vis.render_panel import populate_render_tab
@@ -40,16 +39,27 @@ COLOR_RGB = "rgb"
 COLOR_PHASE = "modal phase"
 COLOR_OBSERVATIONS = "obs count"
 
-SUPPORT_DISPLAY_NAMES = (
+LEGACY_SUPPORT_DISPLAY_NAMES = (
     "anchor",
     "filled",
     "unobserved",
+)
+BASIS_SUPPORT_DISPLAY_NAMES = (
+    "measurement-supported",
+    "graph-propagated",
+    "zero-fallback",
+)
+NEURAL_SUPPORT_DISPLAY_NAMES = (
+    "directly-supervised",
+    "structure-inferred",
+    "unresolved",
 )
 SUPPORT_COLORS = np.asarray(
     (
         (0.05, 0.55, 1.0),
         (0.1, 0.85, 0.3),
         (0.65, 0.35, 1.0),
+        (1.0, 0.75, 0.05),
     ),
     dtype=np.float32,
 )
@@ -70,8 +80,12 @@ def _stable_uniform_indices(count: int, maximum: int) -> np.ndarray:
     ).astype(np.int64)
 
 
-def _component_colors(component_index: np.ndarray) -> np.ndarray:
-    """Reproduce the old graph Viewer's deterministic component palette."""
+def _component_colors(
+    component_index: np.ndarray,
+    *,
+    trusted_component_index: np.ndarray | None = None,
+) -> np.ndarray:
+    """Color graph components deterministically, optionally graying untrusted ones."""
 
     components = np.asarray(component_index)
     if components.ndim != 1 or not np.issubdtype(components.dtype, np.integer):
@@ -104,7 +118,66 @@ def _component_colors(component_index: np.ndarray) -> np.ndarray:
                     rgb[mask, column] = channel[mask]
                 else:
                     rgb[mask, column] = float(channel)
+    if trusted_component_index is not None:
+        trusted = np.asarray(trusted_component_index)
+        if (
+            trusted.ndim != 1
+            or not np.issubdtype(trusted.dtype, np.integer)
+            or np.any(trusted < 0)
+        ):
+            raise ValueError("trusted_component_index must be non-negative graph IDs")
+        rgb[~np.isin(components, trusted)] = 0.55
     return rgb.astype(np.float32)
+
+
+def _component_graph_color_frames(
+    edge_components: np.ndarray,
+    completed_manifest: dict[str, Any],
+    completed_arrays: dict[str, np.ndarray],
+    rigid_manifest: dict[str, Any],
+    rigid_arrays: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Keep legacy trust static; color v6/v7 active bases in greedy mode order."""
+
+    retained = np.asarray(rigid_arrays["component_retained_mask"])
+    graph_ids = np.asarray(rigid_arrays["component_graph_index"])
+    if retained.dtype != np.bool_ or retained.ndim != 2:
+        raise ValueError("Component trust must be boolean [K_source,C]")
+    if graph_ids.shape != (retained.shape[1],):
+        raise ValueError("Rigid-to-graph component mapping has the wrong shape")
+    if completed_manifest.get("version") not in (6, 7):
+        trusted_graph = graph_ids[np.all(retained, axis=0)]
+        return _component_colors(edge_components, trusted_component_index=trusted_graph), None
+    if completed_manifest.get("motion_basis", {}).get("basis_selection_policy") != "trusted_per_mode":
+        raise ValueError("Per-mode graph colors require trusted_per_mode eligibility")
+    source_slots = resolve_source_mode_slots(
+        completed_manifest["modes"], rigid_manifest["modes"]
+    )
+    basis_components = np.asarray(completed_arrays["basis_component_index"])
+    active = np.asarray(completed_arrays["basis_active_mask"])
+    if (
+        basis_components.ndim != 1
+        or not np.issubdtype(basis_components.dtype, np.integer)
+        or not len(basis_components)
+        or basis_components[-1] != -1
+        or np.any(basis_components[:-1] < 0)
+        or np.any(basis_components[:-1] >= len(graph_ids))
+    ):
+        raise ValueError("Per-mode graph basis component indices are invalid")
+    if active.dtype != np.bool_ or active.shape != (len(source_slots), len(basis_components)):
+        raise ValueError("Per-mode graph basis activity must be boolean [K,B]")
+    expected_active = np.column_stack((
+        retained[source_slots][:, basis_components[:-1]],
+        np.ones(len(source_slots), dtype=bool),
+    ))
+    if not np.array_equal(active, expected_active):
+        raise ValueError("Per-mode graph basis activity differs from source trust")
+    basis_graph_ids = graph_ids[basis_components[:-1]]
+    colors = np.stack([
+        _component_colors(edge_components, trusted_component_index=basis_graph_ids[row[:-1]])
+        for row in active
+    ])
+    return colors[0], colors
 
 
 @dataclass(frozen=True)
@@ -128,6 +201,96 @@ def _motion_fill_display_classes(arrays: dict[str, np.ndarray]) -> np.ndarray:
     classes[arrays["completion_mask"] & ~anchors] = 1  # Filled.
     classes[anchors] = 0  # Anchor, including promoted single-view components.
     return classes
+
+
+def _basis_display_classes(
+    manifest: dict[str, Any], arrays: dict[str, np.ndarray]
+) -> np.ndarray:
+    """Map shared, per-frequency, or green-refined basis support to Viewer roles."""
+
+    version = manifest.get("version")
+    methods = {
+        3: "shared_motion_basis_blend",
+        4: "per_frequency_motion_basis_blend",
+        5: "fixed_observation_green_basis_refinement",
+        6: "per_frequency_motion_basis_blend",
+        7: "fixed_observation_green_basis_refinement",
+    }
+    if version not in methods or manifest.get("completion_method") != methods[version]:
+        raise ValueError("Unsupported motion-basis completion role contract")
+    names = (
+        "measurement_supported_mask",
+        "graph_propagated_mask",
+        "zero_fallback_mask",
+    )
+    missing = [name for name in (*names, "phi") if name not in arrays]
+    if missing:
+        raise ValueError(
+            "Motion-basis Viewer arrays are missing: " + ", ".join(missing)
+        )
+    masks = tuple(np.asarray(arrays[name]) for name in names)
+    phi = np.asarray(arrays["phi"])
+    if phi.ndim != 3 or phi.shape[2] != 3:
+        raise ValueError("Motion-basis phi must have shape [K,G,3]")
+    gaussian_count = phi.shape[1]
+    support_shape = (gaussian_count,) if version == 3 else phi.shape[:2]
+    if any(
+        mask.dtype != np.bool_ or mask.shape != support_shape
+        for mask in masks
+    ):
+        shape_label = "[G]" if version == 3 else "[K,G]"
+        raise ValueError(f"Motion-basis support masks must be boolean {shape_label}")
+    membership = np.stack(masks, axis=0).sum(axis=0)
+    if not np.all(membership == 1):
+        raise ValueError(
+            "Motion-basis support masks must be mutually exclusive and exhaustive"
+        )
+    classes = np.full(support_shape, 2, dtype=np.int8)
+    classes[masks[1]] = 1
+    classes[masks[0]] = 0
+    if version != 3:
+        return classes
+    return np.repeat(classes[None], phi.shape[0], axis=0)
+
+
+def _completed_mode_display_roles(
+    manifest: dict[str, Any], arrays: dict[str, np.ndarray]
+) -> tuple[np.ndarray, tuple[str, ...], str]:
+    """Resolve exact debug-role labels for sequential fill or basis blending."""
+
+    if manifest.get("version") in (8, 9):
+        derived = manifest["version"] == 9
+        method = "neural_fragment_motion_propagation" if derived else "neural_complex_displacement_field"
+        if manifest.get("completion_method") != method:
+            raise ValueError("Unsupported neural completion role contract")
+        phi = np.asarray(arrays["phi"])
+        support = np.asarray(arrays["support_class"])
+        if (
+            phi.ndim != 3 or phi.shape[2] != 3
+            or support.shape != phi.shape[:2]
+            or not np.issubdtype(support.dtype, np.integer)
+            or np.any((support < 0) | (support > (3 if derived else 2)))
+        ):
+            raise ValueError("Neural support classes must be integer [K,G] in 0..2")
+        classes = np.asarray([2, 0, 1, 3] if derived else [2, 0, 1], dtype=np.int8)[support]
+        legend = (
+            "**Role colors:** directly image-supervised = blue | "
+            "structure-inferred = green | unresolved = purple"
+        )
+        if derived:
+            legend += " | fragment-propagated = yellow (original image support recorded separately)"
+        names = NEURAL_SUPPORT_DISPLAY_NAMES + (("fragment-propagated",) if derived else ())
+        return classes, names, legend
+    if manifest.get("version") in (3, 4, 5, 6, 7):
+        classes = _basis_display_classes(manifest, arrays)
+        legend = (
+            "**Role colors:** measurement-supported = blue | "
+            "graph-propagated = green | zero-fallback = purple"
+        )
+        return classes, BASIS_SUPPORT_DISPLAY_NAMES, legend
+    classes = _motion_fill_display_classes(arrays)
+    legend = "**Role colors:** anchor = blue | filled = green | unobserved = purple"
+    return classes, LEGACY_SUPPORT_DISPLAY_NAMES, legend
 
 
 def _hsv_to_rgb(hue: Tensor, value: Tensor) -> Tensor:
@@ -190,6 +353,15 @@ def _observation_counts(result: ModalResultArtifact) -> np.ndarray:
     """Count unique topology views contributing to each foreground Gaussian."""
 
     completed = result.completed_modes
+    if completed.manifest.get("version") in (8, 9):
+        observed = np.asarray(completed.arrays["observation_view_mask"])
+        expected = (
+            len(result.manifest["modes"]), result.scene.foreground.count,
+            len(result.manifest["views"]),
+        )
+        if observed.dtype != np.bool_ or observed.shape != expected:
+            raise ValueError("Neural observation view mask must be boolean [K,G,V]")
+        return observed.sum(axis=2, dtype=np.int16)
     topology = load_observation_topology(completed.manifest["topology"])
     offsets = topology.arrays.sample_offsets
     contributor_views = np.repeat(
@@ -205,6 +377,30 @@ def _observation_counts(result: ModalResultArtifact) -> np.ndarray:
     return np.repeat(
         per_gaussian[None], len(result.manifest["modes"]), axis=0
     )
+
+
+def _neural_graph_display(
+    arrays: dict[str, np.ndarray], gaussian_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Display neural geometry connectivity without interpreting rigid trust."""
+
+    edges = np.asarray(arrays["g_edge_index"])
+    components = np.asarray(arrays["g_component_index"])
+    weights = np.asarray(arrays["g_edge_weight"])
+    if (
+        edges.ndim != 2 or edges.shape[1] != 2
+        or not np.issubdtype(edges.dtype, np.integer)
+        or np.any(edges < 0) or np.any(edges >= gaussian_count)
+        or components.shape != (gaussian_count,)
+        or not np.issubdtype(components.dtype, np.integer)
+        or np.any(components < 0)
+        or weights.shape != (len(edges),)
+        or not np.isfinite(weights).all() or np.any(weights <= 0)
+    ):
+        raise ValueError("Neural Gaussian geometry graph arrays are invalid")
+    if np.any(components[edges[:, 0]] != components[edges[:, 1]]):
+        raise ValueError("Neural geometry edges cross graph components")
+    return edges, _component_colors(components[edges[:, 0]])
 
 
 class ModalViewerData:
@@ -238,10 +434,32 @@ class ModalViewerData:
         self.coordinates = np.asarray(
             self.result.coordinates.coordinates, dtype=np.complex64
         )
-        self.display_class = _motion_fill_display_classes(
-            self.result.completed_modes.arrays
+        (
+            self.display_class,
+            self.support_display_names,
+            self.support_legend,
+        ) = _completed_mode_display_roles(
+            self.result.completed_modes.manifest,
+            self.result.completed_modes.arrays,
         )
         self.observation_counts = _observation_counts(self.result)
+        self._load_graph_display()
+        self.spectrum = SpectrumComparisonController(self.result)
+
+    def _load_graph_display(self) -> None:
+        """Select geometry diagnostics belonging to the completed-mode method."""
+
+        if self.result.completed_modes.manifest.get("version") in (8, 9):
+            self.structure_graph = None
+            self.graph_edge_gaussian_index, self.graph_edge_colors = _neural_graph_display(
+                self.result.completed_modes.arrays, self.scene.foreground.count,
+            )
+            self.graph_edge_colors_by_mode = None
+            self.graph_legend = (
+                "**Geometry graph:** distinct colors = connected geometry components. "
+                "Colors indicate connectivity, not rigid trust or observation support."
+            )
+            return
         graph_path = self.result.completed_modes.manifest.get(
             "observed_structure_graph"
         )
@@ -250,7 +468,7 @@ class ModalViewerData:
         )
         if not isinstance(graph_path, str) or not graph_path:
             raise ValueError("Completed modes do not identify their observed graph")
-        self.structure_graph: ObservedStructureGraphArtifact = (
+        self.structure_graph = (
             load_observed_structure_graph(graph_path)
         )
         if (
@@ -272,8 +490,28 @@ class ModalViewerData:
         edge_components = graph_arrays.component_index[
             graph_arrays.edge_index[:, 0]
         ]
-        self.graph_edge_colors = _component_colors(edge_components)
-        self.spectrum = SpectrumComparisonController(self.result)
+        completed_manifest = self.result.completed_modes.manifest
+        rigid = load_rigid_modes(completed_manifest["rigid_modes"])
+        for identity in (
+            "rigid_modes_identity",
+            "observed_structure_graph_identity",
+            "static_scene_identity",
+            "foreground_identity",
+        ):
+            if rigid.manifest[identity] != completed_manifest[identity]:
+                raise ValueError(f"Component graph rigid source differs: {identity}")
+        self.graph_edge_colors, self.graph_edge_colors_by_mode = _component_graph_color_frames(
+            edge_components, completed_manifest, self.result.completed_modes.arrays,
+            rigid.manifest, rigid.arrays,
+        )
+        self.graph_legend = (
+            "**Component graph:** distinct colors = active trusted components at "
+            "Selected frequency (Hz); gray = inactive components. Select a frequency "
+            "in Gaussian color or Spectrum."
+            if self.graph_edge_colors_by_mode is not None else
+            "**Component graph:** distinct colors = components trusted at "
+            "every source frequency; gray = other components."
+        )
 
     def coordinate(self, view_index: int, local_frame: int) -> np.ndarray:
         """Return one stored flow-derived complex coordinate vector."""
@@ -395,6 +633,7 @@ class ModalViserViewer:
         self._point_cloud: Any | None = None
         self._component_graph_handle: Any | None = None
         self._component_graph_edge_indices = np.empty((0,), dtype=np.int64)
+        self._component_graph_color_mode: int | None = None
         self._frustums: dict[str, Any] = {}
         all_means = torch.cat(
             (
@@ -800,10 +1039,7 @@ class ModalViserViewer:
                 step=0.0001,
                 initial_value=0.002,
             )
-            self.server.gui.add_markdown(
-                "**Role colors:** anchor = blue | filled = green | "
-                "unobserved = purple"
-            )
+            self.server.gui.add_markdown(self.data.support_legend)
             self.support_mode_labels = tuple(
                 f"Mode {index}: {frequency:.3f} Hz"
                 for index, frequency in enumerate(self.data.frequencies_hz)
@@ -819,11 +1055,9 @@ class ModalViserViewer:
             )
             self.support_filters = tuple(
                 self.server.gui.add_checkbox(name.capitalize(), True)
-                for name in SUPPORT_DISPLAY_NAMES
+                for name in self.data.support_display_names
             )
-            self.server.gui.add_markdown(
-                "**Component graph:** edges are colored by connected component"
-            )
+            self.server.gui.add_markdown(self.data.graph_legend)
             self.show_component_graph = self.server.gui.add_checkbox(
                 "Show component graph", False
             )
@@ -880,9 +1114,10 @@ class ModalViserViewer:
             self._component_graph_handle.remove()
             self._component_graph_handle = None
         self._component_graph_edge_indices = np.empty((0,), dtype=np.int64)
+        self._component_graph_color_mode = None
 
     def _update_component_graph(self, means: Tensor) -> None:
-        """Display a bounded component-colored subset of observed graph edges."""
+        """Display observed graph edges with trusted colors and untrusted gray."""
 
         if not bool(self.show_component_graph.value):
             return
@@ -896,12 +1131,17 @@ class ModalViserViewer:
         gaussian_edges = self.data.graph_edge_gaussian_index[selected]
         points = means[torch.as_tensor(gaussian_edges, device=means.device)]
         points_numpy = points.detach().cpu().numpy()
+        mode_index = None
+        colors = self.data.graph_edge_colors
+        if self.data.graph_edge_colors_by_mode is not None:
+            mode_index = self.data.frequency_order[int(self.phase_mode.value)]
+            colors = self.data.graph_edge_colors_by_mode[mode_index]
         if (
             self._component_graph_handle is None
             or not np.array_equal(selected, self._component_graph_edge_indices)
         ):
             self._remove_component_graph()
-            edge_colors = self.data.graph_edge_colors[selected]
+            edge_colors = colors[selected]
             self._component_graph_handle = self.server.scene.add_line_segments(
                 "/debug/component_graph",
                 points=points_numpy,
@@ -910,7 +1150,11 @@ class ModalViserViewer:
                 thickness_units="screen",
             )
             self._component_graph_edge_indices = selected
+            self._component_graph_color_mode = mode_index
             return
+        if mode_index != self._component_graph_color_mode:
+            self._component_graph_handle.colors = np.repeat(colors[selected, None, :], 2, axis=1)
+            self._component_graph_color_mode = mode_index
         self._component_graph_handle.points = points_numpy
         self._component_graph_handle.thickness = float(
             self.component_graph_line_width.value

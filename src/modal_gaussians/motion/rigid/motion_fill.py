@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from modal_gaussians.motion.common.completed_modes import CompletedModesArtifact, load_completed_modes
+from modal_gaussians.motion.common.mode_mapping import resolve_source_mode_slots
+
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,9 +25,9 @@ from modal_gaussians.numpy_io import save_named_arrays
 
 from modal_gaussians import __version__
 from modal_gaussians.measurements import load_gaussian_measurements
-from modal_gaussians.rigid import RigidModesArtifact, load_rigid_modes
+from modal_gaussians.motion.rigid.rigid import RigidModesArtifact, load_rigid_modes
 from modal_gaussians.static import load_static_scene
-from modal_gaussians.structure_graph import (
+from modal_gaussians.motion.rigid.structure_graph import (
     StructureGraphArrays,
     load_observed_structure_graph,
 )
@@ -35,7 +38,9 @@ from modal_gaussians.topology import load_observation_topology
 EPSILON = 1.0e-8
 CONVERGED_LSMR_CODES = frozenset({0, 1, 2, 4, 5})
 COMPLETED_MODES_FORMAT = "modal_gaussians.completed_modes"
-COMPLETED_MODES_VERSION = 2
+SEQUENTIAL_COMPLETED_MODES_VERSION = 2
+COMPLETED_MODES_VERSION = 3
+MOTION_BASIS_COMPLETION_METHOD = "shared_motion_basis_blend"
 COMPLETED_MODES_FILENAME = "completed_modes.npz"
 
 SUPPORT_TRUSTED_RIGID = 0
@@ -196,15 +201,6 @@ class SequentialMotionFillResult:
     pointwise_system_row_count: int
     pointwise_system_column_count: int
     pointwise_active_edge_count: int
-
-
-@dataclass(frozen=True)
-class CompletedModesArtifact:
-    """Represent one validated full-foreground completed modal-field artifact."""
-
-    path: Path
-    manifest: dict[str, Any]
-    arrays: dict[str, np.ndarray]
 
 
 def _require_module(name: str) -> Any:
@@ -1403,37 +1399,6 @@ def _artifact_identity_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def resolve_source_mode_slots(
-    modes: Sequence[Mapping[str, Any]], source_modes: Sequence[Mapping[str, Any]]
-) -> np.ndarray:
-    """Validate local-to-original slots without sorting or guessing by frequency."""
-
-    if not modes or not source_modes:
-        raise ValueError("Mode mapping requires non-empty local and source modes")
-    mapped = any("source_mode_slot" in mode for mode in modes)
-    if not mapped:
-        if list(modes) != list(source_modes):
-            raise ValueError("Unmapped modes must exactly match the complete source prefix")
-        return np.arange(len(modes), dtype=np.int64)
-    slots: list[int] = []
-    for local_slot, mode in enumerate(modes):
-        source_slot = mode.get("source_mode_slot")
-        if (
-            isinstance(source_slot, bool)
-            or not isinstance(source_slot, int)
-            or not 0 <= source_slot < len(source_modes)
-            or (slots and source_slot <= slots[-1])
-        ):
-            raise ValueError("Source mode slots must be unique, increasing and in range")
-        parent = source_modes[source_slot]
-        if parent.get("mode_slot") != source_slot or dict(mode) != {
-            **parent, "mode_slot": local_slot, "source_mode_slot": source_slot
-        }:
-            raise ValueError("Mode mapping differs from the original candidate/frequency")
-        slots.append(source_slot)
-    return np.asarray(slots, dtype=np.int64)
-
-
 def _select_rigid_modes(
     rigid: RigidModesArtifact, valid_modes_only: bool
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -1776,8 +1741,8 @@ def _validate_final_arrays(
         raise ValueError("Completed-mode support classes disagree with masks")
 
 
-def load_completed_modes(path: str | Path) -> CompletedModesArtifact:
-    """Load and fully validate one completed full-foreground modal artifact."""
+def load_sequential_completed_modes(path: str | Path) -> CompletedModesArtifact:
+    """Validate the sequential v1/v2 motion-fill artifacts."""
 
     root = Path(path).expanduser().resolve(strict=True)
     manifest_path = root / "manifest.json"
@@ -1787,7 +1752,10 @@ def load_completed_modes(path: str | Path) -> CompletedModesArtifact:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("format") != COMPLETED_MODES_FORMAT:
         raise ValueError("Unsupported completed-mode format")
-    if manifest.get("version") not in (1, COMPLETED_MODES_VERSION):
+    version = manifest.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError("Completed-mode version must be an integer")
+    if version not in (1, SEQUENTIAL_COMPLETED_MODES_VERSION):
         raise ValueError("Unsupported completed-mode version")
     if manifest.get("quality_gate") != {
         "required": True,
@@ -1975,7 +1943,7 @@ def build_completed_modes_artifact(
         unresolved_count = np.count_nonzero(final_arrays["unresolved_mask"], axis=1)
         manifest = {
             "format": COMPLETED_MODES_FORMAT,
-            "version": COMPLETED_MODES_VERSION,
+            "version": SEQUENTIAL_COMPLETED_MODES_VERSION,
             "producer": {
                 "project_version": __version__,
                 "created_utc": datetime.now(timezone.utc).isoformat(),

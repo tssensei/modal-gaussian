@@ -18,7 +18,7 @@ from modal_gaussians.direct_coordinates import (
     DirectModalCoordinatesArtifact,
     load_direct_modal_coordinates,
 )
-from modal_gaussians.motion_fill import CompletedModesArtifact, load_completed_modes
+from modal_gaussians.motion.common.completed_modes import CompletedModesArtifact, load_completed_modes
 from modal_gaussians.physics_coordinates import (
     PHYSICS_COORDINATES_FORMAT,
     PhysicsModalCoordinatesArtifact,

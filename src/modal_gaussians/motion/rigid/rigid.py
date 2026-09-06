@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from modal_gaussians.motion.common.sources import load_observed_sources
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -20,7 +22,7 @@ from modal_gaussians.numpy_io import save_named_arrays
 from modal_gaussians import __version__
 from modal_gaussians.measurements import load_gaussian_measurements
 from modal_gaussians.static import load_static_scene
-from modal_gaussians.structure_graph import (
+from modal_gaussians.motion.rigid.structure_graph import (
     StructureGraphArrays,
     load_observed_structure_graph,
 )
@@ -318,54 +320,50 @@ def solve_rigid_components(
     graph_component = np.asarray(graph.component_index, dtype=np.int64)
     edge_index = np.asarray(graph.edge_index, dtype=np.int64)
     rigid_node_mask = degree > 0
-    selected_graph_components = np.unique(graph_component[rigid_node_mask])
+    rigid_point_indices = node_indices[rigid_node_mask]
+    # Keep compact component labels aligned with participating Gaussian indices.
+    selected_graph_components, rigid_point_component = np.unique(
+        graph_component[rigid_node_mask], return_inverse=True
+    )
+    rigid_point_component = rigid_point_component.astype(np.int32, copy=False)
     component_count = len(selected_graph_components)
     if component_count == 0:
         raise ValueError("Observed graph has no component with an accepted edge")
 
-    graph_to_rigid = np.full(int(graph_component.max()) + 1, -1, dtype=np.int32)
-    graph_to_rigid[selected_graph_components] = np.arange(
-        component_count, dtype=np.int32
-    )
-    node_component = np.full(len(node_indices), -1, dtype=np.int32)
-    node_component[rigid_node_mask] = graph_to_rigid[
-        graph_component[rigid_node_mask]
-    ]
-    rigid_point_indices = node_indices[rigid_node_mask]
-    rigid_seed_mask = np.zeros(point_count, dtype=bool)
-    rigid_seed_mask[rigid_point_indices] = True
+    point_component = np.full(point_count, -1, dtype=np.int32)
+    point_component[rigid_point_indices] = rigid_point_component
+    rigid_seed_mask = point_component >= 0
     observed_mask = np.zeros(point_count, dtype=bool)
     observed_mask[node_indices] = True
-    point_component = np.full(point_count, -1, dtype=np.int32)
-    point_component[rigid_point_indices] = node_component[rigid_node_mask]
 
     component_node_count = np.bincount(
-        node_component[rigid_node_mask], minlength=component_count
+        rigid_point_component, minlength=component_count
     ).astype(np.int32)
     if np.any(component_node_count < 2):
         raise RuntimeError("A rigid component contains fewer than two nodes")
     component_centroid = np.zeros((component_count, 3), dtype=np.float64)
     np.add.at(
         component_centroid,
-        node_component[rigid_node_mask],
+        rigid_point_component,
         points[rigid_point_indices],
     )
     component_centroid /= component_node_count[:, None]
     centered_points = (
         points[rigid_point_indices]
-        - component_centroid[node_component[rigid_node_mask]]
+        - component_centroid[rigid_point_component]
     )
     squared_radius = np.zeros(component_count, dtype=np.float64)
     np.add.at(
         squared_radius,
-        node_component[rigid_node_mask],
+        rigid_point_component,
         np.einsum("ij,ij->i", centered_points, centered_points),
     )
     component_radius = np.sqrt(squared_radius / component_node_count)
 
-    edge_component = node_component[edge_index[:, 0]]
+    global_edges = node_indices[edge_index]
+    edge_component = point_component[global_edges[:, 0]]
     if np.any(edge_component < 0) or np.any(
-        edge_component != node_component[edge_index[:, 1]]
+        edge_component != point_component[global_edges[:, 1]]
     ):
         raise RuntimeError("Accepted edges do not map to one rigid component")
     component_edge_count = np.bincount(
@@ -414,7 +412,7 @@ def solve_rigid_components(
     translation = np.zeros((component_count, 3), dtype=np.complex128)
     rotation = np.zeros((component_count, 3), dtype=np.complex128)
 
-    rigid_order = np.argsort(node_component[rigid_node_mask], kind="stable")
+    rigid_order = np.argsort(rigid_point_component, kind="stable")
     ordered_rigid_points = rigid_point_indices[rigid_order]
     node_offsets = np.concatenate(
         [np.zeros(1, dtype=np.int64), np.cumsum(component_node_count)]
@@ -476,7 +474,6 @@ def solve_rigid_components(
     if not np.isfinite(persisted_phi).all():
         raise FloatingPointError("Rigid field overflowed during complex64 conversion")
 
-    global_edges = node_indices[edge_index]
     edge_vectors = points[global_edges[:, 1]] - points[global_edges[:, 0]]
     model_delta = phi[global_edges[:, 1]] - phi[global_edges[:, 0]]
     model_axial = np.einsum("ij,ij->i", edge_vectors, model_delta)
@@ -834,95 +831,14 @@ def _source_manifest(
 ) -> tuple[dict[str, Any], Any, Any, Any, Any]:
     """Load all upstream artifacts and enforce their immutable identity chain."""
 
-    scene = load_static_scene(scene_dir, "cpu")
-    topology = load_observation_topology(topology_dir)
-    measurements = load_gaussian_measurements(measurements_dir)
-    graph = load_observed_structure_graph(graph_dir)
-    scene_manifest = scene.manifest
-    if scene_manifest is None:
-        raise ValueError("Static scene has no manifest")
-    scene_identity = scene_manifest["static_scene_identity"]
-    foreground_identity = scene_manifest["foreground_identity"]
-    topology_identity = topology.manifest["topology_identity"]
-    for name, value in (
-        ("topology static scene", topology.manifest["static_scene_identity"]),
-        ("graph static scene", graph.manifest["static_scene_identity"]),
-    ):
-        if value != scene_identity:
-            raise ValueError(f"{name} identity does not match the static scene")
-    for name, value in (
-        ("topology foreground", topology.manifest["foreground_identity"]),
-        ("graph foreground", graph.manifest["foreground_identity"]),
-    ):
-        if value != foreground_identity:
-            raise ValueError(f"{name} identity does not match the static foreground")
-    if measurements.manifest["topology_identity"] != topology_identity:
-        raise ValueError("Measurements do not belong to the supplied topology")
-    if graph.manifest["topology_identity"] != topology_identity:
-        raise ValueError("Observed graph does not belong to the supplied topology")
-
-    topology_views = topology.manifest["views"]
-    measurement_views = measurements.manifest["views"]
-    graph_views = graph.manifest["views"]
-    if not (
-        len(topology_views) == len(measurement_views) == len(graph_views)
-    ):
-        raise ValueError("Solver inputs have different view counts")
-    views: list[dict[str, Any]] = []
-    for index, (topology_view, measurement_view, graph_view) in enumerate(
-        zip(topology_views, measurement_views, graph_views)
-    ):
-        label = topology_view["label"]
-        for source, view in (
-            ("measurement", measurement_view),
-            ("graph", graph_view),
-        ):
-            if view["index"] != index or view["label"] != label:
-                raise ValueError(f"{source} view order does not match topology")
-            if view["flow_identity"] != topology_view["flow_identity"]:
-                raise ValueError(f"{source} flow identity for {label!r} differs")
-            if view["shape_hw"] != topology_view["shape_hw"]:
-                raise ValueError(f"{source} shape for {label!r} differs")
-        if graph_view["camera_identity"] != topology_view["camera_identity"]:
-            raise ValueError(f"Graph camera identity for {label!r} differs")
-        views.append(
-            {
-                "index": index,
-                "label": label,
-                "shape_hw": list(topology_view["shape_hw"]),
-                "camera_identity": topology_view["camera_identity"],
-                "flow_identity": topology_view["flow_identity"],
-                "sample_count": int(measurement_view["sample_count"]),
-            }
-        )
-    modes = [
-        {
-            "mode_slot": int(mode["mode_slot"]),
-            "candidate_index": int(mode["candidate_index"]),
-            "frequency_hz": float(mode["frequency_hz"]),
-        }
-        for mode in measurements.manifest["modes"]
-    ]
-    source = {
-        "static_scene": str(scene_dir),
-        "static_scene_identity": scene_identity,
-        "foreground_identity": foreground_identity,
-        "topology": str(topology.path),
-        "topology_identity": topology_identity,
-        "measurements": str(measurements.path),
-        "gaussian_measurements_identity": measurements.manifest[
-            "gaussian_measurements_identity"
-        ],
-        "observed_structure_graph": str(graph.path),
-        "observed_structure_graph_identity": graph.manifest[
-            "observed_structure_graph_identity"
-        ],
-        "modes": modes,
-        "views": views,
-        "alpha_sync": alpha_config.to_dict(),
-        "rigid_components": rigid_config.to_dict(),
-        "trusted_seeds": seed_config.to_dict(),
-    }
+    source, scene, topology, measurements, graph = load_observed_sources(
+        scene_dir=scene_dir, topology_dir=topology_dir,
+        measurements_dir=measurements_dir, graph_dir=graph_dir,
+    )
+    source.update(
+        alpha_sync=alpha_config.to_dict(), rigid_components=rigid_config.to_dict(),
+        trusted_seeds=seed_config.to_dict(),
+    )
     source["solver_run_identity"] = hashlib.sha256(
         _canonical_json(_solver_identity_payload(source))
     ).hexdigest()
