@@ -55,7 +55,7 @@ class RenderedDesignConfig:
 
 
 def projection_jacobian(
-    points: np.ndarray, K: np.ndarray, world_to_camera: np.ndarray
+    points: np.ndarray, K: np.ndarray, world_to_camera: np.ndarray, radial_k: float = 0.0
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute d(pixel xy)/d(world xyz), with zero rows behind the camera."""
 
@@ -68,6 +68,9 @@ def projection_jacobian(
     if not np.isfinite(camera_points).all():
         raise ValueError("Foreground Gaussian camera coordinates are non-finite")
     visible = camera_points[:, 2] > 1.0e-8
+    if radial_k < 0:
+        from modal_gaussians.camera_geometry import radial_domain
+        visible &= radial_domain(camera_points, radial_k)
     jacobian = np.zeros((len(values), 2, 3), dtype=np.float64)
     if np.any(visible):
         x = camera_points[visible, 0]
@@ -78,6 +81,9 @@ def projection_jacobian(
         camera_jacobian[:, 0, 2] = -float(K[0, 0]) * x / (z * z)
         camera_jacobian[:, 1, 1] = float(K[1, 1]) / z
         camera_jacobian[:, 1, 2] = -float(K[1, 1]) * y / (z * z)
+        if radial_k:
+            from modal_gaussians.camera_geometry import camera_jacobian as radial_jacobian
+            camera_jacobian = radial_jacobian(camera_points[visible], K, radial_k)
         jacobian[visible] = np.einsum(
             "nij,jk->nik", camera_jacobian, w2c[:3, :3]
         )

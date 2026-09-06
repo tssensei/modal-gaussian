@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from modal_gaussians.camera_geometry import validate_radial_views, radial_pixel_path
+
 from modal_gaussians.motion.common.geometry_ops import (
     project_points as _project_points,
     bilinear_valid as _bilinear_valid,
@@ -414,6 +416,7 @@ def build_structure_graph_arrays(
     rendered_alphas: Sequence[np.ndarray],
     render_alpha_minimum: float,
     config: ObservedStructureGraphConfig,
+    radial_coefficients: np.ndarray | None = None,
 ) -> tuple[StructureGraphArrays, dict[str, Any]]:
     """Build the accepted color/depth-filtered mutual-KNN graph in memory."""
 
@@ -422,6 +425,7 @@ def build_structure_graph_arrays(
     intrinsics = np.asarray(Ks, dtype=np.float32)
     extrinsics = np.asarray(world_to_cameras, dtype=np.float32)
     view_count = len(rendered_depths)
+    radial = validate_radial_views(radial_coefficients, view_count)
     config.validate(view_count)
     if means.ndim != 2 or means.shape[1] != 3 or len(means) < 2:
         raise ValueError("Foreground means must be finite [G,3] with G at least two")
@@ -501,6 +505,7 @@ def build_structure_graph_arrays(
             node_points,
             intrinsics[view_index],
             extrinsics[view_index],
+            radial[view_index],
         )
         pixel_valid = _bilinear_valid(pixels, depth.shape[0], depth.shape[1])
         sampled_depth = _sample_valid(depth, pixels, pixel_valid)
@@ -558,6 +563,9 @@ def build_structure_graph_arrays(
                 point_start[:, None, :] * (1.0 - line_fraction[None, :, None])
                 + point_end[:, None, :] * line_fraction[None, :, None]
             )
+            if radial[view_index]:
+                line_pixels = radial_pixel_path(point_start, point_end, line_fraction,
+                                                intrinsics[view_index], radial[view_index])
             profile_valid = _bilinear_valid(
                 line_pixels, depth.shape[0], depth.shape[1]
             ).all(axis=1)
@@ -1229,6 +1237,7 @@ def build_observed_structure_graph_artifact(
         foreground_means=active["means"].detach().cpu().numpy(),
         foreground_colors=active["colors"].detach().cpu().numpy(),
         topology=topology.arrays,
+        radial_coefficients=np.array([camera.radial_distortion for camera in cameras]),
         Ks=np.stack(
             [camera.K.detach().cpu().numpy() for camera in cameras], axis=0
         ),

@@ -2,7 +2,7 @@
 
 These commands follow `src/modal_gaussians/cli.py`. Check current `--help` before a run; do not guess new flags. Run them separately and apply the stage gates in [validation-recovery.md](validation-recovery.md). This document is not a script to execute wholesale.
 
-If a program fails while executing an actual experiment, follow the [immediate stop-and-report rule](../SKILL.md#repair-and-stopping-rules). Do not execute a repair, retry/resume command, or subsequent stage until the user explicitly directs that action for the reported failure. All experiment recovery examples below are subject to this gate; ordinary development work and inspection-command mistakes may be corrected within scope.
+If a program fails while executing an authorized experiment, follow the [autonomous repair and recovery rules](../SKILL.md#autonomous-repair-and-recovery): preserve evidence, diagnose and repair, verify the fix, then retry/resume and continue. The recovery commands below are part of the run authorization; do not wait for new instructions after each error. Preserve the run contract and validate prerequisites before consuming their outputs.
 
 ## Bind inputs once
 
@@ -31,7 +31,7 @@ Use native argument-array splatting. Do not concatenate input paths into executa
 
 ## Live text progress
 
-For each compute command below, insert `--log-file "$RunRoot/logs/STAGE_ATTEMPT.log"` immediately after `-m modal_gaussians.cli`, before `flow`, `static`, or another subcommand. Choose the actual stage/attempt name, record it in `run-status.md`, and keep logs outside artifact output directories. Logs append rather than overwrite; use a new attempt name after an authorized retry. Continue retaining stdout/stderr for output from third-party libraries.
+For each compute command below, insert `--log-file "$RunRoot/logs/STAGE_ATTEMPT.log"` immediately after `-m modal_gaussians.cli`, before `flow`, `static`, or another subcommand. Choose the actual stage/attempt name, record it in `run-status.md`, and keep logs outside artifact output directories. Logs append rather than overwrite; use a new attempt name for each retry. Continue retaining stdout/stderr for output from third-party libraries.
 
 Training reports step/epoch/batch, loss, PSNR, SSIM and FG/BG counts; other instrumented loops report frames, columns, selected frequencies, views or modes. Reports flush immediately, normally at most once per five seconds, plus the first completed unit and phase/epoch/mode boundaries. ETA uses this process's completed work (not pre-resume steps) and is an estimate. A phase's `100%` is not artifact validation or whole-pipeline completion.
 
@@ -91,11 +91,11 @@ Output: copied RGB/semantic masks, `sparse/0/{cameras.bin,images.bin,points3D.bi
 
 Output: `static_scene/{manifest.json,tensors.pt,training_summary.json}`. Work state: `work/static/resume.pt`. Training also renders `work/static/qa` automatically. Defaults: 100 epochs, batch 8, initialization caps FG 40,000 / BG 80,000, seed 42. The objective is `0.8*L1 + 0.2*(1-SSIM) + 1.0*trimmed_L1(FG-mask)`, with a 7×7 erosion kernel and no scale regularizer. BG densification stops at step 1,000 and is capped at 160,000 Gaussians; FG densification stops at 4,000. Depth supervision remains disabled until its input artifact is specified and implemented.
 
-When continuation is authorized, resume interrupted training by appending `--resume` to this exact command only after checking unchanged input/config and that the final bundle does not already exist. If export succeeded but QA failed with a code error, stop and report first; after authorized recovery, validate that bundle and rerender QA rather than retraining merely because the original command failed after export.
+Resume interrupted training by appending `--resume` to this exact command only after checking unchanged input/config and that the final bundle does not already exist. If export succeeded but QA failed, diagnose and fix QA, validate the existing bundle, and rerender QA rather than retraining merely because the original command failed after export.
 
 ## 4. Inspect static QA; render only if needed
 
-Review the existing `work/static/qa/metrics.json` and images first. When a QA rerender is authorized (including explicit direction after a code-error failure), use a new directory for missing/failed QA or a fresh comparison:
+Review the existing `work/static/qa/metrics.json` and images first. After repairing a QA failure, use a new directory for missing/failed QA or an in-scope fresh comparison:
 
 ```powershell
 & $MgPython -m modal_gaussians.cli static render --scene "$RunRoot/static_scene" --output "$RunRoot/work/static_qa_retry01" --role all

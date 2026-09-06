@@ -222,6 +222,7 @@ def _unproject_pixels(
     depths: np.ndarray,
     K: np.ndarray,
     world_to_camera: np.ndarray,
+    radial_k: float = 0.0,
 ) -> np.ndarray:
     """Unproject camera-z depth pixels into normalized world coordinates."""
 
@@ -229,6 +230,11 @@ def _unproject_pixels(
     z = np.asarray(depths, dtype=np.float64)
     x = (pixels[:, 0] - K[0, 2]) * z / K[0, 0]
     y = (pixels[:, 1] - K[1, 2]) * z / K[1, 1]
+    if radial_k:
+        from modal_gaussians.camera_geometry import undistort_normalized
+        xy = undistort_normalized(np.column_stack(((pixels[:, 0] - K[0, 2]) / K[0, 0],
+                                                   (pixels[:, 1] - K[1, 2]) / K[1, 1])), radial_k)
+        x, y = (xy * z[:, None]).T
     camera_points = np.stack([x, y, z, np.ones_like(z)], axis=1)
     camera_to_world = np.linalg.inv(np.asarray(world_to_camera, dtype=np.float64))
     return (camera_points @ camera_to_world.T)[:, :3].astype(np.float32)
@@ -238,6 +244,7 @@ def _projection_jacobian(
     points: np.ndarray,
     K: np.ndarray,
     world_to_camera: np.ndarray,
+    radial_k: float = 0.0,
 ) -> np.ndarray:
     """Compute d(pixel xy)/d(normalized world xyz) at Gaussian centers."""
 
@@ -250,6 +257,9 @@ def _projection_jacobian(
     camera_jacobian[:, 0, 2] = -float(K[0, 0]) * x / (z * z)
     camera_jacobian[:, 1, 1] = float(K[1, 1]) / z
     camera_jacobian[:, 1, 2] = -float(K[1, 1]) * y / (z * z)
+    if radial_k:
+        from modal_gaussians.camera_geometry import camera_jacobian as radial_jacobian
+        camera_jacobian = radial_jacobian(camera_points, K, radial_k)
     rotation = np.asarray(world_to_camera, dtype=np.float64)[:3, :3]
     return np.einsum("nij,jk->nik", camera_jacobian, rotation).astype(np.float32)
 
@@ -398,7 +408,7 @@ def build_topology_arrays(
             camera.world_to_camera.detach().cpu().numpy().astype(np.float64)
         )
         surface_points = _unproject_pixels(
-            pixels_xy, selected_depths, K, world_to_camera
+            pixels_xy, selected_depths, K, world_to_camera, camera.radial_distortion
         )
         finite = np.isfinite(surface_points).all(axis=1)
         x_values = x_values[finite]
@@ -415,7 +425,10 @@ def build_topology_arrays(
         )
         if preselect_count == 1:
             preselected = np.asarray(preselected)[:, None]
-        camera_depths = _world_to_camera_points(points, world_to_camera)[:, 2]
+        camera_points = _world_to_camera_points(points, world_to_camera)
+        camera_depths = camera_points[:, 2]
+        from modal_gaussians.camera_geometry import radial_domain
+        projectable = radial_domain(camera_points, camera.radial_distortion)
         samples_before = len(sample_view_indices)
         contributors_before = len(contributor_indices)
 
@@ -460,6 +473,7 @@ def build_topology_arrays(
             positive_depth = (
                 np.isfinite(camera_depths[candidate_indices])
                 & (camera_depths[candidate_indices] > 0.0)
+                & projectable[candidate_indices]
             )
             candidate_indices = candidate_indices[positive_depth]
             scores = scores[positive_depth]
@@ -468,7 +482,7 @@ def build_topology_arrays(
                 continue
             weights = (scores / score_sum).astype(np.float32)
             jacobians = _projection_jacobian(
-                points[candidate_indices], K, world_to_camera
+                points[candidate_indices], K, world_to_camera, camera.radial_distortion
             )
             sample_view_indices.append(view_index)
             sample_pixels.append([int(x), int(y)])
@@ -843,7 +857,8 @@ def build_observation_topology_artifact(
         "static_scene_identity": scene.manifest["static_scene_identity"],
         "foreground_identity": scene.manifest["foreground_identity"],
         "views": view_records,
-        "parameters": settings.to_dict(),
+        "parameters": {**settings.to_dict(), **({"projection_jacobian": "d_simple_radial_pixel_d_normalized_world_point"}
+                                               if any(c.distortion_applied for c in cameras) else {})},
         "counts": {
             "views": len(views),
             "foreground_gaussians": scene.foreground.count,

@@ -24,6 +24,9 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from modal_gaussians.camera_geometry import PROJECTION_CONVENTION, project_camera, undistort_normalized
+from modal_gaussians.camera_rendering import rasterize_cameras
+
 
 Composition = Literal["all", "foreground", "background"]
 CameraRole = Literal["sweep", "reference"]
@@ -102,6 +105,22 @@ class Camera:
     mask_relative_path: str
     image_sha256: str
     mask_sha256: str
+    distortion_applied: bool = False  # Legacy bundles keep their original pinhole convention.
+
+    @property
+    def radial_distortion(self) -> float:
+        if not self.distortion_applied:
+            return 0.0
+        if self.camera_model != "SIMPLE_RADIAL" or len(self.camera_parameters) != 4:
+            raise ValueError("Distorted cameras require COLMAP SIMPLE_RADIAL (f,cx,cy,k)")
+        k = float(self.camera_parameters[3])
+        if not math.isfinite(k):
+            raise ValueError("Camera radial distortion must be finite")
+        expected = np.array([[self.camera_parameters[0], 0, self.camera_parameters[1]],
+                             [0, self.camera_parameters[0], self.camera_parameters[2]], [0, 0, 1]])
+        if not np.allclose(self.K.detach().cpu().numpy(), expected, rtol=1e-6, atol=1e-5):
+            raise ValueError("SIMPLE_RADIAL parameters disagree with K")
+        return k
 
     def to(self, device: torch.device | str) -> "Camera":
         """Copy only camera tensors to the requested compute device."""
@@ -125,7 +144,7 @@ class Camera:
             "height": self.height,
             "camera_model": self.camera_model,
             "camera_parameters": list(self.camera_parameters),
-            "distortion_applied": False,
+            "distortion_applied": self.distortion_applied,
             "raw_K": self.K.detach().cpu().numpy().astype(float).tolist(),
             "K": self.K.detach().cpu().numpy().astype(float).tolist(),
             "raw_world_to_camera": raw_w2c.astype(float).tolist(),
@@ -139,6 +158,9 @@ class Camera:
         }
         if self.label is not None:
             record["label"] = self.label
+        if self.distortion_applied:
+            _ = self.radial_distortion
+            record["projection_convention"] = PROJECTION_CONVENTION
         record["camera_identity"] = _sha256_json(record)
         return record
 
@@ -150,6 +172,13 @@ class Camera:
         recorded_identity = identity_payload.pop("camera_identity", None)
         if recorded_identity != _sha256_json(identity_payload):
             raise ValueError(f"Camera identity does not match manifest record: {payload.get('name')}")
+        applied = payload.get("distortion_applied", False)
+        if not isinstance(applied, bool):
+            raise ValueError("Camera distortion_applied must be boolean")
+        if applied and payload.get("projection_convention") != PROJECTION_CONVENTION:
+            raise ValueError("Unsupported camera projection convention")
+        if not applied and "projection_convention" in payload:
+            raise ValueError("Legacy pinhole camera has contradictory projection metadata")
         role = str(payload["role"])
         if role not in ("sweep", "reference"):
             raise ValueError(f"Unsupported camera role: {role}")
@@ -158,7 +187,7 @@ class Camera:
             np.asarray(payload["K"], dtype=np.float64),
         ):
             raise ValueError(f"Static v1 requires unchanged raw/normalized K: {payload.get('name')}")
-        return cls(
+        camera = cls(
             name=str(payload["name"]),
             role=role,
             label=str(payload["label"]) if "label" in payload else None,
@@ -179,7 +208,10 @@ class Camera:
             mask_relative_path=str(payload["mask_relative_path"]),
             image_sha256=str(payload["image_sha256"]),
             mask_sha256=str(payload["mask_sha256"]),
+            distortion_applied=applied,
         )
+        _ = camera.radial_distortion
+        return camera
 
 
 @dataclass(frozen=True)
@@ -372,7 +404,7 @@ class ForegroundBackgroundScene(nn.Module):
             [camera.world_to_camera.to(device) for camera in cameras], dim=0
         )
         rasterization = _load_gsplat_rasterization()
-        rendered, alphas, info = rasterization(
+        rendered, alphas, info = rasterize_cameras(rasterization, cameras,
             means=active["means"],
             quats=active["quaternions"],
             scales=active["scales"],
@@ -476,7 +508,7 @@ class ForegroundBackgroundScene(nn.Module):
             active = combined
 
         rasterization = _load_gsplat_rasterization()
-        rendered, alphas, _ = rasterization(
+        rendered, alphas, _ = rasterize_cameras(rasterization, [camera],
             means=active["means"],
             quats=active["quaternions"],
             scales=active["scales"],
@@ -521,7 +553,7 @@ class ForegroundBackgroundScene(nn.Module):
         if not bool(torch.isfinite(values).all().item()):
             raise ValueError("features contain non-finite values")
         rasterization = _load_gsplat_rasterization()
-        rendered, alphas, _ = rasterization(
+        rendered, alphas, _ = rasterize_cameras(rasterization, [camera],
             means=active["means"],
             quats=active["quaternions"],
             scales=active["scales"],
@@ -1044,6 +1076,7 @@ def load_static_dataset(root: str | Path) -> StaticDataset:
                 mask_relative_path=entry["mask_relative"],
                 image_sha256=entry["image_hash"],
                 mask_sha256=entry["mask_hash"],
+                distortion_applied=True,
             )
         )
     authoritative_files = {
@@ -1051,9 +1084,17 @@ def load_static_dataset(root: str | Path) -> StaticDataset:
         for name, digest in file_identities.items()
         if name != "point_cloud.ply"
     }
+    for camera in cameras:
+        # Validate the complete image domain before initializing or optimizing
+        # Gaussians. The maximum radial extent of a rectangle is at a corner.
+        K = camera.K.cpu().numpy()
+        corners = np.array([[.5, .5], [camera.width - .5, .5],
+                            [.5, camera.height - .5], [camera.width - .5, camera.height - .5]])
+        undistort_normalized((corners - [K[0, 2], K[1, 2]]) / [K[0, 0], K[1, 1]], camera.radial_distortion)
     identity_payload = {
         "format": "modal_gaussians.static_dataset_identity",
-        "version": 1,
+        "version": 2,
+        "projection_convention": PROJECTION_CONVENTION,
         "files": sorted(authoritative_files.items()),
         "normalization": normalization.to_dict(),
     }
@@ -1096,13 +1137,16 @@ def classify_sparse_points(
         for start in range(0, len(points), chunk_size):
             end = min(start + chunk_size, len(points))
             camera_points = points[start:end] @ rotation.T + translation[None]
-            projected = camera_points @ K.T
             z = camera_points[:, 2]
-            safe_z = np.where(z > 1e-8, projected[:, 2], 1.0)
-            u = np.rint(projected[:, 0] / safe_z).astype(np.int64)
-            v = np.rint(projected[:, 1] / safe_z).astype(np.int64)
+            safe_points = camera_points.copy()
+            safe_points[:, 2] = np.where(z > 1e-8, z, 1.0)
+            pixels = project_camera(safe_points, K, camera.radial_distortion)
+            finite_pixels = np.isfinite(pixels).all(axis=1)
+            safe_pixels = np.where(finite_pixels[:, None], pixels, -1)
+            u = np.rint(safe_pixels[:, 0]).astype(np.int64)
+            v = np.rint(safe_pixels[:, 1]).astype(np.int64)
             valid = (
-                (z > 1e-8)
+                finite_pixels & (z > 1e-8)
                 & (u >= 0)
                 & (u < camera.width)
                 & (v >= 0)
@@ -1265,7 +1309,7 @@ def load_static_scene(
     if not manifest_path.is_file() or not tensors_path.is_file():
         raise FileNotFoundError(f"Incomplete static scene bundle: {path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("format") != "modal_gaussians.static_scene" or manifest.get("version") != 1:
+    if manifest.get("format") != "modal_gaussians.static_scene" or manifest.get("version") not in (1, 2):
         raise ValueError(f"Unsupported static scene manifest: {manifest_path}")
     if _sha256_file(tensors_path) != manifest.get("tensors_sha256"):
         raise ValueError("Static tensors.pt SHA-256 does not match manifest")
@@ -1292,6 +1336,14 @@ def load_static_scene(
         "normalization": manifest["scene_normalization"],
         "representation": "vanilla_3dgs_direct_rgb",
     }
+    if manifest["version"] == 2:
+        cameras = cameras_from_scene_manifest(manifest)
+        if not all(c.distortion_applied for c in cameras):
+            raise ValueError("Static v2 requires distortion-aware cameras")
+        static_identity_payload["camera_identities"] = [c.to_manifest_record()["camera_identity"] for c in cameras]
+        static_identity_payload["projection_convention"] = PROJECTION_CONVENTION
+        if manifest["representation"].get("camera_projection") != PROJECTION_CONVENTION:
+            raise ValueError("Static scene representation has inconsistent camera projection")
     if _sha256_json(static_identity_payload) != manifest.get("static_scene_identity"):
         raise ValueError("Static scene identity does not match manifest contents")
     parts: dict[str, GaussianSet] = {}
@@ -1312,6 +1364,8 @@ def cameras_from_scene_manifest(manifest: Mapping[str, Any]) -> tuple[Camera, ..
     if not isinstance(records, list) or not records:
         raise ValueError("Static scene manifest contains no cameras")
     cameras = tuple(Camera.from_manifest_record(record) for record in records)
+    if manifest.get("version") == 1 and any(c.distortion_applied for c in cameras):
+        raise ValueError("Legacy static v1 cannot be reinterpreted as a distorted camera scene")
     if len({camera.name for camera in cameras}) != len(cameras):
         raise ValueError("Static scene manifest contains duplicate camera names")
     return cameras

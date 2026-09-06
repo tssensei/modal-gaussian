@@ -72,6 +72,12 @@ DESIGN_CONVENTION = {
     "unresolved_modes": "included_as_explicit_zero_phi",
 }
 
+DISTORTED_DESIGN_CONVENTION = {
+    **DESIGN_CONVENTION,
+    "projection": "simple_radial_pixel_jacobian_at_static_gaussian_mean",
+    "rasterization": "full_foreground_gsplat_with_simple_radial_image_warp_v1",
+}
+
 
 @dataclass(frozen=True)
 class RenderedDesignViewInput:
@@ -127,7 +133,7 @@ def _identity_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
 
     return {
         "format": RENDERED_DESIGN_FORMAT,
-        "version": RENDERED_DESIGN_VERSION,
+        "version": manifest["version"],
         "static_scene_identity": manifest["static_scene_identity"],
         "foreground_identity": manifest["foreground_identity"],
         "completed_modes_identity": manifest["completed_modes_identity"],
@@ -246,9 +252,10 @@ def load_rendered_modal_design(path: str | Path) -> RenderedModalDesignArtifact:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("format") != RENDERED_DESIGN_FORMAT:
         raise ValueError("Unsupported rendered-design format")
-    if manifest.get("version") != RENDERED_DESIGN_VERSION:
+    if manifest.get("version") not in (RENDERED_DESIGN_VERSION, 2):
         raise ValueError("Unsupported rendered-design version")
-    if manifest.get("convention") != DESIGN_CONVENTION:
+    expected_convention = DISTORTED_DESIGN_CONVENTION if manifest["version"] == 2 else DESIGN_CONVENTION
+    if manifest.get("convention") != expected_convention:
         raise ValueError("Rendered-design convention is unsupported")
     if manifest.get("quality_gate") != {
         "required": True,
@@ -606,7 +613,7 @@ def build_rendered_modal_design_artifact(
             w2c = (
                 camera.world_to_camera.detach().cpu().numpy().astype(np.float64)
             )
-            jacobian, visible = _projection_jacobian(means, K, w2c)
+            jacobian, visible = _projection_jacobian(means, K, w2c, camera.radial_distortion)
             if not np.any(visible):
                 raise ValueError(
                     f"All foreground Gaussians lie behind view {record['label']!r}"
@@ -773,7 +780,7 @@ def build_rendered_modal_design_artifact(
         }
         manifest = {
             "format": RENDERED_DESIGN_FORMAT,
-            "version": RENDERED_DESIGN_VERSION,
+            "version": 2 if any(c.distortion_applied for c in cameras) else RENDERED_DESIGN_VERSION,
             "producer": {
                 "project_version": __version__,
                 "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -790,7 +797,7 @@ def build_rendered_modal_design_artifact(
             "modes": mode_records,
             "views": view_records,
             "settings": settings.to_dict(),
-            "convention": dict(DESIGN_CONVENTION),
+            "convention": dict(DISTORTED_DESIGN_CONVENTION if any(c.distortion_applied for c in cameras) else DESIGN_CONVENTION),
             "quality_gate": {
                 "required": True,
                 "status": "rendered_design_candidate_unapproved",

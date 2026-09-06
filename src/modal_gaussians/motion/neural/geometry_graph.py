@@ -8,6 +8,10 @@ regularization neighborhoods, not a finite-element elasticity discretization.
 
 from __future__ import annotations
 
+from modal_gaussians.camera_geometry import (
+    project_camera, validate_radial_views, radial_pixel_path, radial_path_length_bound,
+)
+
 from modal_gaussians.motion.common.geometry_ops import (
     pixel_valid as _pixel_valid,
     bilinear_sample_float64 as _bilinear,
@@ -359,6 +363,7 @@ def build_geometry_graph_arrays(
     rendered_depths: Sequence[np.ndarray], rendered_alphas: Sequence[np.ndarray],
     endpoint_thresholds: np.ndarray, depth_jump_thresholds: np.ndarray,
     config: GeometryGraphConfig | None = None,
+    radial_coefficients: np.ndarray | None = None,
 ) -> GeometryGraph:
     """Build all-foreground mutual KNN with fixed static depth-path evidence.
 
@@ -374,6 +379,7 @@ def build_geometry_graph_arrays(
     Ks = np.asarray(Ks, dtype=np.float64)
     poses = np.asarray(world_to_cameras, dtype=np.float64)
     view_count = len(rendered_depths)
+    radial = validate_radial_views(radial_coefficients, view_count)
     if view_count == 0 or len(rendered_alphas) != view_count:
         raise ValueError("Geometry graph requires matching nonempty depth/alpha views")
     if Ks.shape != (view_count, 3, 3) or poses.shape != (view_count, 4, 4) or not np.isfinite(Ks).all() or not np.isfinite(poses).all():
@@ -412,6 +418,8 @@ def build_geometry_graph_arrays(
         with np.errstate(divide="ignore", invalid="ignore"):
             pixels = np.column_stack((Ks[view, 0, 0] * camera[:, 0] / z + Ks[view, 0, 2],
                                       Ks[view, 1, 1] * camera[:, 1] / z + Ks[view, 1, 2]))
+            if radial[view]:
+                pixels = project_camera(camera[:, :3], Ks[view], radial[view])
         in_frame = _pixel_valid(pixels, depth.shape) & (z > 0)
         valid_indices = np.flatnonzero(in_frame)
         sampled_depth = _bilinear(depth, pixels[valid_indices])
@@ -424,6 +432,9 @@ def build_geometry_graph_arrays(
         if not len(selected):
             continue
         projected_lengths = np.linalg.norm(pixels[edges[selected, 0]] - pixels[edges[selected, 1]], axis=1)
+        if radial[view]:
+            projected_lengths = radial_path_length_bound(pixels[edges[selected, 0]], pixels[edges[selected, 1]],
+                                                        Ks[view], radial[view])
         samples_per_edge = np.maximum(settings.profile_min_samples,
                                       np.ceil(projected_lengths / settings.profile_max_step_pixels).astype(np.int64) + 1)
         for sample_count in np.unique(samples_per_edge):
@@ -435,6 +446,12 @@ def build_geometry_graph_arrays(
                 rows = matching[offset:offset + batch_size]
                 p0, p1 = pixels[edges[rows, 0]], pixels[edges[rows, 1]]
                 path = p0[:, None] * (1 - fractions[None, :, None]) + p1[:, None] * fractions[None, :, None]
+                if radial[view]:
+                    path = radial_pixel_path(p0, p1, fractions, Ks[view], radial[view])
+                    inside = _pixel_valid(path, depth.shape).all(axis=1)
+                    rows, path = rows[inside], path[inside]
+                    if not len(rows):
+                        continue  # A path outside the image is unknown evidence.
                 path_depth = _bilinear(depth, path.reshape(-1, 2)).reshape(len(rows), -1)
                 path_alpha = _bilinear(alpha, path.reshape(-1, 2)).reshape(len(rows), -1)
                 denominator = np.maximum(0.5 * (path_depth[:, 1:] + path_depth[:, :-1]), 1e-8)

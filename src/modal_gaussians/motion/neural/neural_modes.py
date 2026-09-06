@@ -404,7 +404,7 @@ def _prepare_observation_arrays(scene: Any, source: Mapping[str, Any], dense: An
             confidence = frozen_arrays["sample_confidence"][lo:hi]
             if not np.allclose(alpha_image[pixels[:, 1], pixels[:, 0]], confidence, rtol=2e-5, atol=2e-6):
                 raise ValueError("Resumed static foreground alpha differs from frozen observation inputs")
-        jacobian, _ = projection_jacobian(points, camera.K.cpu().numpy(), camera.world_to_camera.cpu().numpy())
+        jacobian, _ = projection_jacobian(points, camera.K.cpu().numpy(), camera.world_to_camera.cpu().numpy(), camera.radial_distortion)
         projector = FrozenModalProjector(scene, camera, torch.as_tensor(jacobian, device=device),
                                          pixels, torch.as_tensor(confidence, device=device))
         if frozen_arrays is None:
@@ -1001,6 +1001,7 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         graph = build_geometry_graph_arrays(
             foreground_means=scene.foreground.active()["means"].detach().cpu().numpy(),
             Ks=np.stack([c.K.cpu().numpy() for c in cameras]),
+            radial_coefficients=np.array([c.radial_distortion for c in cameras]),
             world_to_cameras=np.stack([c.world_to_camera.cpu().numpy() for c in cameras]),
             rendered_depths=depths, rendered_alphas=alpha_images,
             endpoint_thresholds=endpoint, depth_jump_thresholds=jump, config=geometry_settings,

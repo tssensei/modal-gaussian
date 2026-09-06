@@ -569,6 +569,16 @@ class ModalViewerData:
         jacobian_camera[:, 0, 2] = -fx * x / z_safe.square()
         jacobian_camera[:, 1, 1] = fy / z_safe
         jacobian_camera[:, 1, 2] = -fy * y / z_safe.square()
+        if camera.radial_distortion:
+            k = camera.radial_distortion
+            qx, qy = x / z_safe, y / z_safe
+            s = 1 + k * (qx.square() + qy.square())
+            distortion = torch.empty((len(means), 2, 2), device=self.device, dtype=means.dtype)
+            distortion[:, 0, 0] = s + 2 * k * qx.square()
+            distortion[:, 0, 1] = (fx / fy) * 2 * k * qx * qy
+            distortion[:, 1, 0] = (fy / fx) * 2 * k * qx * qy
+            distortion[:, 1, 1] = s + 2 * k * qy.square()
+            jacobian_camera = distortion @ jacobian_camera
         jacobian = torch.einsum("nij,jk->nik", jacobian_camera, rotation)
         projected = torch.einsum(
             "nij,nj->ni", jacobian, self.phi[mode_index]

@@ -34,6 +34,7 @@ from modal_gaussians.static import (
     tensor_dictionary_identity,
 )
 from modal_gaussians.progress import Progress, report_progress
+from modal_gaussians.camera_geometry import PROJECTION_CONVENTION
 
 
 @dataclass(frozen=True)
@@ -132,7 +133,8 @@ class StaticTrainConfig:
             "representation": "vanilla_3dgs_direct_rgb",
             "training_camera_roles": ["sweep", "reference"],
             "camera_optimization": False,
-            "distortion_applied": False,
+            "distortion_applied": True,
+            "projection_convention": PROJECTION_CONVENTION,
             "loss": {
                 "rgb_l1_weight": 0.8,
                 "rgb_dssim_weight": 0.2,
@@ -1074,10 +1076,14 @@ def export_static_bundle(
             "normalization": trainer.dataset.normalization.to_dict(),
             "representation": "vanilla_3dgs_direct_rgb",
         }
+        if not all(camera.distortion_applied for camera in trainer.dataset.cameras):
+            raise ValueError("New static training requires distortion-aware cameras; restart from joint COLMAP")
+        identity_payload["camera_identities"] = [record["camera_identity"] for record in camera_records]
+        identity_payload["projection_convention"] = PROJECTION_CONVENTION
         static_scene_identity = _sha256_json(identity_payload)
         manifest = {
             "format": "modal_gaussians.static_scene",
-            "version": 1,
+            "version": 2,
             "static_scene_identity": static_scene_identity,
             "foreground_identity": foreground_identity,
             "background_identity": background_identity,
@@ -1092,8 +1098,8 @@ def export_static_bundle(
                 "quaternion_convention": "wxyz_normalized",
                 "scale_activation": "exp",
                 "opacity_activation": "sigmoid",
-                "camera_projection": "pinhole_K_only",
-                "colmap_distortion_recorded_but_applied": False,
+                "camera_projection": PROJECTION_CONVENTION,
+                "colmap_distortion_recorded_but_applied": True,
                 "foreground_local_index_domain": [0, trainer.scene.foreground.count],
                 "background_local_index_domain": [0, trainer.scene.background.count],
                 "combined_foreground_index_domain": [0, trainer.scene.foreground.count],

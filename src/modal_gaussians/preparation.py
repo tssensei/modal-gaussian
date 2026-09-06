@@ -28,6 +28,7 @@ from modal_gaussians.data.sequence import (
     read_color_image,
     validate_image_mask_sequence,
 )
+from modal_gaussians.video_color import resolve_video_color, tone_map_rgb16
 
 CHECKPOINTS = {
     "sam": "sam_vit_h_4b8939.pth",
@@ -39,6 +40,7 @@ XMEM_CONFIG = {
     "max_long_term_elements": 1000,
     "num_prototypes": 128,
     "top_k": 30,
+    "query_chunk_size": 256,
     "mem_every": 5,
     "deep_update_every": -1,
     "enable_long_term": True,
@@ -252,7 +254,7 @@ def _process_options() -> dict[str, Any]:
 
 
 def probe_video(path: Path) -> dict[str, Any]:
-    """Read video timing and rotation metadata without decoding the full file."""
+    """Read video timing, rotation, and HDR metadata without decoding the full file."""
     if not path.is_file():
         raise FileNotFoundError(path)
     result = subprocess.run(
@@ -288,6 +290,7 @@ class PreparationWorkspace:
     def extract(
         self, video: str | Path, sequence: str, *, fps: float, start: float = 0,
         end: float | None = None, height: int | None = None,
+        color_mode: str = "auto",
         cancel: Event | None = None, progress: Progress | None = None,
     ) -> dict[str, Any]:
         """Extract/validate a complete clip, then replace frames and clear masks."""
@@ -303,13 +306,13 @@ class PreparationWorkspace:
         if any(_overlap(source, target) for target in (images, masks, metadata)):
             raise ValueError("Source video cannot be inside an overwritten output")
         info = probe_video(source)
+        color = resolve_video_color(info, color_mode)
         source_stat = source.stat()
         executable = media_executable("ffmpeg")
         with _staging(self.root) as stage:
             staged_images = stage / "images"
             staged_images.mkdir()
-            filters = ([f"scale=-1:{int(height)}"] if height is not None else [])
-            filters += [f"fps={fps:.12g}", "format=rgb24"]
+            filters = color.decode_filters(int(height) if height is not None else None, fps)
             command = [executable, "-hide_banner", "-loglevel", "error", "-nostdin",
                        "-ss", f"{start:.12g}", "-i", str(source)]
             if end is not None:
@@ -336,6 +339,18 @@ class PreparationWorkspace:
             if process.returncode:
                 message = (stage / "ffmpeg.log").read_text(encoding="utf-8", errors="replace")
                 raise RuntimeError(f"FFmpeg failed: {message[-2000:]}")
+            if color.transfer is not None:
+                frames = _list_pngs(staged_images, "HDR frame")
+                for index, frame in enumerate(frames):
+                    _check_cancel(cancel)
+                    image = cv2.imread(str(frame), cv2.IMREAD_UNCHANGED)
+                    if image is None:
+                        raise ValueError(f"Cannot read decoded HDR frame: {frame}")
+                    converted = tone_map_rgb16(image[..., ::-1], color)
+                    if not cv2.imwrite(str(frame), converted[..., ::-1]):
+                        raise OSError(f"Cannot write tone-mapped frame: {frame}")
+                    if progress is not None:
+                        progress(index + 1, len(frames), "Tone mapping HDR to SDR / sRGB…")
             prepared = inspect_images(staged_images, cancel)
             if len(prepared.paths) > 99999:
                 raise ValueError("Clip exceeds five-digit frame numbering; use a shorter clip")
@@ -356,6 +371,7 @@ class PreparationWorkspace:
                 "images": str(images), "masks": str(masks),
                 "mask_status": "pending", "prompt_frame": None,
                 "rotation_policy": "ffmpeg_default_autorotate", "video_probe": info,
+                "color_processing": color.metadata(), "extraction_filters": filters,
             }
             _write_json(stage / "metadata.json", record)
             _check_cancel(cancel)

@@ -14,6 +14,8 @@ class MemoryManager:
         self.hidden_dim = config["hidden_dim"]
         self.top_k = config["top_k"]
 
+        self.query_chunk_size = self._query_chunk_size(config)
+
         self.enable_long_term = config["enable_long_term"]
         self.enable_long_term_usage = config["enable_long_term_count_usage"]
         if self.enable_long_term:
@@ -37,6 +39,7 @@ class MemoryManager:
         self.reset_config = True
 
     def update_config(self, config):
+        self.query_chunk_size = self._query_chunk_size(config)
         self.reset_config = True
         self.hidden_dim = config["hidden_dim"]
         self.top_k = config["top_k"]
@@ -57,28 +60,69 @@ class MemoryManager:
         # this function is for a single object group
         return v @ affinity
 
-    def match_memory(self, query_key, selection):
-        # query_key: B x C^k x H x W
-        # selection:  B x C^k x H x W
-        num_groups = self.work_mem.num_groups
-        h, w = query_key.shape[-2:]
+    @staticmethod
+    def _query_chunk_size(config):
+        size = config.get("query_chunk_size", 256)
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError("XMem query_chunk_size must be a nonnegative integer (0 = dense)")
+        return size
 
+    def match_memory(self, query_key, selection):
+        """Bound affinity allocations without truncating the memory bank.
+
+        Each query retains the original global top-k and softmax. Usage is
+        accumulated over chunks and age advances once per video frame, retaining
+        the original consolidation time scale. The caller uses inference_mode.
+        """
+        h, w = query_key.shape[-2:]
         query_key = query_key.flatten(start_dim=2)
         selection = selection.flatten(start_dim=2) if selection is not None else None
-
-        """
-        Memory readout using keys
-        """
-
+        long_mem_size = 0
         if self.enable_long_term and self.long_mem.engaged():
-            # Use long-term memory
             long_mem_size = self.long_mem.size
             memory_key = torch.cat([self.long_mem.key, self.work_mem.key], -1)
-            shrinkage = torch.cat(
-                [self.long_mem.shrinkage, self.work_mem.shrinkage], -1
-            )
+            shrinkage = torch.cat([self.long_mem.shrinkage, self.work_mem.shrinkage], -1)
+            all_memory_value = [
+                torch.cat([self.long_mem.value[gi], gv], -1)
+                if gi < self.long_mem.num_groups else gv
+                for gi, gv in enumerate(self.work_mem.value)
+            ]
+        else:
+            memory_key, shrinkage = self.work_mem.key, self.work_mem.shrinkage
+            all_memory_value = self.work_mem.value
 
-            similarity = get_similarity(memory_key, shrinkage, query_key, selection)
+        chunk_size = self.query_chunk_size or h * w
+        output = all_memory_value[0].new_empty(
+            (sum(value.shape[0] for value in all_memory_value), self.CV, h * w)
+        )
+        usage_sum = None
+        for start in range(0, h * w, chunk_size):
+            stop = min(start + chunk_size, h * w)
+            readout, usage = self._match_memory_chunk(
+                query_key[:, :, start:stop],
+                selection[:, :, start:stop] if selection is not None else None,
+                memory_key, shrinkage, all_memory_value, long_mem_size,
+            )
+            output[:, :, start:stop] = readout
+            if usage is not None:
+                if usage_sum is None:
+                    usage_sum = usage
+                else:
+                    usage_sum.add_(usage)
+
+        if usage_sum is not None:
+            self.work_mem.update_usage(usage_sum[:, long_mem_size:].flatten())
+            if long_mem_size and self.enable_long_term_usage:
+                self.long_mem.update_usage(usage_sum[:, :long_mem_size].flatten())
+        return output.view(output.shape[0], self.CV, h, w)
+
+    def _match_memory_chunk(self, query_key, selection, memory_key, shrinkage,
+                            all_memory_value, long_mem_size):
+        """Original group-specific equations applied to one query slice."""
+        num_groups = self.work_mem.num_groups
+        usage = None
+        similarity = get_similarity(memory_key, shrinkage, query_key, selection)
+        if long_mem_size:
             work_mem_similarity = similarity[:, long_mem_size:]
             long_mem_similarity = similarity[:, :long_mem_size]
 
@@ -122,35 +166,7 @@ class MemoryManager:
                     )
                 affinity.append(affinity_one_group)
 
-            all_memory_value = []
-            for gi, gv in enumerate(self.work_mem.value):
-                # merge the working and lt values before readout
-                if gi < self.long_mem.num_groups:
-                    all_memory_value.append(
-                        torch.cat(
-                            [self.long_mem.value[gi], self.work_mem.value[gi]], -1
-                        )
-                    )
-                else:
-                    all_memory_value.append(gv)
-
-            """
-            Record memory usage for working and long-term memory
-            """
-            # ignore the index return for long-term memory
-            work_usage = usage[:, long_mem_size:]
-            self.work_mem.update_usage(work_usage.flatten())
-
-            if self.enable_long_term_usage:
-                # ignore the index return for working memory
-                long_usage = usage[:, :long_mem_size]
-                self.long_mem.update_usage(long_usage.flatten())
         else:
-            # No long-term memory
-            similarity = get_similarity(
-                self.work_mem.key, self.work_mem.shrinkage, query_key, selection
-            )
-
             if self.enable_long_term:
                 affinity, usage = do_softmax(
                     similarity,
@@ -159,8 +175,6 @@ class MemoryManager:
                     return_usage=True,
                 )
 
-                # Record memory usage for working memory
-                self.work_mem.update_usage(usage.flatten())
             else:
                 affinity = do_softmax(
                     similarity,
@@ -180,15 +194,13 @@ class MemoryManager:
                 )
                 affinity.append(affinity_one_group)
 
-            all_memory_value = self.work_mem.value
-
         # Shared affinity within each group
         all_readout_mem = torch.cat(
             [self._readout(affinity[gi], gv) for gi, gv in enumerate(all_memory_value)],
             0,
         )
 
-        return all_readout_mem.view(all_readout_mem.shape[0], self.CV, h, w)
+        return all_readout_mem, usage
 
     def add_memory(self, key, shrinkage, value, objects, selection=None):
         # key: 1*C*H*W

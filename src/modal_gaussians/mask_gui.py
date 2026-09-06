@@ -149,6 +149,14 @@ def build_mask_app(root_dir: Path, checkpoint_dir: Path, device: str = "cuda") -
                     output_fps = gr.Textbox(label="Output FPS (required)", value="",
                                             placeholder="e.g. 30", min_width=140)
                     height = gr.Textbox(label="Height (blank = original)", value="", min_width=140)
+                color_mode = gr.Dropdown(
+                    label="Video color",
+                    choices=[("Auto · HDR to SDR", "auto"), ("Off · original extraction", "off"),
+                             ("Force HLG · iPhone HDR", "hlg"), ("Force PQ · HDR10", "pq")],
+                    value="auto",
+                    info="Detects iPhone HDR and exports sRGB PNGs. SDR videos stay unchanged. "
+                         "Use Force only when the video's HDR tags are missing.",
+                )
                 extract = gr.Button("Extract / replace frames", variant="primary")
                 gr.Markdown("After extraction, click **Load sequence** in the next column. "
                             "The sequence name and FPS are filled in automatically.")
@@ -176,7 +184,7 @@ def build_mask_app(root_dir: Path, checkpoint_dir: Path, device: str = "cuda") -
                 cancel = gr.Button("Cancel current operation")
                 loaded = gr.Textbox(label="Loaded input / mask output", interactive=False, lines=4)
 
-        def extract_video(path, name, rate, begin, finish, size, progress=gr.Progress()):
+        def extract_video(path, name, rate, begin, finish, size, color, progress=gr.Progress()):
             """Publish new frames only after decoding/validation succeeds."""
             with controller.operation():
                 if not rate.strip():
@@ -186,7 +194,7 @@ def build_mask_app(root_dir: Path, checkpoint_dir: Path, device: str = "cuda") -
                 try:
                     record = controller.workspace.extract(
                         path, name, fps=float(rate), start=0 if begin is None else begin,
-                        end=resolved_end, height=resolved_height,
+                        end=resolved_end, height=resolved_height, color_mode=color,
                         cancel=controller.cancel_event,
                         progress=partial(_report_progress, progress),
                     )
@@ -194,7 +202,9 @@ def build_mask_app(root_dir: Path, checkpoint_dir: Path, device: str = "cuda") -
                     return str(error), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
                 controller.images = None
                 controller.prompt.release()
+                color_status = ("HDR → SDR / sRGB. " if record["color_processing"]["applied"] else "")
                 return (f"Extracted {record['frame_count']} frames at {record['fps_hz']:g} FPS. "
+                        f"{color_status}"
                         "Old masks cleared; load the sequence to create new masks.",
                         name, "", record["fps_hz"], None, None, "No sequence loaded.")
 
@@ -258,7 +268,7 @@ def build_mask_app(root_dir: Path, checkpoint_dir: Path, device: str = "cuda") -
 
         # Non-queued edits fail immediately while a long job holds the shared lock.
         # Gradio attaches these event methods dynamically through its metaclass.
-        getattr(extract, "click")(extract_video, [video, extraction_name, output_fps, start, end, height],
+        getattr(extract, "click")(extract_video, [video, extraction_name, output_fps, start, end, height, color_mode],
                       [status, sequence, external, fps, canvas, selection, loaded], concurrency_limit=None)
         getattr(load, "click")(load_sequence, [sequence, external, fps],
                    [canvas, selection, frame_index, fps, status, loaded],

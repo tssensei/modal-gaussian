@@ -150,6 +150,18 @@ the mask overlay and point markers in the right-hand preview.
    choose it for your experiment, not a guessed default. Blank end uses the
    rest of the video; blank height preserves resolution. FFmpeg honors rotation
    metadata, preserves aspect ratio when resizing, and performs no crop.
+   **Video color** defaults to **Auto · HDR to SDR**: tagged HLG/PQ inputs,
+   including iPhone Dolby Vision profile 8.4's HLG base layer, are decoded at
+   16-bit RGB precision and converted to 8-bit sRGB PNGs. The fixed BT.2100
+   conversion and Hable curve use a 1000-nit HDR reference and 100-nit SDR scale;
+   there is no per-frame auto-exposure. Ordinary SDR extraction is unchanged.
+   **Off** retains the previous extraction; **Force HLG/PQ** handles missing
+   transfer tags when you know the source format. The selected conversion and
+   decode filters are recorded in sequence metadata. This is a reproducible
+   base-layer conversion, not Apple's display-adaptive Dolby Vision rendering;
+   dynamic Dolby metadata is not applied. It works without FFmpeg's `zscale`.
+   See [Apple's HDR metadata notes](https://developer.apple.com/documentation/technotes/tn3145-hdr-video-metadata)
+   for the iPhone HLG / Dolby Vision format relationship.
 2. **Load sequence:** enter the sequence name; leave the image path blank to
    use `root/images/name`, or enter an external PNG directory to use it in place.
    Extracted sequences recover FPS from metadata; external sequences need their
@@ -163,6 +175,13 @@ the mask overlay and point markers in the right-hand preview.
 4. Click **Track / replace masks**. XMem tracks every frame forward/backward
    from the prompt, saving masks incrementally into a temporary directory.
    SAM VRAM is released before tracking; XMem memory resets between directions.
+   Tracking keeps the original image resolution and FP32 precision. Memory
+   matching processes 256 query feature positions at a time against the full
+   history, reducing temporary similarity/affinity allocation while retaining
+   global top-k matching. Usage is accumulated across chunks and memory age is
+   updated once per frame. `XMEM_CONFIG.query_chunk_size` in `preparation.py`
+   controls this bound (0 is the dense comparison path); resolved tracker settings
+   are recorded in sequence metadata. Small FP32 rounding differences are possible.
    Cancel takes effect between frames. There is no whole-video preview or
    extra Save Masks step; the output is published after complete validation.
 
@@ -204,7 +223,7 @@ old experiment must remain reproducible. The core flow/COLMAP/modal artifacts
 retain their existing non-overwrite rules. `data/`, `checkpoints/` and `outputs/`
 are Git-ignored; original raw videos stay where you placed them. Type checking
 covers the project and mask wrappers; the untyped third-party XMem snapshot is
-explicitly excluded from diagnostics to preserve its inference implementation.
+explicitly excluded from diagnostics; local adaptations are listed in its NOTICE.
 
 ## Current command
 
@@ -377,9 +396,28 @@ modal-gaussians static render `
   --role all
 ```
 
-`SIMPLE_RADIAL` parameters remain recorded for provenance, but this first
-static implementation intentionally preserves the accepted pinhole-K rendering
-convention used by the downstream projection logic.
+New static training applies COLMAP's full `SIMPLE_RADIAL` model `(f,cx,cy,k)`.
+The classic differentiable gsplat renderer first renders an overscanned pinhole
+image, then a fixed differentiable radial warp samples it into the original
+image coordinates. RGB, semantic membership, alpha and modal features use the
+same warp; expected depth is warped as an alpha-weighted moment. This adds
+bilinear resampling, but preserves gradients to Gaussian geometry and features
+(the installed gsplat UT distortion projection does not support geometry backward).
+The warp includes pixel-center conventions and border overscan; noninvertible
+calibration or overscan exceeding four times the original area fails explicitly.
+
+Sparse-point mask voting, topology unprojection, graph depth paths, motion
+Jacobians and calibrated modal phase display also use the radial model. Original
+images, masks and flow/FFT artifacts retain their coordinate system and need no
+undistortion. Free-orbit Viser cameras remain virtual pinhole cameras.
+
+New static bundles are version 2 and record the projection convention in camera,
+dataset, scene and resume identities. Existing version-1 scenes keep their
+original pinhole behavior and identities; they are not silently reinterpreted.
+To use the correction, start a new `static train` from existing joint COLMAP,
+then rebuild topology, graph, alignment, motion and derived results. Old static
+checkpoints cannot resume into the corrected model. No baseline was retrained
+or replaced as part of this implementation.
 
 The corresponding Python interface is intentionally direct:
 
@@ -413,7 +451,7 @@ For every sampled pixel inside the eroded flow mask, the command requires valid
 foreground alpha and expected depth, unprojects a canonical surface point,
 preselects nearby foreground Gaussians, and ranks them by opacity-weighted 3D
 Mahalanobis contribution. It retains up to four positive-depth contributors,
-normalizes their weights per pixel, and stores the pinhole projection Jacobian
+normalizes their weights per pixel, and stores the camera-model projection Jacobian
 for each contributor. Background Gaussian indices never enter this artifact.
 
 The output is deliberately limited to two files:
@@ -1011,7 +1049,7 @@ modal-gaussians coordinates render-design `
 `--modes` accepts either the version-3 shared-basis result or a legacy
 sequential-fill baseline. This stage no longer uses the observation topology's
 short contributor lists.
-For every selected mode and fixed view it evaluates the pinhole projection
+For every selected mode and fixed view it evaluates the camera-model projection
 Jacobian at every foreground Gaussian, rasterizes all projected features with
 the same Gaussian geometry, opacity, transmittance, and depth ordering as the
 static renderer, then divides by rendered foreground alpha. Background
@@ -1019,6 +1057,9 @@ Gaussians are excluded and contribute zero features. Legacy completed-mode
 entries that remain unresolved are retained as explicit zero displacement
 while still participating in foreground alpha; version-3 zero-fallback entries
 are likewise explicit zero-basis blends.
+
+For corrected static scenes, the design is version 2 and records the radial
+Jacobian and shared radial render warp; legacy version-1 designs remain readable.
 
 Candidate pixels come from the eroded flow mask, foreground-alpha threshold,
 and an internal stride grid. The output columns use the fixed real packing

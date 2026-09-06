@@ -243,7 +243,7 @@ def render_predictions(parent: nm.NeuralModesArtifact, phi: np.ndarray) -> np.nd
             if not np.allclose(alpha[pixels[:, 1], pixels[:, 0]], confidence, rtol=2e-5, atol=2e-6):
                 raise ValueError("Fragment fixed foreground alpha differs")
             jacobian, _ = projection_jacobian(arrays["g_points"], camera.K.cpu().numpy(),
-                                               camera.world_to_camera.cpu().numpy())
+                                               camera.world_to_camera.cpu().numpy(), camera.radial_distortion)
             projector = nm.FrozenModalProjector(scene, camera, torch.as_tensor(jacobian, device="cuda"),
                                                 pixels, torch.as_tensor(confidence, device="cuda"))
             for k in range(len(phi)):
