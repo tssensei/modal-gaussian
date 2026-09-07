@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import os
+import shutil
+from functools import lru_cache
 from pathlib import Path
 import tempfile
 import time
@@ -71,8 +73,20 @@ def atomic_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
+@lru_cache(maxsize=256)
+def _source_digest(path: str, stamp: tuple[int, ...]) -> str:
+    # Cache code hashes only, never user data or artifact validation.
+    return sha256(Path(path))
+
+
 def module_revision(*modules: Any) -> str:
-    return identity({m.__name__: sha256(Path(m.__file__)) for m in modules})
+    digests = {}
+    for module in modules:
+        path = Path(module.__file__).resolve()
+        stat = path.stat()
+        stamp = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+        digests[module.__name__] = _source_digest(str(path), stamp)
+    return identity(digests)
 
 
 @contextmanager
@@ -169,13 +183,20 @@ def put_entry(root: Path, contract: dict[str, Any], arrays: dict[str, np.ndarray
     atomic_json(temporary / "manifest.json", {"version": 1, "contract": contract,
                                                "sha256": sha256(temporary / "arrays.npz")})
     try:
-        # rename (not replace) is intentional: never overwrite another publisher.
+        # A successful rename publishes the bytes just checked above. Do not
+        # reopen/decompress/hash that same payload a second time.
         os.rename(temporary, destination)
     except OSError:
         if not destination.exists():
             raise
-        # Keep the completed competing temporary for inspection; it is not a hit.
-    return load_entry(root, contract)  # type: ignore[return-value]
+        # A concurrent winner must pass its own checksum/contract validation.
+        winner = load_entry(root, contract)
+        resolved = temporary.resolve()
+        if resolved.parent != root.resolve() or not resolved.name.startswith(".writing-"):
+            raise RuntimeError("Cache temporary escaped its publication directory")
+        shutil.rmtree(resolved)
+        return winner
+    return {name: np.asarray(value) for name, value in arrays.items()}
 
 
 def cached(root: Path, contract: dict[str, Any], build: Callable[[], dict[str, np.ndarray]],

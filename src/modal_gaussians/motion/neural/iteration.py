@@ -4,18 +4,16 @@ import copy
 from dataclasses import fields
 import json
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 from modal_gaussians.iteration_cache import Timings, atomic_json, exclusive_work, identity, module_revision
 from modal_gaussians.motion.neural.prepared import load_prepared
-from modal_gaussians.motion.neural import neural_modes as nm, neural_field, geometry_graph, fragment_propagation as fp
-from modal_gaussians.motion.neural import training_fragments, surface_attachments, pointwise_attachments, guarded_attachments
-from modal_gaussians.motion.neural import component_field
+from modal_gaussians.motion.neural import neural_modes as nm, neural_field, geometry_graph
+from . import strategies
+from .baseline import baseline_overrides
 from modal_gaussians.motion.common import projection
 from modal_gaussians import static, camera_geometry
 from modal_gaussians.rendered_design import RenderedDesignConfig, RenderedDesignViewInput, build_rendered_modal_design_artifact, load_rendered_modal_design
-from modal_gaussians.direct_coordinates import DirectCoordinateViewInput, build_direct_modal_coordinates_artifact, load_direct_modal_coordinates
 from modal_gaussians.motion.neural.preview import build_preview, load_preview
 
 
@@ -27,19 +25,13 @@ def resolve_config(defaults, overrides):
     if not isinstance(fragment_changes, dict):
         raise ValueError("Fragment overrides must be an object")
     if "strategy" in fragment_changes and fragment_changes["strategy"] != resolved["fragment"].get("strategy"):
-        if fragment_changes["strategy"] not in ("surface", "pointwise", "guarded", "component_field"):
-            raise ValueError("Unknown fragment strategy")
         previous = resolved["fragment"]
-        if fragment_changes["strategy"] == "component_field":
-            resolved["fragment"] = component_field.ComponentFieldConfig().to_dict()
-        elif fragment_changes["strategy"] == "guarded":
-            resolved["fragment"] = guarded_attachments.GuardedAttachmentConfig().to_dict()
-        elif fragment_changes["strategy"] == "pointwise":
-            resolved["fragment"] = pointwise_attachments.PointwiseAttachmentConfig().to_dict()
+        cls = strategies.config_class(fragment_changes)
+        if fragment_changes["strategy"] == "surface" and "strategy" not in previous:
+            resolved["fragment"] = cls(legacy_config=previous).to_dict()
         else:
-            resolved["fragment"] = (surface_attachments.SurfaceAttachmentConfig(legacy_config=previous)
-                if "strategy" not in previous else surface_attachments.SurfaceAttachmentConfig()).to_dict()
-    types = {"neural": nm.NeuralModesConfig, "fragment": training_fragments.config_class(resolved["fragment"]), "design": RenderedDesignConfig}
+            resolved["fragment"] = cls().to_dict()
+    types = {"neural": nm.NeuralModesConfig, "fragment": strategies.config_class(resolved["fragment"]), "design": RenderedDesignConfig}
     for section, values in overrides.items():
         if not isinstance(values, dict) or set(values) - {f.name for f in fields(types[section])}:
             raise ValueError(f"Unknown iteration parameters in {section}")
@@ -76,6 +68,13 @@ def resolve_mode_slots(modes, frequencies_hz):
     return nm._validated_mode_slots(sorted(slots), len(modes))
 
 
+def training_revision(strategy_config):
+    """Cache only code used by this representation, including artifact replay."""
+    from . import artifacts
+    return module_revision(nm, neural_field, geometry_graph, projection, static,
+        camera_geometry, artifacts, strategies, *strategies.implementation_modules(strategy_config))
+
+
 def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", frequencies_hz=None,
                    refine_observations=False, refinement_config_path=None):
     if stage not in ("modes", "preview", "full"):
@@ -84,14 +83,14 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
     if refinement_config_path is not None and not refine_observations:
         raise ValueError("--refinement-config requires --refine-observations")
     if refine_observations:
-        from .observation_refinement import ObservationRefinementConfig
+        from modal_gaussians.motion.legacy.neural.observation_refinement import ObservationRefinementConfig
         values = json.loads(Path(refinement_config_path).read_text()) if refinement_config_path else {}
         refinement = ObservationRefinementConfig.from_dict(values)
     root = Path(output_dir).expanduser().resolve()
     timer = Timings()
     with timer.stage("prepared_load"):
         prepared = load_prepared(prepared_dir)
-        overrides = json.loads(Path(config_path).read_text(encoding="utf-8")) if config_path else {}
+        overrides = json.loads(Path(config_path).read_text(encoding="utf-8")) if config_path else baseline_overrides()
         config = resolve_config(prepared.manifest["defaults"], overrides)
         settings = nm.NeuralModesConfig.from_dict(config["neural"])
         if refinement is not None and (settings.training_fragment_config or {}).get("strategy") == "component_field":
@@ -102,16 +101,14 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
         mode_slots = resolve_mode_slots(prepared.source["modes"], frequencies_hz)
     if root == prepared.path or root.is_relative_to(prepared.path):
         raise ValueError("Experiment must not overwrite prepared inputs")
-    neural_revision = module_revision(nm, neural_field, geometry_graph, projection, static, camera_geometry, training_fragments, fp, surface_attachments)
-    if settings.training_fragment_config and settings.training_fragment_config.get("strategy") == "pointwise":
-        neural_revision = identity({"base": neural_revision, "pointwise": module_revision(pointwise_attachments)})
-    if settings.training_fragment_config and settings.training_fragment_config.get("strategy") == "guarded":
-        neural_revision = identity({"base": neural_revision, "guarded": module_revision(guarded_attachments, pointwise_attachments)})
-    if settings.training_fragment_config and settings.training_fragment_config.get("strategy") == "component_field":
-        neural_revision = identity({"base": neural_revision, "component_field":
-            module_revision(component_field, guarded_attachments, pointwise_attachments)})
-    contract = {"version": 1, "prepared": str(prepared.path), "prepared_identity": prepared.manifest["prepared_identity"],
-                "config": config, "neural_revision": neural_revision, "fragment_revision": module_revision(fp)}
+    strategy_config = settings.training_fragment_config
+    neural_revision = training_revision(strategy_config)
+    contract = {"version": 2, "prepared": str(prepared.path),
+                "prepared_identity": prepared.manifest["prepared_identity"],
+                "config": config, "neural_revision": neural_revision}
+    if strategy_config is None:
+        from modal_gaussians.motion.legacy.neural import fragment_propagation as fp
+        contract["fragment_revision"] = module_revision(fp)
     if mode_slots is not None:
         contract["source_mode_slots"] = mode_slots
     if root.exists() and not (root / "iteration.json").is_file():
@@ -135,7 +132,6 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
 
 
 def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slots=None, refinement=None):
-    from modal_gaussians.result import materialize_modal_result, load_modal_result
     source = prepared.source
     model_contract = {"prepared": prepared.manifest["prepared_identity"], "config": config["neural"], "code": neural_revision}
     if mode_slots is not None:
@@ -164,9 +160,10 @@ def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slot
     timer.records[-1]["cache_hit"] = hit
     if config["neural"].get("training_fragment_config") is not None:
         completed, completed_path = raw, raw.path
-        if raw.manifest["version"] != training_fragments.artifact_contract(config["neural"]["training_fragment_config"])[0]:
+        if raw.manifest["version"] != strategies.artifact_contract(config["neural"]["training_fragment_config"])[0]:
             raise ValueError("Training fill version differs from its attachment strategy")
     else:
+        from modal_gaussians.motion.legacy.neural import fragment_propagation as fp
         completed_path = root / "neural_completed_modes"
         with timer.stage("fragment_propagation"):
             if completed_path.exists():
@@ -179,7 +176,7 @@ def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slot
                 raise ValueError("Existing propagation is not this experiment")
     propagation_path = completed_path
     if refinement is not None:
-        from . import observation_refinement as ref
+        from modal_gaussians.motion.legacy.neural import observation_refinement as ref
         ref_key = identity({"parent": completed.manifest["completed_modes_identity"],
                             "prepared": prepared.manifest["prepared_identity"],
                             "config": refinement.to_dict(), "code": module_revision(ref)})
@@ -214,7 +211,7 @@ def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slot
         else:
             design = build_rendered_modal_design_artifact(scene_dir=source["static_scene"], completed_modes_dir=completed_path,
                 views=[RenderedDesignViewInput(v["label"], Path(f["path"])) for v, f in zip(source["views"], prepared.manifest["flows"])],
-                output_dir=design_path, flow_loader=prepared.flow,
+                output_dir=design_path, flow_loader=prepared.flow, validated_completed=completed,
                 config=RenderedDesignConfig(**{f.name: config["design"][f.name] for f in fields(RenderedDesignConfig)}))
         if design.manifest["completed_modes_identity"] != completed.manifest["completed_modes_identity"] or design.manifest["settings"] != config["design"]:
             raise ValueError("Existing rendered design differs from experiment")
@@ -222,7 +219,8 @@ def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slot
     with timer.stage("preview_publication"):
         if not preview_path.exists():
             preview = build_preview(prepared_dir=prepared.path, scene_dir=source["static_scene"], completed_modes_dir=completed_path,
-                                    rendered_design_dir=design_path, output_dir=preview_path)
+                                    rendered_design_dir=design_path, output_dir=preview_path,
+                                    prepared=prepared, completed=completed, design=design)
         else:
             preview = load_preview(preview_path)
         if preview.manifest["completed_modes_identity"] != completed.manifest["completed_modes_identity"]:
@@ -231,6 +229,9 @@ def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slot
     # is performed by the user after launch, not as an extra iteration stage.
     outputs.update(rendered_design=str(design_path), preview=str(preview_path))
     if stage == "full":
+        from modal_gaussians.direct_coordinates import (DirectCoordinateViewInput,
+            build_direct_modal_coordinates_artifact, load_direct_modal_coordinates)
+        from modal_gaussians.result import materialize_modal_result, load_modal_result
         coordinates_path = root / "direct_coordinates"
         with timer.stage("coordinates"):
             if coordinates_path.exists():

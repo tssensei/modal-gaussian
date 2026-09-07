@@ -6,7 +6,7 @@ import numpy as np
 from scipy.sparse import coo_matrix
 
 from .geometry_graph import build_control_graph
-from .pointwise_attachments import assign_points
+from ..common.point_transfer import assign_points
 
 VERSION = 16
 METHOD = "neural_component_field_with_stable_donors"
@@ -61,13 +61,13 @@ class ComponentFieldConfig:
 def observation_inputs(points, cameras, depths, alphas, tolerances, alpha_minimum):
     # Use exactly the previous donor visibility test, without storing or applying
     # its observation-direction projector to the learned displacement field.
-    from .guarded_attachments import observation_inputs as guarded_inputs
-    data = guarded_inputs(points, cameras, depths, alphas, tolerances, alpha_minimum)
+    from ..common.visibility import observation_inputs as visibility_inputs
+    data = visibility_inputs(points, cameras, depths, alphas, tolerances, alpha_minimum)
     return {"u_surface_visible": data["h_surface_visible"]}
 
 
 def build_component_controls(graph, *, geometry_config, fragment_config, scene_scale, attachment_inputs):
-    from .training_fragments import host_subgraph
+    from ..common.graph_ops import host_subgraph
     settings = ComponentFieldConfig.from_dict(fragment_config)
     observed = attachment_inputs["observation_view_mask"]
     mass = attachment_inputs["contribution_mass"]

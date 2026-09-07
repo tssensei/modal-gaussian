@@ -127,36 +127,35 @@ class PreparedNeuralInputs:
                             "config": {k: getattr(config, k) for k in CONTROL_FIELDS}}
         arrays.update({"g_" + k: v for k, v in graph_arrays.items()})
         if config.training_fragment_config is not None:
-            from . import training_fragments, fragment_propagation, surface_attachments, pointwise_attachments, guarded_attachments
+            from . import strategies
             attachment_inputs = None
             if config.training_fragment_config.get("strategy") == "surface":
+                from modal_gaussians.motion.legacy.neural import surface_attachments
                 attachment_inputs = surface_attachments.observation_inputs(scene, cameras, depths, alphas, endpoint,
                     arrays["contribution_mass"], arrays["contribution_threshold"])
                 control_contract["surface_inputs"] = nm._arrays_identity(attachment_inputs)
             if config.training_fragment_config.get("strategy") == "pointwise":
                 attachment_inputs = {"p_observation_view_mask": arrays["observation_view_mask"]}
                 control_contract["pointwise_inputs"] = nm._arrays_identity(attachment_inputs)
-                control_contract["pointwise_code"] = module_revision(pointwise_attachments)
             if config.training_fragment_config.get("strategy") == "guarded":
+                from modal_gaussians.motion.legacy.neural import guarded_attachments
                 attachment_inputs = guarded_attachments.observation_inputs(arrays["g_points"], cameras, depths,
                                                                            alphas, endpoint, config.alpha_minimum)
                 attachment_inputs.update(observation_view_mask=arrays["observation_view_mask"],
                                          contribution_mass=arrays["contribution_mass"])
                 control_contract["guarded_inputs"] = nm._arrays_identity(attachment_inputs)
-                control_contract["guarded_code"] = module_revision(guarded_attachments, pointwise_attachments)
             if config.training_fragment_config.get("strategy") == "component_field":
-                from . import component_field
+                from modal_gaussians.motion.neural import component_field
                 attachment_inputs = component_field.observation_inputs(arrays["g_points"], cameras, depths,
                                                                         alphas, endpoint, config.alpha_minimum)
                 attachment_inputs.update(observation_view_mask=arrays["observation_view_mask"],
                                          contribution_mass=arrays["contribution_mass"])
                 control_contract["component_inputs"] = nm._arrays_identity(attachment_inputs)
-                control_contract["component_code"] = module_revision(component_field, guarded_attachments, pointwise_attachments)
             control_contract.update(implementation="host_controls_with_training_fill_v1",
                 fragment_config=config.training_fragment_config,
-                attachment_code=module_revision(training_fragments, fragment_propagation, surface_attachments))
+                attachment_code=module_revision(strategies, *strategies.implementation_modules(config.training_fragment_config)))
             control_arrays = cached(self.cache_dir / "controls", control_contract,
-                lambda: training_fragments.build_training_controls(graph, geometry_config=settings,
+                lambda: strategies.build_training_controls(graph, geometry_config=settings,
                     fragment_config=config.training_fragment_config, scene_scale=float(arrays["scene_scale"]),
                     attachment_inputs=attachment_inputs),
                 timer, "control_cache")
@@ -200,8 +199,8 @@ def prepare_neural(*, output_dir, cache_dir=DEFAULT_CACHE, from_result=None,
     from modal_gaussians.result import load_modal_result
     from modal_gaussians.vis.spectrum import _read_reference_rgb
     from modal_gaussians.modes import dense_cache_contract
-    from modal_gaussians.motion.neural.fragment_propagation import FragmentPropagationConfig
-    from modal_gaussians.motion.neural.surface_attachments import SurfaceAttachmentConfig
+    from .baseline import new_training_config
+    from .component_field import ComponentFieldConfig
     from modal_gaussians.motion.common.projection import RenderedDesignConfig
     timer = timer or Timings()
     destination = Path(output_dir).expanduser().resolve()
@@ -211,7 +210,11 @@ def prepare_neural(*, output_dir, cache_dir=DEFAULT_CACHE, from_result=None,
     frozen = None
     legacy_controls_requested = (config_overrides or {}).get("training_fragment_config", "default") is None
     with timer.stage("source_validation"):
-        fragment_config = (FragmentPropagationConfig() if legacy_controls_requested else SurfaceAttachmentConfig()).to_dict()
+        if legacy_controls_requested:
+            from modal_gaussians.motion.legacy.neural.fragment_propagation import FragmentPropagationConfig
+            fragment_config = FragmentPropagationConfig().to_dict()
+        else:
+            fragment_config = ComponentFieldConfig().to_dict()
         design_config = RenderedDesignConfig().to_dict()
         if from_result is not None:
             if any(v is not None for v in (scene_dir, topology_dir, measurements_dir, graph_dir, alignment_from)):
@@ -236,7 +239,7 @@ def prepare_neural(*, output_dir, cache_dir=DEFAULT_CACHE, from_result=None,
             if all(getattr(config, k) == getattr(baseline_config, k) for k in OBSERVATION_FIELDS):
                 frozen = {k: v for k, v in completed.arrays.items() if k not in ("phi", "sample_prediction")}
             design_config = result.rendered_design.manifest["settings"]
-        config = config or nm.NeuralModesConfig()
+        config = config or new_training_config()
         if config_overrides:
             config = nm.NeuralModesConfig(**{**config.to_dict(), **config_overrides})
         if config.training_fragment_config is None and not legacy_controls_requested:
@@ -285,9 +288,9 @@ def prepare_neural(*, output_dir, cache_dir=DEFAULT_CACHE, from_result=None,
                 "defaults": {"neural": config.to_dict(), "fragment": fragment_config, "design": design_config}}
     manifest["prepared_identity"] = identity(manifest)
     atomic_json(temporary / "manifest.json", manifest)
-    load_prepared(temporary)
+    prepared = load_prepared(temporary)
     os.rename(temporary, destination)
-    prepared = load_prepared(destination)
+    prepared.path = destination
     # Populate geometry/control caches now; training starts with warm geometry.
     with timer.stage("geometry_preparation"):
         prepared.training_inputs(source, scene, old_graph, config, torch.device("cuda"), timer)

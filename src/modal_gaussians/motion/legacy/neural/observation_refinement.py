@@ -12,8 +12,8 @@ import torch
 from modal_gaussians.iteration_cache import module_revision
 from modal_gaussians.numpy_io import save_named_arrays
 from modal_gaussians.progress import report_progress
-from . import neural_modes as nm
-from .neural_field import ModalObservation, radial_huber
+from modal_gaussians.motion.neural import neural_modes as nm
+from modal_gaussians.motion.neural.neural_field import ModalObservation, radial_huber
 
 VERSION = 13
 METHOD = "neural_pointwise_observation_refinement"
@@ -187,7 +187,7 @@ def _sources(parent, prepared):
             raise ValueError(f"Refinement frozen source differs: {name}")
     from modal_gaussians.static import cameras_from_scene_manifest
     from modal_gaussians.camera_geometry import project_camera
-    from .geometry_graph import depth_thresholds_from_manifest
+    from modal_gaussians.motion.neural.geometry_graph import depth_thresholds_from_manifest
     scene_manifest = json.loads((Path(parent.manifest["static_scene"])/"manifest.json").read_text())
     reference = {c.label: c for c in cameras_from_scene_manifest(scene_manifest) if c.role == "reference"}
     cameras = [reference[v["label"]] for v in parent.manifest["views"]]
@@ -260,7 +260,7 @@ def identity_payload(manifest):
 
 
 def load_refined_modes(path):
-    from .prepared import load_prepared
+    from modal_gaussians.motion.neural.prepared import load_prepared
     root = Path(path).resolve(strict=True)
     manifest = json.loads((root/"manifest.json").read_text())
     expected = artifact_contract(14 if manifest.get("version") == 15 else 12)

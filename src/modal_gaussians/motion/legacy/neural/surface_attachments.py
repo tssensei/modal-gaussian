@@ -15,7 +15,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 from .fragment_propagation import FragmentPropagationConfig, build_attachments, core_mask
-from .geometry_graph import build_control_graph
+from modal_gaussians.motion.neural.geometry_graph import build_control_graph
 
 VERSION = 11
 METHOD = "neural_field_with_surface_attachments"

@@ -323,6 +323,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name, default in (("max-fragment-extent", 0.016), ("attachment-distance", 0.008),
                           ("patch-radius", 0.008), ("host-size-ratio", 4.0), ("ambiguity-ratio", 1.25)):
         propagate_fragments.add_argument(f"--{name}", type=_positive_float, default=default)
+    from modal_gaussians.motion.neural.baseline import NEURAL_OVERRIDES
     fit_neural = motion_commands.add_parser(
         "fit-neural", help="Fit full-foreground complex displacement fields",
     )
@@ -351,10 +352,10 @@ def build_parser() -> argparse.ArgumentParser:
         ("max-iterations", 2000), ("convergence-patience", 50),
         ("checkpoint-every", 100),
     ):
-        fit_neural.add_argument(f"--{name}", type=_positive_int, default=default)
+        fit_neural.add_argument(f"--{name}", type=_positive_int, default=NEURAL_OVERRIDES.get(name.replace("-", "_"), default))
     for name, default in (("mask-erosion-iterations", 1), ("seed", 1729)):
-        fit_neural.add_argument(f"--{name}", type=_non_negative_int, default=default)
-    fit_neural.add_argument("--local-feature-dim", type=_non_negative_int, default=0,
+        fit_neural.add_argument(f"--{name}", type=_non_negative_int, default=NEURAL_OVERRIDES.get(name.replace("-", "_"), default))
+    fit_neural.add_argument("--local-feature-dim", type=_non_negative_int, default=NEURAL_OVERRIDES["local_feature_dim"],
                             help="Learn this many features per control and frequency; 0 preserves the coordinate-only network")
     for name, default in (
         ("graph-max-distance", 0.008), ("unknown-max-distance", 0.004),
@@ -363,18 +364,18 @@ def build_parser() -> argparse.ArgumentParser:
         ("huber-delta", 1.0), ("rotation-length-fraction", 0.05),
         ("learning-rate", 0.001), ("gradient-clip", 1.0),
     ):
-        fit_neural.add_argument(f"--{name}", type=_positive_float, default=default)
+        fit_neural.add_argument(f"--{name}", type=_positive_float, default=NEURAL_OVERRIDES.get(name.replace("-", "_"), default))
     for name, default in (
         ("deformation-weight", 1.0), ("rotation-weight", 0.1),
         ("relative-tolerance", 1.0e-6),
     ):
-        fit_neural.add_argument(f"--{name}", type=_non_negative_float, default=default)
+        fit_neural.add_argument(f"--{name}", type=_non_negative_float, default=NEURAL_OVERRIDES.get(name.replace("-", "_"), default))
     fit_neural.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     fit_neural.add_argument("--fragment-treatment", choices=("in-training", "post-training"), default="in-training",
                             help="Default: host controls with fixed fragment fill before the loss")
     fit_neural.add_argument("--fragment-config", type=Path,
                             help="Fragment JSON: strategy=component_field selects v16, guarded v14, pointwise v12, surface v11; no strategy v10")
-    fit_neural.add_argument("--graph-edge-filter", choices=("depth", "none"), default="depth",
+    fit_neural.add_argument("--graph-edge-filter", choices=("depth", "none"), default=NEURAL_OVERRIDES["graph_edge_filter"],
                             help="Use depth/path filtering, or retain every spatial mutual-KNN candidate")
     fit_neural.add_argument(
         "--resume", action="store_true",
@@ -919,10 +920,7 @@ def _dispatch(
             print(f"identity: {artifact.manifest['rigid_modes_identity']}")
             return 0
         if args.command == "motion" and args.motion_command == "propagate-fragments":
-            from modal_gaussians.motion.neural.fragment_propagation import (
-                FragmentPropagationConfig,
-                build_fragment_modes,
-            )
+            from modal_gaussians.motion.legacy.neural.fragment_propagation import FragmentPropagationConfig, build_fragment_modes
 
             names = ("max_fragment_nodes", "core_degree", "min_anchors", "max_fragment_extent",
                      "attachment_distance", "patch_radius", "host_size_ratio", "ambiguity_ratio")
@@ -968,11 +966,10 @@ def _dispatch(
             )
             training_fragments = None
             if args.fragment_treatment == "in-training":
-                from modal_gaussians.motion.neural.fragment_propagation import FragmentPropagationConfig
-                from modal_gaussians.motion.neural.surface_attachments import SurfaceAttachmentConfig
+                from modal_gaussians.motion.neural.component_field import ComponentFieldConfig
                 fragment_values = json.loads(args.fragment_config.read_text(encoding="utf-8")) if args.fragment_config else {}
-                from modal_gaussians.motion.neural.training_fragments import config_class
-                cls = config_class(fragment_values) if args.fragment_config else SurfaceAttachmentConfig
+                from modal_gaussians.motion.neural.strategies import config_class
+                cls = config_class(fragment_values) if args.fragment_config else ComponentFieldConfig
                 training_fragments = cls(**fragment_values).to_dict()
             elif args.fragment_config:
                 raise ValueError("--fragment-config requires --fragment-treatment in-training")

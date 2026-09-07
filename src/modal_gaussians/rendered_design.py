@@ -446,6 +446,7 @@ def _load_sources(
     views: Sequence[RenderedDesignViewInput],
     device: torch.device,
     flow_loader: Any = None,
+    validated_completed: Any = None,
 ) -> tuple[
     Path,
     ForegroundBackgroundScene,
@@ -465,7 +466,9 @@ def _load_sources(
     scene = load_static_scene(scene_path, device)
     if scene.manifest is None:
         raise ValueError("Static scene has no manifest")
-    completed = load_completed_modes(completed_modes_dir)
+    completed = validated_completed if validated_completed is not None else load_completed_modes(completed_modes_dir)
+    if completed.path.resolve() != Path(completed_modes_dir).expanduser().resolve():
+        raise ValueError("Reused completed modes belong to a different path")
     for name, actual, expected in (
         (
             "static scene",
@@ -552,6 +555,7 @@ def build_rendered_modal_design_artifact(
     config: RenderedDesignConfig | None = None,
     command: Sequence[str] = (),
     flow_loader: Any = None,
+    validated_completed: Any = None,
 ) -> RenderedModalDesignArtifact:
     """Render completed full-foreground modes and publish the compact C16 artifact."""
 
@@ -570,7 +574,7 @@ def build_rendered_modal_design_artifact(
         cameras,
         flows,
         view_records,
-    ) = _load_sources(scene_dir, completed_modes_dir, views, device, flow_loader=flow_loader)
+    ) = _load_sources(scene_dir, completed_modes_dir, views, device, flow_loader=flow_loader, validated_completed=validated_completed)
     scene_manifest = scene.manifest
     if scene_manifest is None:
         raise ValueError("Static scene has no manifest")

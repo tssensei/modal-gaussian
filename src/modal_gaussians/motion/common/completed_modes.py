@@ -41,12 +41,12 @@ def load_completed_modes(path: str | Path) -> CompletedModesArtifact:
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError("Completed-mode version must be an integer")
     if version == 9:
-        from modal_gaussians.motion.neural.fragment_propagation import load_fragment_modes
+        from modal_gaussians.motion.legacy.neural.fragment_propagation import load_fragment_modes
 
         derived = load_fragment_modes(root)
         return CompletedModesArtifact(path=derived.path, manifest=derived.manifest, arrays=derived.arrays)
     if version in (13, 15):
-        from modal_gaussians.motion.neural.observation_refinement import load_refined_modes
+        from modal_gaussians.motion.legacy.neural.observation_refinement import load_refined_modes
         refined = load_refined_modes(root)
         return CompletedModesArtifact(refined.path, refined.manifest, refined.arrays)
     if version in (8, 10, 11, 12, 14, 16):

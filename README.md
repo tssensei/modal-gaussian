@@ -10,7 +10,8 @@ The current user-selected neural motion baseline is
 and **three** message-passing layers, using whole-component control fields and
 separate reliable propagation donors. The accepted preview contains **0.744 Hz**;
 deformation/rotation penalties remain 0.1/0.1. Use
-`configs/neural_component_field.json` for subsequent experiment overrides.
+`configs/neural_component_field.json` for subsequent experiment overrides. New
+neural CLI runs without an explicit config also select this preset.
 See [BASELINE.md](BASELINE.md) for the exact result, frozen configuration and
 historical corn references.
 
@@ -19,7 +20,9 @@ historical corn references.
 Motion implementations are grouped under `src/modal_gaussians/motion/`:
 
 - [`neural/`](src/modal_gaussians/motion/neural): geometry/control graphs, GNN,
-  neural training/artifacts, and fragment propagation.
+  current component fields, training, prepared inputs and previews.
+- [`legacy/neural/`](src/modal_gaussians/motion/legacy/neural): historical fragment,
+  surface, pointwise, guarded and observation-refinement strategies.
 - [`rigid/`](src/modal_gaussians/motion/rigid): component graphs, rigid solves,
   sequential fill, motion-basis fitting, and green refinement.
 - [`common/`](src/modal_gaussians/motion/common): unified completed-modes loading,
@@ -28,8 +31,10 @@ Motion implementations are grouped under `src/modal_gaussians/motion/`:
 See the [motion code map](src/modal_gaussians/motion/README.md) for entry points
 and dependencies. Static reconstruction, observations, coordinates, result
 packaging, and Viewer remain shared. The former root-level motion aliases have
-been removed; Python imports now use the `motion/` packages. CLI commands,
-artifact formats, and experiment parameters are unchanged.
+been removed; Python imports now use the `motion/` packages. Historical neural
+strategies use `motion.legacy.neural`. Saved artifact formats and numerical
+algorithms remain unchanged; new-run defaults now select the current baseline.
+See the [cleanup report](docs/code-cleanup.md) for cache/resume boundaries.
 
 ## Environment
 

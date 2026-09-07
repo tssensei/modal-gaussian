@@ -1,84 +1,88 @@
 # Motion code map
 
-Both motion pipelines use the same static scene and observation sources, and
-export complex foreground displacement `phi[K,G,3]` for the shared rendered
-design, coordinate fitting, result packaging, and Viewer.
+The selected baseline is v16 `neural_component_field_with_stable_donors`.
+See [BASELINE.md](../../../BASELINE.md) for the accepted result and
+[the cleanup report](../../../docs/code-cleanup.md) for this refactor.
+The [earlier audit](../../../docs/baseline-code-audit.md) describes the code before cleanup.
 
-## Neural field pipeline
+## Current neural pipeline
 
-Read these modules in order:
-
-1. [geometry_graph.py](neural/geometry_graph.py): all-foreground geometry graph,
-   graph-distance control selection, control graph, and fixed sparse interpolation.
-2. [neural_field.py](neural/neural_field.py): `PerFrequencyModalGNN`, control-motion
-   composition, structural/modal losses, and `train_single_frequency`.
-3. [neural_modes.py](neural/neural_modes.py): frozen observation renderer, complete
-   training orchestration, checkpoints, prefix export, and strict v8 loading.
-4. [fragment_propagation.py](neural/fragment_propagation.py): local post-training
-   fragment attachment and motion transfer; strict derived v9 loading.
-
-The accepted baseline uses deformation weight `0.1`, rotation weight `0.1`,
-`graph_edge_filter=none`, and fragment propagation. CLI defaults still use
-deformation weight `1.0` and depth filtering. Directory reorganization does not
-change these defaults or the accepted [baseline](../../../BASELINE.md).
-
-## Rigid and motion-basis pipeline
-
-1. [structure_graph.py](rigid/structure_graph.py): original observation-supported
-   component graph and its format validator.
-2. [rigid.py](rigid/rigid.py): complex component motion, trust checks, and rigid artifacts.
-3. [motion_basis.py](rigid/motion_basis.py): basis candidates and shared weight fitting.
-4. [motion_basis_frequency.py](rigid/motion_basis_frequency.py): independent weights
-   and trusted basis selection per frequency.
-5. [motion_basis_green.py](rigid/motion_basis_green.py): fixed-blue green refinement.
-
-[motion_fill.py](rigid/motion_fill.py) also retains the older sequential
-promotion/fill implementation and the v1/v2 validator.
-
-## Shared boundaries
+Read these modules in this order:
 
 | Module | Responsibility |
 |---|---|
-| [completed_modes.py](common/completed_modes.py) | Common artifact type and lazy version dispatch to strict v1–v9 validators |
-| [mode_mapping.py](common/mode_mapping.py) | Exact local-to-source frequency mapping; never infer ordering from frequency values |
-| [sources.py](common/sources.py) | Shared scene/topology/measurement identity checks; fixed-alpha compatibility adapter |
-| [projection.py](common/projection.py) | Projection Jacobian, sampling configuration, mask/alpha pixel selection, foreground feature sampling |
-| [geometry_ops.py](common/geometry_ops.py) | Geometric image sampling, preserving historical float32/float64 arithmetic separately |
+| [baseline.py](neural/baseline.py) | Preset for new experiments: width 256, features 32, three message layers, current component-field strategy |
+| [geometry_graph.py](neural/geometry_graph.py) | Foreground mutual-KNN graph, graph-distance controls, fixed sparse interpolation |
+| [component_field.py](neural/component_field.py) | Whole-component learning eligibility; separate reliable donors and fixed pointwise transfer |
+| [neural_field.py](neural/neural_field.py) | GNN, complex control field, differentiable transfer, modal/structure losses and single-frequency optimization |
+| [neural_modes.py](neural/neural_modes.py) | Frozen observations, training/checkpoints, mode selection and artifact publication |
+| [artifacts.py](neural/artifacts.py) | Persisted-array/source validation and network replay for v8/v10/v11/v12/v14/v16 |
+| [prepared.py](neural/prepared.py) | Immutable observations and independent geometry/control caches |
+| [iteration.py](neural/iteration.py) | Resolve configuration and run modes, optional preview, or explicitly requested full evaluation |
+| [preview.py](neural/preview.py) | Bind modes, rendered design and sources for manual preview without video coordinates |
+| [strategies.py](neural/strategies.py) | Lazy version/strategy dispatch; only selected implementations contribute to training dependencies |
 
-The neural pipeline still accepts the existing rigid artifact as
-`--alignment-from`. The adapter validates that artifact but exposes only complex
-alpha and identifiability arrays to neural code. It neither initializes from
-rigid motion nor applies rigid trust. The observed-graph identity remains part
-of the existing source contract, including when neural depth filtering is disabled.
+The default is `modes`. `preview` additionally builds rendered modal-image
+comparisons and manual oscillation inputs. Only explicit `full` imports and runs
+coordinate fitting/result packaging. Current training fills follower motion
+before the full-foreground observation loss; it does not run historical
+post-training propagation or observation refinement.
 
-Static reconstruction, `flow/`, topology, frequency selection, measurements,
-synchronization, rendered design, coordinates, and `vis/` remain shared at the
-package root. Rendering and result code import the neutral completed-modes
-interface. Viewer uses method-specific graph display adapters after loading it.
+## Configuration and compatibility
 
-## Imports and saved-result compatibility
+`fit-neural`, preparation from explicit sources, and `iterate-neural` without
+`--config` select [baseline.py](neural/baseline.py). The baseline override keeps
+the preparation's observation units and sampling. An explicit iteration config
+continues to overlay the preparation's recorded defaults, so use
+[neural_component_field.json](../../../configs/neural_component_field.json) as
+the starting config for baseline parameter studies.
 
-Use canonical imports in new code:
+Historical decoding stays separate: `NeuralModesConfig` and `NeuralFieldConfig`
+retain early defaults, and old v16 configs without `min_learning_controls`
+retain their original meaning. Model state-dict keys, array names, identities
+and saved `phi` semantics are unchanged. Saved results need no migration.
 
-```python
-from modal_gaussians.motion.neural.neural_field import PerFrequencyModalGNN
-from modal_gaussians.motion.rigid.rigid import solve_rigid_components
-from modal_gaussians.motion.common.completed_modes import load_completed_modes
-```
+The new iteration contract is version 2 and code revisions reflect the new
+module boundaries. Start changed-code experiments in a new output directory;
+do not reuse an old revision's directory as a resume. Existing result loading
+and Viewer commands remain supported.
 
-The ten previous root module aliases have been removed. Import motion modules
-from `motion.neural`, `motion.rigid`, or `motion.common`; for example, replace
-`modal_gaussians.neural_field` with `modal_gaussians.motion.neural.neural_field`.
-Archived experiment scripts and source snapshots under `outputs/` retain their
-original imports for provenance; update those imports before rerunning an archived
-helper against the current package. Current CLI commands and saved-result loading
-use the canonical paths and do not need these aliases.
+## Shared functions and sources
 
-`rendered_design` still re-exports its former projection helpers and configuration.
-Within `motion.rigid`, `motion_fill.load_completed_modes` forwards to the common
-loader; shared consumers should import the common loader directly.
+| Module | Responsibility |
+|---|---|
+| [completed_modes.py](common/completed_modes.py) | Unified lazy dispatch to the appropriate strict format loader |
+| [sources.py](common/sources.py) | Shared source identities and the fixed-alpha alignment adapter |
+| [projection.py](common/projection.py) | Calibrated Jacobians, sampling and foreground feature projection |
+| [mode_mapping.py](common/mode_mapping.py) | Explicit exported-to-source frequency mapping |
+| [graph_ops.py](common/graph_ops.py) | Induced host subgraphs, shared across strategies |
+| [point_transfer.py](common/point_transfer.py) | Nearest donor component and fixed per-point transfer weights |
+| [visibility.py](common/visibility.py) | Frozen depth/alpha visibility with calibrated cameras |
+| [geometry_ops.py](common/geometry_ops.py) | Shared image sampling with preserved numerical conventions |
 
-CLI names/options, default values, artifact format strings, identities, source
-paths, saved network state dictionaries, and numerical algorithms are unchanged.
-No result migration or retraining is required. Run development checks with
-`python -m unittest discover -s tests -v` from the repository root.
+The existing rigid alignment and observed-graph formats remain source contracts.
+The neural path consumes fixed complex alpha and identifiability, plus depth
+tolerances for donor visibility. It does not consume rigid motion or trust.
+These dependencies still require the corresponding old loaders.
+
+## Historical implementations
+
+- [legacy/neural](legacy/neural/README.md): fragment, surface, pointwise, guarded
+  and observation-refinement strategies. They import shared helpers instead of
+  defining copies. No forwarding files remain at their former `neural/` paths.
+- [rigid](rigid): rigid components, sequential fill, motion-basis fitting,
+  per-frequency candidates and green refinement. This existing boundary stays
+  intact because old results and alignment sources still use its loaders.
+
+Use canonical imports under `motion.neural`, `motion.common`, `motion.rigid`,
+or `motion.legacy.neural`. Archived scripts referencing the moved Python
+modules need import-path updates; artifact paths and CLI command names do not.
+
+## I/O boundaries
+
+A public load still verifies its on-disk data. Within one producer call, retain
+validated arrays/objects across atomic publication and downstream preview/design
+construction instead of loading them again. Reused inputs must match the
+requested paths and linked identities. A competing cache publisher's output
+is independently validated. Only source-code hashes use a process-local stat
+cache; user data never bypass content validation on that basis.
