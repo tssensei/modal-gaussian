@@ -1,4 +1,4 @@
 interface:
   display_name: "Modal Gaussians Pipeline"
-  short_description: "Run and validate the pipeline to a Viser-ready result"
-  default_prompt: "Use $modal-gaussians-pipeline to run my prepared experiment to validated Viser-ready artifacts with live logs, autonomously diagnosing, repairing, verifying, and resuming after failures within the agreed scope; provide the Viser launch command without launching it."
+  short_description: "Generate validated 3D modes without fitting coordinates"
+  default_prompt: "Use $modal-gaussians-pipeline to obtain validated 3D modes at my requested frequencies, fixing and resuming in-scope failures automatically; stop without fitting modal coordinates or launching Viser."

@@ -1,0 +1,20 @@
+{
+  "fragment": {
+    "strategy": "surface",
+    "min_host_nodes": 101,
+    "min_host_controls": 2,
+    "search_radius_fraction": 0.03,
+    "support_sigma": 2.0,
+    "max_support_gap": 0.008,
+    "patch_radius": 0.008,
+    "core_preference": 1.25,
+    "ambiguity_ratio": 1.25,
+    "smoothing_steps": 4,
+    "smoothing_strength": 0.25,
+    "preserve_legacy": true
+  },
+  "neural": {
+    "hidden_dim": 256,
+    "local_feature_dim": 16
+  }
+}

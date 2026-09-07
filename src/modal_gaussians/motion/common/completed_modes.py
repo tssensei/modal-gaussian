@@ -45,9 +45,17 @@ def load_completed_modes(path: str | Path) -> CompletedModesArtifact:
 
         derived = load_fragment_modes(root)
         return CompletedModesArtifact(path=derived.path, manifest=derived.manifest, arrays=derived.arrays)
-    if version == 8:
-        if manifest.get("completion_method") != "neural_complex_displacement_field":
-            raise ValueError("Completed-mode v8 method is unsupported")
+    if version in (13, 15):
+        from modal_gaussians.motion.neural.observation_refinement import load_refined_modes
+        refined = load_refined_modes(root)
+        return CompletedModesArtifact(refined.path, refined.manifest, refined.arrays)
+    if version in (8, 10, 11, 12, 14, 16):
+        method = {8: "neural_complex_displacement_field", 10: "neural_field_with_training_fragment_fill",
+                  11: "neural_field_with_surface_attachments", 12: "neural_field_with_pointwise_displacement_fill",
+                  14: "neural_field_with_guarded_neighbor_residuals",
+                  16: "neural_component_field_with_stable_donors"}[version]
+        if manifest.get("completion_method") != method:
+            raise ValueError("Completed-mode neural method is unsupported")
         from modal_gaussians.motion.neural.neural_modes import load_neural_completed_modes
 
         neural_artifact = load_neural_completed_modes(root)

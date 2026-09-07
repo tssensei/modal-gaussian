@@ -336,6 +336,8 @@ def build_fragment_modes(*, parent_dir: str | Path, output_dir: str | Path,
     config = config or FragmentPropagationConfig()
     config.validate()
     parent = nm.load_neural_completed_modes(parent_dir)
+    if parent.manifest["version"] != 8:
+        raise ValueError("Post-training fragment propagation requires v8; v10 already includes training-time fill")
     destination = Path(output_dir).expanduser().resolve()
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"Fragment output already exists: {destination}")

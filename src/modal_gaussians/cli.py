@@ -170,6 +170,20 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument(
         "--role", choices=("all", "sweep", "reference"), default="all"
     )
+    repartition = static_commands.add_parser(
+        "repartition", help="Reclassify trained Gaussians using visibility and per-frame masks"
+    )
+    repartition.add_argument("--scene", required=True, type=Path)
+    repartition.add_argument("--output", required=True, type=Path)
+    repartition.add_argument("--dataset-root", type=Path, help="Optional relocated source root; mask hashes must match")
+    repartition.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    repartition.add_argument("--mask-dilation-pixels", type=_non_negative_int, default=10,
+                             help="Dilate foreground masks by this radius in original-image pixels; no erosion")
+    repartition.add_argument("--min-visible-mass", type=_positive_float, default=0.5)
+    repartition.add_argument("--min-visible-groups", type=_positive_int, default=2)
+    repartition.add_argument("--class-fraction", type=_positive_float, default=0.8)
+    repartition.add_argument("--view-angle-degrees", type=_positive_float, default=10.0)
+    repartition.add_argument("--view-position-fraction", type=_positive_float, default=0.05)
     topology_parser = command_parsers.add_parser(
         "topology", help="Pixel-to-foreground-Gaussian observation topology"
     )
@@ -312,6 +326,23 @@ def build_parser() -> argparse.ArgumentParser:
     fit_neural = motion_commands.add_parser(
         "fit-neural", help="Fit full-foreground complex displacement fields",
     )
+    prepare_neural = motion_commands.add_parser("prepare-neural", help="Freeze reusable neural observations and geometry caches")
+    for name in ("from-result", "scene", "topology", "measurements", "graph", "alignment-from", "config"):
+        prepare_neural.add_argument(f"--{name}", type=Path)
+    prepare_neural.add_argument("--cache-dir", type=Path, default=Path("outputs/_cache"))
+    prepare_neural.add_argument("--output", type=Path, required=True)
+    iterate_neural = motion_commands.add_parser("iterate-neural", help="Produce 3D modes; optionally prepare a preview or fit coordinates")
+    iterate_neural.add_argument("--prepared", type=Path, required=True)
+    iterate_neural.add_argument("--config", type=Path)
+    iterate_neural.add_argument("--refine-observations", action="store_true",
+                                help="After v12 propagation, refine visible followers while keeping hosts fixed; reuse training")
+    iterate_neural.add_argument("--refinement-config", type=Path,
+                                help="Optional flat observation-refinement JSON; requires --refine-observations")
+    iterate_neural.add_argument("--frequency-hz", type=float, action="append",
+                                help="Train only this exact prepared frequency; repeat for a subset, preserving source order and normalization")
+    iterate_neural.add_argument("--output", type=Path, required=True)
+    iterate_neural.add_argument("--stage", choices=("modes", "preview", "full"), default="modes",
+                                help="Stop after final 3D modes by default; preview adds display data, full explicitly fits video coordinates")
     for name in ("scene", "topology", "measurements", "graph", "alignment-from", "work-dir", "output"):
         fit_neural.add_argument(f"--{name}", required=True, type=Path)
     for name, default in (
@@ -323,6 +354,8 @@ def build_parser() -> argparse.ArgumentParser:
         fit_neural.add_argument(f"--{name}", type=_positive_int, default=default)
     for name, default in (("mask-erosion-iterations", 1), ("seed", 1729)):
         fit_neural.add_argument(f"--{name}", type=_non_negative_int, default=default)
+    fit_neural.add_argument("--local-feature-dim", type=_non_negative_int, default=0,
+                            help="Learn this many features per control and frequency; 0 preserves the coordinate-only network")
     for name, default in (
         ("graph-max-distance", 0.008), ("unknown-max-distance", 0.004),
         ("unknown-edge-weight", 0.1), ("control-radius-fraction", 0.03),
@@ -337,6 +370,10 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         fit_neural.add_argument(f"--{name}", type=_non_negative_float, default=default)
     fit_neural.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    fit_neural.add_argument("--fragment-treatment", choices=("in-training", "post-training"), default="in-training",
+                            help="Default: host controls with fixed fragment fill before the loss")
+    fit_neural.add_argument("--fragment-config", type=Path,
+                            help="Fragment JSON: strategy=component_field selects v16, guarded v14, pointwise v12, surface v11; no strategy v10")
     fit_neural.add_argument("--graph-edge-filter", choices=("depth", "none"), default="depth",
                             help="Use depth/path filtering, or retain every spatial mutual-KNN candidate")
     fit_neural.add_argument(
@@ -572,7 +609,9 @@ def build_parser() -> argparse.ArgumentParser:
     viewer = command_parsers.add_parser(
         "viewer", help="Inspect one complete modal result in Viser"
     )
-    viewer.add_argument("--result", required=True, type=Path)
+    viewer_input = viewer.add_mutually_exclusive_group(required=True)
+    viewer_input.add_argument("--result", type=Path)
+    viewer_input.add_argument("--preview", type=Path)
     viewer.add_argument("--work-dir", required=True, type=Path)
     viewer.add_argument("--host", default="0.0.0.0")
     viewer.add_argument("--port", type=_positive_int, default=8080)
@@ -682,6 +721,24 @@ def _dispatch(
             print(f"static scene: {output.resolve()}")
             print(f"manifest: {(output / 'manifest.json').resolve()}")
             print(f"tensors: {(output / 'tensors.pt').resolve()}")
+            return 0
+        if args.command == "static" and args.static_command == "repartition":
+            from modal_gaussians.static_partition import PartitionConfig, repartition_static_scene
+
+            output = repartition_static_scene(
+                scene_dir=args.scene, output_dir=args.output, device=str(args.device),
+                dataset_root=args.dataset_root,
+                config=PartitionConfig(
+                    mask_dilation_pixels=int(args.mask_dilation_pixels),
+                    minimum_visible_mass=float(args.min_visible_mass),
+                    minimum_visible_groups=int(args.min_visible_groups),
+                    class_fraction=float(args.class_fraction),
+                    view_angle_degrees=float(args.view_angle_degrees),
+                    view_position_fraction=float(args.view_position_fraction),
+                ),
+            )
+            print(f"repartitioned static scene: {output.resolve()}")
+            print(f"classification summary: {(output / 'partition-summary.json').resolve()}")
             return 0
         if args.command == "static" and args.static_command == "render":
             from modal_gaussians.static_training import render_static_bundle
@@ -878,6 +935,22 @@ def _dispatch(
             print(f"identity: {artifact.manifest['completed_modes_identity']}")
             print(json.dumps(artifact.manifest["diagnostics"]))
             return 0
+        if args.command == "motion" and args.motion_command == "prepare-neural":
+            from modal_gaussians.motion.neural.prepared import prepare_neural
+            overrides = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
+            artifact = prepare_neural(from_result=args.from_result, scene_dir=args.scene, topology_dir=args.topology,
+                measurements_dir=args.measurements, graph_dir=args.graph, alignment_from=args.alignment_from,
+                cache_dir=args.cache_dir, output_dir=args.output, config_overrides=overrides)
+            print(f"prepared: {artifact.path}")
+            print(f"prepared_identity: {artifact.manifest['prepared_identity']}")
+            return 0
+        if args.command == "motion" and args.motion_command == "iterate-neural":
+            from modal_gaussians.motion.neural.iteration import iterate_neural
+            root = iterate_neural(prepared_dir=args.prepared, config_path=args.config,
+                                  output_dir=args.output, stage=args.stage, frequencies_hz=args.frequency_hz,
+                                  refine_observations=args.refine_observations, refinement_config_path=args.refinement_config)
+            print(f"iteration: {root}")
+            return 0
         if args.command == "motion" and args.motion_command == "fit-neural":
             from modal_gaussians.motion.neural.neural_modes import (
                 NeuralModesConfig,
@@ -887,18 +960,29 @@ def _dispatch(
             config_names = (
                 "graph_neighbors", "graph_max_distance", "graph_edge_filter", "unknown_max_distance",
                 "unknown_edge_weight", "control_radius_fraction", "max_controls",
-                "hidden_dim", "message_layers", "pixel_sample_stride", "alpha_minimum",
+                "hidden_dim", "message_layers", "local_feature_dim", "pixel_sample_stride", "alpha_minimum",
                 "mask_erosion_iterations", "energy_floor_fraction", "huber_delta",
                 "deformation_weight", "rotation_weight", "rotation_length_fraction",
                 "learning_rate", "max_iterations", "gradient_clip", "seed",
                 "convergence_patience", "relative_tolerance", "checkpoint_every", "device",
             )
+            training_fragments = None
+            if args.fragment_treatment == "in-training":
+                from modal_gaussians.motion.neural.fragment_propagation import FragmentPropagationConfig
+                from modal_gaussians.motion.neural.surface_attachments import SurfaceAttachmentConfig
+                fragment_values = json.loads(args.fragment_config.read_text(encoding="utf-8")) if args.fragment_config else {}
+                from modal_gaussians.motion.neural.training_fragments import config_class
+                cls = config_class(fragment_values) if args.fragment_config else SurfaceAttachmentConfig
+                training_fragments = cls(**fragment_values).to_dict()
+            elif args.fragment_config:
+                raise ValueError("--fragment-config requires --fragment-treatment in-training")
             artifact = build_neural_modes_artifact(
                 scene_dir=args.scene, topology_dir=args.topology,
                 measurements_dir=args.measurements, graph_dir=args.graph,
                 alignment_from=args.alignment_from, work_dir=args.work_dir,
                 output_dir=args.output, resume=bool(args.resume),
-                config=NeuralModesConfig(**{name: getattr(args, name) for name in config_names}),
+                config=NeuralModesConfig(**{name: getattr(args, name) for name in config_names},
+                                         training_fragment_config=training_fragments),
                 command=[parser.prog, *arguments],
             )
             counts = artifact.manifest["counts"]
@@ -1238,11 +1322,12 @@ def _dispatch(
             from modal_gaussians.vis.viewer import run_modal_viewer
 
             run_modal_viewer(
-                result_dir=args.result,
+                result_dir=args.preview or args.result,
                 work_dir=args.work_dir,
                 host=str(args.host),
                 port=int(args.port),
                 viewer_resolution=int(args.viewer_res),
+                preview=args.preview is not None,
             )
             return 0
         parser.error("unsupported command")

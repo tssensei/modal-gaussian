@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 from typing import Any, Callable
+import threading
 
 import cv2
 import numpy as np
@@ -24,6 +25,8 @@ from modal_gaussians.modes import Complex2DModesArtifact, load_complex_2d_modes
 from modal_gaussians.motion.common.mode_mapping import resolve_source_mode_slots
 from modal_gaussians.result import ModalResultArtifact
 from modal_gaussians.topology import load_observation_topology
+from modal_gaussians.iteration_cache import DEFAULT_CACHE, load_entry, put_entry
+from modal_gaussians.motion.neural.neural_modes import _arrays_identity
 
 
 PIXEL_CHUNK_SIZE = 4096
@@ -113,9 +116,13 @@ def _mean_image_plane_power(
 def _completed_dense_modes(completed: Any) -> Complex2DModesArtifact:
     """Bind display targets to the method's declared dense modal source."""
 
-    if completed.manifest.get("version") in (8, 9):
-        method = ("neural_fragment_motion_propagation" if completed.manifest["version"] == 9
-                  else "neural_complex_displacement_field")
+    if completed.manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16):
+        method = {8: "neural_complex_displacement_field",
+                  9: "neural_fragment_motion_propagation",
+                  10: "neural_field_with_training_fragment_fill", 11: "neural_field_with_surface_attachments",
+                  12: "neural_field_with_pointwise_displacement_fill", 13: "neural_pointwise_observation_refinement",
+                  14: "neural_field_with_guarded_neighbor_residuals", 15: "neural_guarded_observation_refinement",
+                  16: "neural_component_field_with_stable_donors"}[completed.manifest["version"]]
         if completed.manifest.get("completion_method") != method:
             raise ValueError("Unsupported neural spectrum source contract")
         source = completed.manifest.get("complex_2d_modes")
@@ -146,8 +153,13 @@ def _completed_dense_modes(completed: Any) -> Complex2DModesArtifact:
 class SpectrumComparisonController:
     """Compare bound dense flow spectra with rendered 3D modal projections."""
 
-    def __init__(self, result: ModalResultArtifact) -> None:
+    def __init__(self, result: ModalResultArtifact, *, prepared: Any = None) -> None:
         self.result = result
+        self.prepared = prepared
+        self.cache_dir = prepared.cache_dir if prepared is not None else DEFAULT_CACHE
+        self._ready_spectra: set[str] = set()
+        self._raw_magnitude: dict[str, np.ndarray] = {}
+        self.spectrum_error = ""
         self.frequencies_hz = np.asarray(
             [mode["frequency_hz"] for mode in result.manifest["modes"]],
             dtype=np.float64,
@@ -164,7 +176,8 @@ class SpectrumComparisonController:
         self.reconstructed_index = 0
         self.amplitude_normalization = "per mode"
 
-        flow_sources = result.coordinates.manifest.get("flow_artifacts")
+        flow_sources = ([r["path"] for r in prepared.manifest["flows"]] if prepared is not None
+                        else result.coordinates.manifest.get("flow_artifacts"))
         if not isinstance(flow_sources, list):
             raise ValueError("Modal coordinates do not bind flow artifacts")
         design_views = result.rendered_design.manifest["views"]
@@ -178,7 +191,7 @@ class SpectrumComparisonController:
         for index, (source, design_view, dense_view) in enumerate(
             zip(flow_sources, design_views, dense.manifest["views"])
         ):
-            flow = load_flow_analysis_artifact(source)
+            flow = prepared.flow(source) if prepared is not None else load_flow_analysis_artifact(source)
             identity = flow_artifact_identity(flow)
             if (
                 design_view["index"] != index
@@ -197,6 +210,11 @@ class SpectrumComparisonController:
         self, index: int, label: str, flow: FlowAnalysisArtifact
     ) -> SpectrumViewState:
         """Fit one complex display alpha per mode for one rendered view."""
+
+        if not hasattr(self, "prepared"):
+            self.prepared = None
+        if not hasattr(self, "_ready_spectra"):
+            self._ready_spectra = set()
 
         design = self.result.rendered_design
         offsets = design.samples["view_sample_offsets"]
@@ -226,7 +244,7 @@ class SpectrumComparisonController:
                 not math.isfinite(denominator)
                 or denominator <= np.finfo(np.float64).tiny
             ):
-                if self.result.completed_modes.manifest.get("version") in (8, 9):
+                if self.result.completed_modes.manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16):
                     if math.isfinite(denominator):
                         # Unresolved neural modes remain explicit zero fields.
                         continue
@@ -252,7 +270,16 @@ class SpectrumComparisonController:
         raw_frequencies = np.fft.rfftfreq(
             flow.arrays.flow.shape[0], d=1.0 / float(flow.manifest["fps_hz"])
         )
-        raw_power = _mean_image_plane_power(flow.arrays.spectrum, pixels)
+        if self.prepared is None:
+            raw_power = _mean_image_plane_power(flow.arrays.spectrum, pixels)
+            self._ready_spectra.add(label)
+        else:
+            stored = load_entry(self.cache_dir / "viewer_spectrum", self._spectrum_contract(flow, pixels))
+            raw_power = np.zeros(len(raw_frequencies), dtype=np.float32)
+            if stored is not None:
+                raw_power = stored["raw_power"]
+                self._raw_magnitude[label] = stored["raw_magnitude"]
+                self._ready_spectra.add(label)
         selected_min = float(np.min(self.frequencies_hz))
         selected_max = float(np.max(self.frequencies_hz))
         raw_step = float(raw_frequencies[1] - raw_frequencies[0])
@@ -266,7 +293,7 @@ class SpectrumComparisonController:
             label=label,
             flow=flow,
             pixels_xy=pixels,
-            reference_rgb=_read_reference_rgb(flow),
+            reference_rgb=(self.prepared.arrays[f"v{index}_rgb"] if self.prepared is not None else _read_reference_rgb(flow)),
             raw_frequencies_hz=raw_frequencies,
             raw_power=raw_power,
             reconstructed_power=reconstructed_power,
@@ -282,7 +309,41 @@ class SpectrumComparisonController:
             raise ValueError(f"Unknown Viewer spectrum view: {label!r}")
         self.view_id = label
         self.state = self._states[label]
+        if not self.full_spectrum_ready:
+            self.amplitude_normalization = "per mode"
         self._refresh_products()
+
+    @property
+    def full_spectrum_ready(self) -> bool:
+        return self.view_id in self._ready_spectra
+
+    def _spectrum_contract(self, flow, pixels):
+        return {"implementation": "viewer_raw_spectrum_v1", "flow_identity": flow_artifact_identity(flow),
+                "pixels_identity": _arrays_identity({"pixels": pixels}), "percentile": PREVIEW_PERCENTILE}
+
+    def load_full_spectrum(self, label: str) -> None:
+        """Explicit expensive operation; GUI invokes it on a background worker."""
+        state = self._states[label]
+        contract = self._spectrum_contract(state.flow, state.pixels_xy)
+        cached = load_entry(self.cache_dir / "viewer_spectrum", contract)
+        if cached is None:
+            flow = load_flow_analysis_artifact(state.flow.path, cache_dir=self.cache_dir)
+            if flow_artifact_identity(flow) != flow_artifact_identity(state.flow):
+                raise ValueError("Raw spectrum source changed since preparation")
+            raw_power = _mean_image_plane_power(flow.arrays.spectrum, state.pixels_xy)
+            magnitude = np.zeros(2, dtype=np.float64)
+            for lower in range(0, flow.arrays.spectrum.shape[0], 8):
+                block = read_pixels(flow.arrays.spectrum, slice(lower, lower + 8), state.pixels_xy)
+                for component in range(2):
+                    magnitude[component] = max(magnitude[component], float(np.percentile(np.abs(block[..., component]), PREVIEW_PERCENTILE)))
+            cached = put_entry(self.cache_dir / "viewer_spectrum", contract,
+                               {"raw_power": raw_power, "raw_magnitude": magnitude})
+        self._raw_magnitude[label] = cached["raw_magnitude"]
+        self._ready_spectra.add(label)
+        self._states[label] = replace(state, raw_power=cached["raw_power"])
+        if self.view_id == label:
+            self.state = self._states[label]
+            self._refresh_products()
 
     def select_mode(self, index: int) -> None:
         """Select one greedy mode slot without changing mode order."""
@@ -306,6 +367,8 @@ class SpectrumComparisonController:
 
         if normalization not in ("per mode", "entire spectrum"):
             raise ValueError(f"Unknown amplitude normalization: {normalization!r}")
+        if normalization == "entire spectrum" and not self.full_spectrum_ready:
+            raise ValueError("Load the full spectrum before selecting entire-spectrum normalization")
         self.amplitude_normalization = normalization
         self._refresh_products()
 
@@ -339,13 +402,14 @@ class SpectrumComparisonController:
         if cached is not None:
             return cached
         pixels = self.state.pixels_xy
-        spectrum = self.state.flow.arrays.spectrum
         maximum = 0.0
-        for lower in range(0, spectrum.shape[0], 8):
-            block = read_pixels(
-                spectrum, slice(lower, lower + 8), pixels, self.component_index
-            )
-            maximum = max(maximum, float(np.percentile(np.abs(block), PREVIEW_PERCENTILE)))
+        if self.view_id in self._raw_magnitude:
+            maximum = float(self._raw_magnitude[self.view_id][self.component_index])
+        else:
+            spectrum = self.state.flow.arrays.spectrum
+            for lower in range(0, spectrum.shape[0], 8):
+                block = read_pixels(spectrum, slice(lower, lower + 8), pixels, self.component_index)
+                maximum = max(maximum, float(np.percentile(np.abs(block), PREVIEW_PERCENTILE)))
         for mode_index in range(len(self.frequencies_hz)):
             previous = self.reconstructed_index
             self.reconstructed_index = mode_index
@@ -415,6 +479,8 @@ class SpectrumComparisonController:
             f"**component:** {component}  \n"
             f"**Amplitude normalization:** `{self.amplitude_normalization}`"
             + ("" if identifiable else "  \n**Reconstruction unavailable:** zero projection energy.")
+            + ("" if self.full_spectrum_ready else "  \n**Full spectrum not loaded.** Selected-frequency modal images are available.")
+            + ("  \n" + self.spectrum_error if self.spectrum_error else "")
         )
 
     @property
@@ -513,7 +579,7 @@ class ModalSpectrumPanel:
         )
         self.normalization = server.gui.add_dropdown(
             "Amplitude normalization",
-            options=("per mode", "entire spectrum"),
+            options=("per mode", "entire spectrum") if controller.full_spectrum_ready else ("per mode",),
             initial_value=controller.amplitude_normalization,
         )
         self.mode = server.gui.add_slider(
@@ -531,6 +597,26 @@ class ModalSpectrumPanel:
         solo = server.gui.add_button("Solo selected mode")
         enable_all = server.gui.add_button("Enable all modes")
         self.status = server.gui.add_markdown(controller.status)
+        self.load_spectrum = server.gui.add_button("Load full spectrum", visible=not controller.full_spectrum_ready)
+
+        @self.load_spectrum.on_click
+        def _load(_) -> None:
+            label = controller.view_id
+            self.load_spectrum.disabled = True
+            controller.spectrum_error = "Loading full spectrum…"
+            controller._refresh_products()
+            self.status.content = controller.status
+            def worker():
+                try:
+                    controller.load_full_spectrum(label)
+                    controller.spectrum_error = ""
+                except Exception as error:
+                    controller.spectrum_error = f"Spectrum loading failed: {error}"
+                finally:
+                    self.load_spectrum.disabled = False
+                    controller._refresh_products()
+                    self._refresh()
+            threading.Thread(target=worker, daemon=True).start()
         maximum = self._shared_power_max()
         self.raw_plot = server.gui.add_uplot(
             data=_spectrum_plot_data(
@@ -558,6 +644,7 @@ class ModalSpectrumPanel:
             legend=viser.uplot.Legend(show=True),
             height=260,
         )
+        self.raw_plot.visible = controller.full_spectrum_ready
         self.raw_image = server.gui.add_image(
             controller.raw_modal_image,
             label="Original modal image",
@@ -647,6 +734,7 @@ class ModalSpectrumPanel:
         maximum = self._shared_power_max()
         self._updating = True
         try:
+            self.normalization.options = (("per mode", "entire spectrum") if self.controller.full_spectrum_ready else ("per mode",))
             self.mode.value = self._display_indices[index]
             self.frequency.value = frequency
             self.view.value = self.controller.view_id
@@ -655,6 +743,8 @@ class ModalSpectrumPanel:
         finally:
             self._updating = False
         self.status.content = self.controller.status
+        self.load_spectrum.visible = not self.controller.full_spectrum_ready
+        self.raw_plot.visible = self.controller.full_spectrum_ready
         self.raw_plot.data = _spectrum_plot_data(
             self.controller.raw_frequencies_hz,
             self.controller.raw_power,

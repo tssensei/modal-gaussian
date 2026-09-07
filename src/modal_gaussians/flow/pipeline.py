@@ -50,7 +50,8 @@ class FlowAnalysisConfig:
         if self.stabilize:
             stabilization = {
                 "method": "reference-background-lk-ransac-homography",
-                "implementation_version": 1,
+                "implementation_version": 2,
+                "reference_anchor": "inverse-smoothed-reference-left-composition",
                 "opencv_version": cv2.__version__,
                 "settings": asdict(self.stabilization_settings),
             }

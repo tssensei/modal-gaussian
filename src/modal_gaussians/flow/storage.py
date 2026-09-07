@@ -2,17 +2,39 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import os
 from pathlib import Path
 from typing import Any, Iterator
 
 import numpy as np
 import zarr
+from modal_gaussians.iteration_cache import read_bytes
 from zarr.codecs import ZstdCodec
+from zarr.storage import LocalStore
 
 
 DenseArray = np.ndarray | zarr.Array
 BLOCK_BYTES = 32 * 1024 * 1024
+
+
+class _WindowsRetryLocalStore(LocalStore):
+    """Retry transient Windows locks while retaining Zarr's atomic writes.
+
+    A reader or scanner can briefly deny replacement of an existing shard.
+    Retry the same buffer; persistent permissions and unrelated errors still
+    fail. No data, chunk layout, compression or numerical settings change.
+    """
+
+    async def _set(self, key, value, exclusive=False):
+        for attempt in range(7):
+            try:
+                return await super()._set(key, value, exclusive=exclusive)
+            except OSError as error:
+                if os.name != "nt" or getattr(error, "winerror", None) not in (5, 32, 33) or attempt == 6:
+                    raise
+                await asyncio.sleep(min(0.05 * 2**attempt, 0.8))
 
 
 def create_array(path: Path, shape: tuple[int, ...], dtype: Any) -> zarr.Array:
@@ -21,7 +43,7 @@ def create_array(path: Path, shape: tuple[int, ...], dtype: Any) -> zarr.Array:
     chunks = tuple(min(size, limit) for size, limit in zip(shape, (8, 32, 128, 2)))
     shards = tuple(chunk * factor for chunk, factor in zip(chunks, (4, 4, 1, 1)))
     return zarr.create_array(
-        str(path),
+        _WindowsRetryLocalStore(path),
         shape=shape,
         dtype=dtype,
         chunks=chunks,
@@ -78,7 +100,9 @@ def validate_finite(array: DenseArray, label: str) -> None:
     """Reject non-finite values without a whole-array boolean allocation."""
 
     for selection in array_blocks(array):
-        if not np.isfinite(array[selection]).all():
+        values = array[selection]
+        read_bytes(values.nbytes)
+        if not np.isfinite(values).all():
             raise ValueError(f"{label} contains NaN or Inf")
 
 
@@ -112,6 +136,7 @@ def storage_sha256(path: Path) -> str:
             digest.update(entry.stat().st_size.to_bytes(8, "little"))
         with entry.open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
+                read_bytes(len(block))
                 digest.update(block)
     return digest.hexdigest()
 

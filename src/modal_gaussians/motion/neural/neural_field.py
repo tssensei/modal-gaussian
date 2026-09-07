@@ -20,6 +20,7 @@ from torch import Tensor, nn
 class NeuralFieldConfig:
     hidden_dim: int = 64
     message_layers: int = 3
+    local_feature_dim: int = 0
     learning_rate: float = 0.001
     max_iterations: int = 2000
     gradient_clip: float = 1.0
@@ -44,6 +45,8 @@ class NeuralFieldConfig:
                 raise ValueError(f"Neural field {name} must be a positive integer")
         if isinstance(self.seed, bool) or not isinstance(self.seed, int) or self.seed < 0:
             raise ValueError("Neural field seed must be a non-negative integer")
+        if type(self.local_feature_dim) is not int or self.local_feature_dim < 0:
+            raise ValueError("Neural field local_feature_dim must be a non-negative integer")
         for name in ("learning_rate", "gradient_clip", "huber_delta",
                      "rotation_length_fraction"):
             value = float(getattr(self, name))
@@ -55,7 +58,11 @@ class NeuralFieldConfig:
                 raise ValueError(f"Neural field {name} must be finite and non-negative")
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        # Keep coordinate-only checkpoint contracts byte-compatible.
+        if self.local_feature_dim == 0:
+            result.pop("local_feature_dim")
+        return result
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> "NeuralFieldConfig":
@@ -84,6 +91,12 @@ class NeuralFieldGeometry:
     control_edge_lengths: Tensor
     gaussian_supported: Tensor
     control_supported: Tensor
+    transfer_rows: Tensor | None = None
+    transfer_sources: Tensor | None = None
+    transfer_weights: Tensor | None = None
+    residual_projector: Tensor | None = None
+    residual_mask: Tensor | None = None
+    residual_prior_weight: float = 0.0
 
     @classmethod
     def from_arrays(
@@ -119,8 +132,15 @@ class NeuralFieldGeometry:
             torch.arange(count, device=device), indptr[1:] - indptr[:-1],
         )
         sums = weights.new_zeros(count).index_add_(0, rows, weights)
-        if not torch.allclose(sums, torch.ones_like(sums), atol=2e-6, rtol=2e-6):
+        nonempty = indptr[1:] > indptr[:-1]
+        expected_sums = nonempty.to(dtype) if arrays.get("allow_empty_interpolation", False) else torch.ones_like(sums)
+        if not torch.allclose(sums, expected_sums, atol=2e-6, rtol=2e-6):
             raise ValueError("Interpolation weights must sum to one in every Gaussian row")
+        base_support = "interpolation_supported" if "interpolation_supported" in arrays else "gaussian_supported"
+        if arrays.get("allow_empty_interpolation", False) and bool((
+            tensor(base_support, torch.bool) & ~nonempty
+        ).any()):
+            raise ValueError("Supported Gaussians cannot have empty control interpolation")
 
         def edge_arrays(prefix: str, positions: Tensor) -> tuple[Tensor, Tensor]:
             edge = tensor(prefix + "_edges", torch.long)
@@ -165,10 +185,39 @@ class NeuralFieldGeometry:
                 raise ValueError(f"{name} must have shape [{size}]")
             return value
 
+        transfer_rows = transfer_sources = transfer_weights = None
+        if "transfer_rows" in arrays:
+            transfer_rows, transfer_sources = tensor("transfer_rows", torch.long), tensor("transfer_sources", torch.long)
+            transfer_weights = tensor("transfer_weights")
+            if (transfer_rows.ndim != 1 or transfer_sources.shape != transfer_rows.shape
+                    or transfer_weights.shape != transfer_rows.shape
+                    or bool(((transfer_rows < 0) | (transfer_rows >= count)).any())
+                    or bool(((transfer_sources < 0) | (transfer_sources >= count)).any())
+                    or not bool(torch.isfinite(transfer_weights).all()) or bool((transfer_weights <= 0).any())):
+                raise ValueError("Invalid pointwise transfer domains/weights")
+            totals = points.new_zeros(count).index_add_(0, transfer_rows, transfer_weights)
+            targets = torch.unique(transfer_rows)
+            if (not torch.allclose(totals[targets], torch.ones_like(totals[targets]), atol=2e-6, rtol=2e-6)
+                    or bool(torch.isin(transfer_sources, targets).any()) or not bool(nonempty[transfer_sources].all())):
+                raise ValueError("Pointwise transfer must be normalized and reference independent interpolated sources")
+        residual_projector = residual_mask = None
+        residual_prior_weight = 0.0
+        if "residual_projector" in arrays:
+            residual_projector = tensor("residual_projector")
+            residual_mask = supported("residual_mask", count)
+            residual_prior_weight = float(arrays["residual_prior_weight"])
+            if (residual_projector.shape != (count, 3, 3) or not bool(torch.isfinite(residual_projector).all())
+                    or not math.isfinite(residual_prior_weight) or residual_prior_weight <= 0
+                    or bool((residual_projector[~residual_mask] != 0).any())
+                    or not torch.allclose(residual_projector, residual_projector.transpose(-1, -2), atol=2e-6)
+                    or not torch.allclose(residual_projector @ residual_projector, residual_projector, atol=2e-6)
+                    or transfer_rows is None or not bool(torch.isin(torch.where(residual_mask)[0], transfer_rows).all())):
+                raise ValueError("Invalid neighbor residual projector/mask/prior")
         return cls(points, controls, indptr, indices, weights, rows,
                    gaussian_edges, gaussian_weights, control_edges, control_weights, control_lengths,
                    supported("gaussian_supported", count),
-                   supported("control_supported", control_count))
+                   supported("control_supported", control_count), transfer_rows, transfer_sources, transfer_weights,
+                   residual_projector, residual_mask, residual_prior_weight)
 
 
 def _positive_scale(value: float, name: str) -> float:
@@ -195,28 +244,46 @@ def weighted_neighbor_mean(features: Tensor, edges: Tensor, weights: Tensor) -> 
 class PerFrequencyModalGNN(nn.Module):
     """One frequency's residual GNN; no parameters are shared across frequencies."""
 
-    def __init__(self, config: NeuralFieldConfig | None = None) -> None:
+    def __init__(self, config: NeuralFieldConfig | None = None, *, control_count: int | None = None) -> None:
         super().__init__()
         self.config = config or NeuralFieldConfig()
         self.config.validate()
         width = self.config.hidden_dim
-        self.encoder = nn.Sequential(nn.Linear(3, width), nn.SiLU())
+        feature_dim = self.config.local_feature_dim
+        if feature_dim:
+            if type(control_count) is not int or control_count <= 0:
+                raise ValueError("Local control features require a positive control_count")
+            # Rows follow the immutable saved control order (host-local for v10/v11).
+            # The caller seeds each frequency independently before construction.
+            self.local_features = nn.Parameter(torch.empty(control_count, feature_dim))
+            nn.init.normal_(self.local_features, mean=0.0, std=0.01)
+        else:
+            self.register_parameter("local_features", None)
+        self.encoder = nn.Sequential(nn.Linear(3 + feature_dim, width), nn.SiLU())
         self.layers = nn.ModuleList([
             nn.Sequential(nn.Linear(2 * width, width), nn.SiLU(), nn.Linear(width, width))
             for _ in range(self.config.message_layers)
         ])
-        self.head = nn.Linear(width + 3, 12)
+        self.head = nn.Linear(width + 3 + feature_dim, 12)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
     def forward(self, geometry: NeuralFieldGeometry, length_scale: float) -> tuple[Tensor, Tensor]:
         length = _positive_scale(length_scale, "length_scale")
         coordinates = (geometry.control_positions - geometry.control_positions.mean(0)) / length
-        hidden = self.encoder(coordinates)
+        inputs = coordinates
+        if self.local_features is not None:
+            if len(self.local_features) != len(coordinates):
+                raise ValueError("Local features differ from the saved control count")
+            # Unsupported controls remain zero and cannot inject a free local code.
+            features = self.local_features * geometry.control_supported[:, None]
+            inputs = torch.cat((coordinates, features), dim=-1)
+        hidden = self.encoder(inputs)
         for layer in self.layers:
             message = weighted_neighbor_mean(hidden, geometry.control_edges, geometry.control_edge_weights)
             hidden = hidden + layer(torch.cat((hidden, message), dim=-1))
-        values = self.head(torch.cat((hidden, coordinates), dim=-1))
+        # Keep a direct local-feature route, alongside graph-aggregated features.
+        values = self.head(torch.cat((hidden, inputs), dim=-1))
         values = values * geometry.control_supported[:, None]
         displacement = torch.complex(values[:, :3], values[:, 3:6])
         rotation = torch.complex(values[:, 6:9], values[:, 9:12])
@@ -229,6 +296,7 @@ class ComposedField:
     rotation: Tensor
     control_displacement: Tensor
     control_rotation: Tensor
+    residual_field: Tensor | None = None
 
 
 def compose_field(geometry: NeuralFieldGeometry, displacement: Tensor, rotation: Tensor) -> ComposedField:
@@ -250,9 +318,23 @@ def compose_field(geometry: NeuralFieldGeometry, displacement: Tensor, rotation:
     blended_rotation = rotation.new_zeros(geometry.gaussian_positions.shape).index_add_(
         0, rows, weights[:, None] * rotation[indices],
     )
+    residual = residual_rotation = None
+    if geometry.residual_projector is not None:
+        residual = torch.einsum("gij,gj->gi", geometry.residual_projector.to(field.dtype), field)
+        residual_rotation = blended_rotation * geometry.residual_mask[:, None]
+    if geometry.transfer_rows is not None:
+        # Copy final source displacement, without rotation extrapolation to the target.
+        target = torch.unique(geometry.transfer_rows)
+        def transfer(values):
+            propagated = values.new_zeros(values.shape).index_add_(0, geometry.transfer_rows,
+                geometry.transfer_weights[:, None] * values[geometry.transfer_sources])
+            return values.index_copy(0, target, propagated[target])
+        field, blended_rotation = transfer(field), transfer(blended_rotation)
+    if residual is not None:
+        field, blended_rotation = field + residual, blended_rotation + residual_rotation
     return ComposedField(field * geometry.gaussian_supported[:, None],
                          blended_rotation * geometry.gaussian_supported[:, None],
-                         displacement, rotation)
+                         displacement, rotation, residual)
 
 
 def model_field(model: PerFrequencyModalGNN, geometry: NeuralFieldGeometry, *,
@@ -425,7 +507,7 @@ def evaluate_model(model_state: Mapping[str, Any], geometry: NeuralFieldGeometry
     _validate_finite_payload(model_state, "Neural model state")
     # Initializing a throwaway evaluation model must not change training RNG.
     with torch.random.fork_rng(devices=[]):
-        model = PerFrequencyModalGNN(settings).to(geometry.gaussian_positions)
+        model = PerFrequencyModalGNN(settings, control_count=len(geometry.control_positions)).to(geometry.gaussian_positions)
     model.load_state_dict(model_state)
     model.eval()
     result = model_field(model, geometry, length_scale=length_scale, amplitude_scale=amplitude_scale)
@@ -477,7 +559,7 @@ def train_single_frequency(
               for index, observation in enumerate(observations)]
 
     torch.manual_seed(settings.seed)
-    model = PerFrequencyModalGNN(settings).to(points)
+    model = PerFrequencyModalGNN(settings, control_count=len(geometry.control_positions)).to(points)
     optimizer = torch.optim.Adam(model.parameters(), lr=settings.learning_rate)
     step, best_step, stale_steps = 0, 0, 0
     best_loss = math.inf
@@ -539,14 +621,25 @@ def train_single_frequency(
                 rotation_length_fraction=settings.rotation_length_fraction,
             )
             regularizer = settings.deformation_weight * edge + settings.rotation_weight * rotation
+            prior_value = 0.0
+            if field.residual_field is not None:
+                residual = field.residual_field[geometry.residual_mask] / amplitude
+                prior = (residual.abs().square().sum(dim=-1).mean() if len(residual)
+                         else field.residual_field.real.sum() * 0.0)
+                regularizer = regularizer + geometry.residual_prior_weight * prior
+                prior_value = float(prior.detach())
             if backward:
                 regularizer.backward()
             edge_value, rotation_value = float(edge.detach()), float(rotation.detach())
-            total = data_value + settings.deformation_weight * edge_value + settings.rotation_weight * rotation_value
+            total = (data_value + settings.deformation_weight * edge_value + settings.rotation_weight * rotation_value
+                     + geometry.residual_prior_weight * prior_value)
             if not math.isfinite(total):
                 raise FloatingPointError("Non-finite neural field objective")
-            return {"loss": total, "data_loss": data_value, "edge_loss": edge_value,
-                    "rotation_loss": rotation_value}
+            result = {"loss": total, "data_loss": data_value, "edge_loss": edge_value,
+                      "rotation_loss": rotation_value}
+            if field.residual_field is not None:
+                result["neighbor_prior_loss"] = prior_value
+            return result
 
     def snapshot(losses: Mapping[str, float], status: str) -> dict[str, Any]:
         return _cpu_snapshot({

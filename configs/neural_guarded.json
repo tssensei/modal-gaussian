@@ -1,0 +1,15 @@
+{
+  "neural": {"hidden_dim": 256, "local_feature_dim": 16},
+  "fragment": {
+    "strategy": "guarded",
+    "min_residual_nodes": 10,
+    "min_source_nodes": 101,
+    "min_source_controls": 2,
+    "neighbors": 4,
+    "min_observation_mass": 0.05,
+    "min_observed_points": 3,
+    "min_residual_observed_fraction": 0.2,
+    "observable_rtol": 0.1,
+    "residual_prior_weight": 1.0
+  }
+}

@@ -1,12 +1,12 @@
 # Pipeline commands
 
-These commands follow `src/modal_gaussians/cli.py`. Check current `--help` before a run; do not guess new flags. Run them separately and apply the stage gates in [validation-recovery.md](validation-recovery.md). This document is not a script to execute wholesale.
+These commands follow `src/modal_gaussians/cli.py`. Reuse a known working invocation; consult `--help` only for uncertain or changed flags. Run them separately and apply the stage gates in [validation-recovery.md](validation-recovery.md). This document is not a script to execute wholesale.
 
 If a program fails while executing an authorized experiment, follow the [autonomous repair and recovery rules](../SKILL.md#autonomous-repair-and-recovery): preserve evidence, diagnose and repair, verify the fix, then retry/resume and continue. The recovery commands below are part of the run authorization; do not wait for new instructions after each error. Preserve the run contract and validate prerequisites before consuming their outputs.
 
 ## Bind inputs once
 
-Copy the skill's JSON template to a run-owned `run-spec.json`, resolve its required nulls, and add/remove view records to match the dataset. The two template views are illustrative, not a mandatory view count. For the intended multi-view rigid mainline, validate that sufficient independent camera observations actually exist.
+Copy the skill's JSON template to a run-owned `run-spec.json`, resolve its required nulls, and add/remove view records to match the dataset. The two template views are illustrative, not a mandatory view count. For fixed complex view alignment, validate the actual independent camera observations. The default motion representation is the accepted neural field plus fragment propagation.
 
 The examples below are PowerShell. All input/output paths must be absolute on the execution host. `reference_frame` is a PNG stem without an extension. Validate the directories using the repository sequence loader before assuming the derived `.png` paths exist.
 
@@ -43,7 +43,7 @@ Get-Content -LiteralPath "$RunRoot/logs/static_train_attempt01.log" -Tail 20 -Wa
 
 Ctrl+C ends only this log follower. No preview images, server, or Viser launch is needed for numeric monitoring.
 
-## 0. Environment and input preflight
+## 0. Environment and input preflight (new environment or actual failure only)
 
 ```powershell
 & $MgPython -c "import sys, modal_gaussians; print(sys.executable); print(modal_gaussians.__file__)"
@@ -93,15 +93,12 @@ Output: `static_scene/{manifest.json,tensors.pt,training_summary.json}`. Work st
 
 Resume interrupted training by appending `--resume` to this exact command only after checking unchanged input/config and that the final bundle does not already exist. If export succeeded but QA failed, diagnose and fix QA, validate the existing bundle, and rerender QA rather than retraining merely because the original command failed after export.
 
-## 4. Inspect static QA; render only if needed
+## 4. Static QA is user-evaluated
 
-Review the existing `work/static/qa/metrics.json` and images first. After repairing a QA failure, use a new directory for missing/failed QA or an in-scope fresh comparison:
-
-```powershell
-& $MgPython -m modal_gaussians.cli static render --scene "$RunRoot/static_scene" --output "$RunRoot/work/static_qa_retry01" --role all
-```
-
-Output: all/FG/BG RGB, FG alpha and expected depth, GT/render pairs, and per-view PSNR/SSIM. This is a recovery/optional command, not an obligatory duplicate render after successful training.
+Do not inspect, rerender or produce additional QA images during ordinary runs.
+Use successful static export and its built-in checks, then continue. If the user
+asks for visual diagnosis or a rendering operation actually fails, address that
+specific request/failure without retraining valid static weights unnecessarily.
 
 ## 5. Pixel-to-Gaussian observation topology
 
@@ -151,57 +148,54 @@ Output: `manifest.json`, `graph.npz`, an unapproved candidate rigid-component gr
 
 Output: `manifest.json`, `rigid_modes.npz`. Work directory supports identity-checked per-mode recovery by repeating the same command; there is no `--resume` flag here. Preserve bounded complex view synchronization and trust/observability checks.
 
-## 11. Motion fill
+## 11. Prepare once, then produce the requested 3D modes
+
+Stop after final modes by default. Ordinary run authorization does not authorize fitting per-frame modal coordinates or evaluating a reconstructed video. Resolve the accepted neural/fragment configuration instead of inheriting the obsolete rigid-fill recipe below.
+
+If a validated neural baseline result exists, import its fixed inputs and resolved parameters once:
 
 ```powershell
-& $MgPython -m modal_gaussians.cli motion fill --scene "$RunRoot/static_scene" --topology "$RunRoot/topology" --measurements "$RunRoot/measurements" --graph "$RunRoot/observed_graph" --rigid "$RunRoot/rigid_modes" --work-dir "$RunRoot/work/motion_fill" --neighbors 8 --max-distance 0.008 --max-anchor-hops 8 --observable-ratio 0.01 --ray-direction-fraction 0.8 --max-finite-drift 2.0 --output "$RunRoot/completed_modes"
+& $MgPython -m modal_gaussians.cli motion prepare-neural --from-result $Spec.motion.baseline_result --cache-dir $Spec.motion.cache_dir --output "$RunRoot/prepared"
 ```
 
-Output: `manifest.json`, `completed_modes.npz`, including full-FG `phi` `[K,G_fg,3] complex64`, fill graph and support classes. Same-command per-mode recovery; no `--resume` flag. Unresolved motion remains zero and must be reported separately from solved motion.
-
-## 12. Rendered modal design
+For new data with the upstream artifacts from stages 1–10, prepare explicitly. `--config` here is a flat JSON object of resolved neural settings:
 
 ```powershell
-& $MgPython -m modal_gaussians.cli coordinates render-design --scene "$RunRoot/static_scene" --modes "$RunRoot/completed_modes" @ViewArgs --pixel-stride 2 --alpha-min 0.05 --mask-erode-iters 1 --modes-per-batch 8 --output "$RunRoot/rendered_design"
+& $MgPython -m modal_gaussians.cli motion prepare-neural --scene "$RunRoot/static_scene" --topology "$RunRoot/topology" --measurements "$RunRoot/measurements" --graph "$RunRoot/observed_graph" --alignment-from "$RunRoot/rigid_modes" --config $Spec.motion.prepare_config --cache-dir $Spec.motion.cache_dir --output "$RunRoot/prepared"
 ```
 
-Output: `manifest.json`, `design.npy` `[P,2,2K] float32`, `samples.npz`. Columns are built through actual foreground feature rasterization, not a substitute topology-weight approximation. Preserve the real/imaginary sign convention.
-
-## 13. Direct modal coordinates
+Use the chosen path as `$Prepared`. Reuse an existing prepared snapshot without rebuilding matching inputs. The optional iteration JSON uses `neural`, `fragment`, and `design` sections; omitted values inherit the snapshot. Pass `--config` only when a real override file is provided.
 
 ```powershell
-& $MgPython -m modal_gaussians.cli coordinates solve-direct --design "$RunRoot/rendered_design" @ViewArgs --ridge-relative 0.0001 --frame-chunk-size 64 --output "$RunRoot/direct_coordinates"
+$Prepared = "$RunRoot/prepared"
+$IterationArgs = @()
+if ($Spec.motion.iteration_config) { $IterationArgs = @('--config', [string]$Spec.motion.iteration_config) }
+& $MgPython -m modal_gaussians.cli motion iterate-neural --prepared $Prepared @IterationArgs --output "$RunRoot/experiment" --stage modes
 ```
 
-Output: manifest, `coordinates.npy` `[sum(T_view),K] complex64`, `diagnostics.npz`. Fit each view's time series independently and retain its frame offsets/FPS. Store mean-zero coordinates; flow reconstruction is reference-relative.
+`modes` is the CLI default. It trains/reuses the raw neural field, applies the accepted fragment propagation, validates the final `neural_completed_modes` and records `modes_ready`. This is the successful end of the ordinary run. It does not build a preview or fit coordinates. Preserve shared cache/prepared dependencies.
 
-## 14. Physics coordinate post-fit
+## 12. Optional manual preview, only when requested
+
+Reuse exactly the same experiment and settings:
 
 ```powershell
-& $MgPython -m modal_gaussians.cli coordinates physics-fit --input "$RunRoot/direct_coordinates" --damping-ratio 0.05 --forcing-weight 0.1 --forcing-difference-weight 0 --assigned-band-half-width-hz 0.1 --frame-chunk-size 64 --output "$RunRoot/physics_coordinates"
+& $MgPython -m modal_gaussians.cli motion iterate-neural --prepared $Prepared @IterationArgs --output "$RunRoot/experiment" --stage preview
 ```
 
-Output: manifest, `coordinates.npy`, `diagnostics.npz`. Compare direct and physics flow fits and oscillator residuals. Keep both artifacts. A regularized result need not improve raw flow R2; report the measured tradeoff without changing weights automatically.
+This adds rendered-design, an independent preview artifact with built-in source binding checks; it does not initialize Viewer data or inspect visual results. Rendering the modal image is not fitting modal coordinates. Full flow/spectrum loading and entire-spectrum statistics are not required for initialization. Do not append `--stage full` to validate this preview.
 
-## 15. Result materialization
+Hand off the following fully resolved command **without executing it**:
 
 ```powershell
-& $MgPython -m modal_gaussians.cli result materialize --scene "$RunRoot/static_scene" --modes "$RunRoot/completed_modes" --coordinates "$RunRoot/physics_coordinates" --output "$RunRoot/modal_result"
+& $MgPython -m modal_gaussians.cli viewer --preview "$RunRoot/experiment/preview" --work-dir "$RunRoot/work/viewer" --host $Spec.viewer.host --port $Spec.viewer.port --viewer-res $Spec.viewer.resolution
 ```
 
-Output: linked `manifest.json`, not another copy of all tensors. It validates identities and references existing artifacts by absolute paths. Do not move/delete ancestors after materialization. For a user-requested direct-coordinate comparison, materialize another result pointing to `direct_coordinates`; do not overwrite the physics result.
+Use `127.0.0.1` by default. Give the expected local URL, labelled not running. Controls use manual gain/phase/oscillation; no stored video trajectory or coordinate-dependent flow score is implied.
 
-## 16. Headless readiness check and handoff
+## Historical compatibility, not part of the default run
 
-Run the final headless data-readiness check in [validation-recovery.md](validation-recovery.md). It creates no Viser server and requires no browser. Stop execution after it passes.
-
-Give the user this fully resolved command **without executing it**:
-
-```powershell
-& $MgPython -m modal_gaussians.cli viewer --result "$RunRoot/modal_result" --work-dir "$RunRoot/work/viewer" --host $Spec.viewer.host --port $Spec.viewer.port --viewer-res $Spec.viewer.resolution
-```
-
-Use `127.0.0.1` by default, not the CLI's broad `0.0.0.0` default. Give the expected URL `http://127.0.0.1:PORT` but label it as not yet running. Do not start a background process or try to open the page. This workflow validates data readiness, not browser behavior.
+Existing `motion fill`, `coordinates solve-direct`, `coordinates physics-fit`, `result materialize`, `iterate-neural --stage full` and `viewer --result` APIs remain available for old results or a later explicit request for those operations. Do not run them as automatic follow-ups to mode generation, preview checks, or generic “complete pipeline” instructions. Inspect current CLI help and the old artifact's own contract when such a request actually occurs; preserve the existing result and its scientific conventions.
 
 ## Linux / cluster translation
 

@@ -1,0 +1,4 @@
+{
+  "neural": {"hidden_dim": 256, "local_feature_dim": 16},
+  "fragment": {"strategy": "pointwise", "min_host_nodes": 6, "neighbors": 4}
+}

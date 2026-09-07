@@ -1,8 +1,70 @@
-# Current Corn motion baseline
+# Current neural motion baseline
 
-On 2026-09-05, the user reviewed `corn_neural_fragment_propagation_001`, reported that its visual result was very good, and explicitly selected it as the new baseline. Future motion experiments should use this neural-field plus fragment-propagation result as their primary comparison reference.
+On 2026-09-07, the user selected **only increasing the local feature dimension to
+32**, with width **256** and **three** message-passing layers, as the new baseline
+after comparing the bush capacity experiments. This is the `features32` result,
+not the combined 32-feature/six-layer experiment. The choice is based on the
+user's visual assessment, rather than the lowest training loss.
 
-## Accepted result and scope
+## Accepted bush result and default experiment recipe
+
+- Experiment: `outputs/bush_neural_capacity_0744_001/features32`.
+- Manual preview: `outputs/bush_neural_capacity_0744_001/features32/preview`.
+- Frequency: **0.744 Hz**, source slot 1 of the prepared `[0.357, 0.744]` Hz inputs;
+  the preparation's original normalization is retained.
+- Completed modes: v16, `neural_component_field_with_stable_donors`.
+- Completed-modes identity: `83dece66f94ab721a1504c25db41b609eed79be2811b83ba8b31fd44aedd3268`.
+- Immutable trained modes: `outputs/_cache/trained_modes/8c653354f2b2e433f43aa568855f426b7e52adafb006dac9c5c56ec96da9d069`.
+- Prepared inputs: `outputs/bush_neural_dense_controls_001/prepared`.
+- Frozen experiment config: [features32.json](outputs/bush_neural_capacity_0744_001/configs/features32.json).
+- Resolved configuration and source contract: [iteration.json](outputs/bush_neural_capacity_0744_001/features32/iteration.json).
+- Default overrides for future experiments: [neural_component_field.json](configs/neural_component_field.json).
+
+The accepted settings are width **256**, local features **32**, **3** message
+layers, control coverage radius `0.015L`, maximum 32,768 controls, and deformation
+and rotation-variation weights **0.1 / 0.1**. Keep Adam learning rate `0.001`,
+maximum 2,000 steps, early-stop patience **50**, relative tolerance `1e-6`, and
+seed 1729. The suggested longer patience was not applied to this baseline.
+
+Use the whole-component field strategy: components need at least **10 Gaussians**,
+**two controls**, and some effective image support to learn their own motion.
+Reliable points in components with at least **101 Gaussians** and **two controls**
+may supply propagation; other components receive pointwise motion from these
+donors. Keep the existing donor checks, four-neighbor transfer, geometry,
+interpolation and full modal-image supervision. Observation refinement is off.
+See [component-field.md](docs/component-field.md) for the exact classification.
+
+Future capacity comparisons should start from this recipe and use matching data,
+frequency, gain, phase and motion scale. This acceptance covers the bush 0.744 Hz
+result; it does not imply that the 32-feature recipe has already been trained on
+corn or validated at other frequencies. Historical results and immutable saved
+configs, quality gates and logs remain unchanged. No modal coordinates were fit
+for this preview. The user performs visual evaluation.
+
+## Current execution endpoint
+
+On 2026-09-07, the user requested that future runs stop after obtaining the final
+3D modes at the requested frequencies. Use `motion iterate-neural --stage modes`
+(the default), retaining the accepted fragment propagation and 2D modal-image
+supervision. Do not automatically fit per-frame modal coordinates to optical
+flow, run physics post-fit, compute coordinate-dependent flow R², or run full
+evaluation as a completion check. A later preview request uses `--stage preview`
+and manual oscillation, without coordinate fitting. `--stage full` requires a
+separate explicit request for coordinate/video reconstruction. Existing baseline
+coordinates and historical metrics below are preserved records, not requirements
+for new experiments.
+
+The current v16 implementation uses **whole-component fields with separate
+propagation donors**. Fixed pointwise propagation is composed into the final
+Gaussian field before full modal-image supervision; there is no observation
+post-refinement. The selected bush result has completed training and manual
+preview preparation.
+
+## Historical corn neural baseline: accepted result and scope
+
+On 2026-09-05, the user selected `corn_neural_fragment_propagation_001` as the
+baseline at that time. Its original recipe, metrics and launch command below are
+preserved as historical records, not the defaults for new experiments.
 
 - Result: `outputs/corn_neural_fragment_propagation_001/modal_result`
 - Result identity: `a60774d885e5e70047d6dbb2b2c09c40d34db5f1fc24a544d9d2598f3b2fc5bb`
@@ -15,7 +77,7 @@ On 2026-09-05, the user reviewed `corn_neural_fragment_propagation_001`, reporte
 - Coordinates: direct, two views and 2,378 frames; no physics postfit.
 - All 11 execution/check stages passed, including headless Viser data readiness. Visual baseline acceptance is the user's subsequent confirmation in this conversation. Immutable artifact quality-gate fields and original execution logs are preserved; this document records the later baseline decision.
 
-## Baseline recipe
+## Historical corn recipe
 
 - Static 3DGS remains fixed. Each frequency has an independent neural complex displacement field with shared control-node interpolation within the geometry graph.
 - Geometry covers all 44,251 foreground Gaussians. Keep all mutual-KNN candidates: 8 neighbors, distance limit 0.008, `graph_edge_filter=none`; no RGB or depth/path edge filtering. Degree-normalized spatial weights remain enabled.
@@ -29,7 +91,7 @@ On 2026-09-05, the user reviewed `corn_neural_fragment_propagation_001`, reporte
 
 The immutable v8 parent is `outputs/corn_neural_no_depth_edges_001/neural_completed_modes`, identity `ff739ec80f4311ae84ecd2bb1436a4a1cc263de1ae9141164e74ac82637f2760`. Preserve this parent and all linked upstream data with the accepted v9 result.
 
-## Recorded metrics and comparison convention
+## Historical corn metrics and comparison convention
 
 At 0.225 Hz:
 

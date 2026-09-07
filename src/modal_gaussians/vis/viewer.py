@@ -258,9 +258,13 @@ def _completed_mode_display_roles(
 ) -> tuple[np.ndarray, tuple[str, ...], str]:
     """Resolve exact debug-role labels for sequential fill or basis blending."""
 
-    if manifest.get("version") in (8, 9):
-        derived = manifest["version"] == 9
-        method = "neural_fragment_motion_propagation" if derived else "neural_complex_displacement_field"
+    if manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16):
+        derived = manifest["version"] in (9, 10, 11, 12, 13, 14, 15, 16)
+        method = {8: "neural_complex_displacement_field", 9: "neural_fragment_motion_propagation",
+                  10: "neural_field_with_training_fragment_fill", 11: "neural_field_with_surface_attachments",
+                  12: "neural_field_with_pointwise_displacement_fill", 13: "neural_pointwise_observation_refinement",
+                  14: "neural_field_with_guarded_neighbor_residuals", 15: "neural_guarded_observation_refinement",
+                  16: "neural_component_field_with_stable_donors"}[manifest["version"]]
         if manifest.get("completion_method") != method:
             raise ValueError("Unsupported neural completion role contract")
         phi = np.asarray(arrays["phi"])
@@ -271,7 +275,7 @@ def _completed_mode_display_roles(
             or not np.issubdtype(support.dtype, np.integer)
             or np.any((support < 0) | (support > (3 if derived else 2)))
         ):
-            raise ValueError("Neural support classes must be integer [K,G] in 0..2")
+            raise ValueError("Neural support classes must match the method's role range")
         classes = np.asarray([2, 0, 1, 3] if derived else [2, 0, 1], dtype=np.int8)[support]
         legend = (
             "**Role colors:** directly image-supervised = blue | "
@@ -279,7 +283,13 @@ def _completed_mode_display_roles(
         )
         if derived:
             legend += " | fragment-propagated = yellow (original image support recorded separately)"
+        if manifest["version"] == 13:
+            legend += " | yellow includes observation-refined propagated points"
+        if manifest["version"] in (14, 15):
+            legend += " | blue includes small-component residuals constrained by stable neighbors; yellow stays propagated"
         names = NEURAL_SUPPORT_DISPLAY_NAMES + (("fragment-propagated",) if derived else ())
+        if manifest["version"] == 16:
+            legend += " | blue/green use their own component field; donor eligibility is recorded separately"
         return classes, names, legend
     if manifest.get("version") in (3, 4, 5, 6, 7):
         classes = _basis_display_classes(manifest, arrays)
@@ -353,7 +363,7 @@ def _observation_counts(result: ModalResultArtifact) -> np.ndarray:
     """Count unique topology views contributing to each foreground Gaussian."""
 
     completed = result.completed_modes
-    if completed.manifest.get("version") in (8, 9):
+    if completed.manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16):
         observed = np.asarray(completed.arrays["observation_view_mask"])
         expected = (
             len(result.manifest["modes"]), result.scene.foreground.count,
@@ -403,14 +413,46 @@ def _neural_graph_display(
     return edges, _component_colors(components[edges[:, 0]])
 
 
+def _control_point_gaussian_indices(arrays: dict[str, np.ndarray], gaussian_count: int) -> np.ndarray:
+    """Map saved controls from a possible host-local domain to foreground order."""
+    if "c_control_point_index" not in arrays:
+        return np.empty(0, dtype=np.int64)
+    indices = np.asarray(arrays["c_control_point_index"])
+    hosts = np.asarray(arrays.get("t_host_gaussian_index", np.arange(gaussian_count)))
+    if (indices.ndim != 1 or hosts.ndim != 1
+            or not np.issubdtype(indices.dtype, np.integer)
+            or not np.issubdtype(hosts.dtype, np.integer)
+            or np.any(indices < 0) or np.any(indices >= len(hosts))
+            or np.any(hosts < 0) or np.any(hosts >= gaussian_count)):
+        raise ValueError("Control point indices differ from their foreground/host domain")
+    return hosts[indices].astype(np.int64, copy=False)
+
+
 class ModalViewerData:
     """Hold strict result data and implement all scientific display transforms."""
 
-    def __init__(self, result_dir: str | Path, device: str = "cuda") -> None:
+    def __init__(self, result_dir: str | Path, device: str = "cuda", *, preview: bool = False) -> None:
         requested_device = torch.device(device)
         if requested_device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("Modal Gaussian Viser requires a CUDA device")
-        self.result = load_modal_result(result_dir)
+        prepared = None
+        self.is_preview = preview
+        if preview:
+            from modal_gaussians.motion.neural.preview import load_preview
+            self.result = load_preview(result_dir)
+            prepared = self.result.prepared
+        else:
+            self.result = load_modal_result(result_dir)
+            contract_path = Path(result_dir).resolve().parent / "iteration.json"
+            if contract_path.is_file():
+                import json
+                from modal_gaussians.motion.neural.prepared import load_prepared
+                from modal_gaussians.motion.neural.neural_modes import _source_identity
+                contract = json.loads(contract_path.read_text())
+                prepared = load_prepared(contract["prepared"])
+                if (prepared.manifest["prepared_identity"] != contract["prepared_identity"]
+                        or _source_identity(self.result.completed_modes.manifest) != prepared.manifest["source_identity"]):
+                    raise ValueError("Viewer preparation differs from result sources")
         self.device = requested_device
         self.scene = self.result.scene.to(self.device)
         self.cameras = _viewer_cameras(self.result)
@@ -431,7 +473,7 @@ class ModalViewerData:
         self.phi = torch.from_numpy(
             np.asarray(self.result.completed_modes.arrays["phi"])
         ).to(self.device)
-        self.coordinates = np.asarray(
+        self.coordinates = None if preview else np.asarray(
             self.result.coordinates.coordinates, dtype=np.complex64
         )
         (
@@ -443,13 +485,20 @@ class ModalViewerData:
             self.result.completed_modes.arrays,
         )
         self.observation_counts = _observation_counts(self.result)
+        self.control_point_gaussian_index = _control_point_gaussian_indices(
+            self.result.completed_modes.arrays, self.scene.foreground.count,
+        )
+        self.control_point_colors = (
+            _component_colors(self.result.completed_modes.arrays["g_component_index"][self.control_point_gaussian_index])
+            if len(self.control_point_gaussian_index) else np.empty((0, 3), dtype=np.float32)
+        )
         self._load_graph_display()
-        self.spectrum = SpectrumComparisonController(self.result)
+        self.spectrum = SpectrumComparisonController(self.result, prepared=prepared)
 
     def _load_graph_display(self) -> None:
         """Select geometry diagnostics belonging to the completed-mode method."""
 
-        if self.result.completed_modes.manifest.get("version") in (8, 9):
+        if self.result.completed_modes.manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16):
             self.structure_graph = None
             self.graph_edge_gaussian_index, self.graph_edge_colors = _neural_graph_display(
                 self.result.completed_modes.arrays, self.scene.foreground.count,
@@ -516,6 +565,8 @@ class ModalViewerData:
     def coordinate(self, view_index: int, local_frame: int) -> np.ndarray:
         """Return one stored flow-derived complex coordinate vector."""
 
+        if self.coordinates is None:
+            raise ValueError("This preview has no video coordinates; use the manual oscillator")
         view = self.result.manifest["views"][view_index]
         frame_count = int(view["frame_count"])
         if not 0 <= local_frame < frame_count:
@@ -641,6 +692,7 @@ class ModalViserViewer:
         self._selection_sync = False
         self._canonical_disabled_cache: list[bool] = []
         self._point_cloud: Any | None = None
+        self._control_point_cloud: Any | None = None
         self._component_graph_handle: Any | None = None
         self._component_graph_edge_indices = np.empty((0,), dtype=np.int64)
         self._component_graph_color_mode: int | None = None
@@ -684,7 +736,7 @@ class ModalViserViewer:
     def _active_frame_count(self) -> int:
         """Return the frame count of the selected playback view."""
 
-        return int(self.views[self._active_view_index()]["frame_count"])
+        return 1800 if self.data.is_preview else int(self.views[self._active_view_index()]["frame_count"])
 
     def _build_gui(self) -> None:
         """Build every accepted control group from the old modal Viewer."""
@@ -701,6 +753,8 @@ class ModalViserViewer:
             self.viewer_resolution.on_update(self.request_render)
 
         with self.server.gui.add_folder("Time"):
+            if self.data.is_preview:
+                self.server.gui.add_markdown("**Mode preview — manual oscillation. Video coordinates have not been fitted.**")
             self.playback_view = self.server.gui.add_dropdown(
                 "Playback view",
                 options=tuple(str(view["label"]) for view in self.views),
@@ -709,7 +763,7 @@ class ModalViserViewer:
             self.playback = add_gui_playback_group(
                 self.server,
                 num_frames=self._active_frame_count(),
-                initial_fps=15.0,
+                initial_fps=30.0 if self.data.is_preview else 15.0,
                 num_frames_getter=self._active_frame_count,
             )
             self.timestep = self.playback[0]
@@ -779,8 +833,8 @@ class ModalViserViewer:
         with self.server.gui.add_folder("Modal playback"):
             self.drive = self.server.gui.add_dropdown(
                 "Drive",
-                options=(DRIVE_FLOW, DRIVE_MANUAL),
-                initial_value=DRIVE_FLOW,
+                options=(DRIVE_MANUAL,) if self.data.is_preview else (DRIVE_FLOW, DRIVE_MANUAL),
+                initial_value=DRIVE_MANUAL if self.data.is_preview else DRIVE_FLOW,
             )
             self.motion_scale = self.server.gui.add_slider(
                 "Motion scale",
@@ -816,7 +870,7 @@ class ModalViserViewer:
                     "phase": phase,
                     "frequency": frequency,
                 }
-                enabled.on_update(self.request_render)
+                enabled.on_update(self._on_mode_enabled)
                 gain.on_update(self.request_render)
                 phase.on_update(self.request_render)
             self.mode_controls = tuple(
@@ -839,7 +893,15 @@ class ModalViserViewer:
 
         for index, mode in enumerate(self.mode_controls):
             mode["enabled"].value = index == int(mode_index)
-        self.request_render(None)
+        self._set_selected_mode(int(mode_index))
+
+    def _on_mode_enabled(self, event: Any) -> None:
+        """Single-mode playback always selects matching phase and role colors."""
+        active = [i for i, mode in enumerate(getattr(self, "mode_controls", ())) if mode["enabled"].value]
+        if len(active) == 1:
+            self._set_selected_mode(active[0], event)
+        else:
+            self.request_render(event)
 
     def _enable_all_modes(self) -> None:
         """Enable every manual oscillator mode."""
@@ -950,6 +1012,8 @@ class ModalViserViewer:
             self.phase_frequency.value = float(self.data.frequencies_hz[index])
             if hasattr(self, "spectrum_panel"):
                 self.spectrum_panel.set_mode_index(index)
+            if getattr(self, "support_mode", None) is not None:
+                self.support_mode.value = self.support_mode_labels[index]
         finally:
             self._selection_sync = False
         self.request_render(event)
@@ -978,6 +1042,8 @@ class ModalViserViewer:
         """Synchronize phase-image brightness policy between both panels."""
 
         value = str(normalization)
+        if value == "entire spectrum" and not self.data.spectrum.full_spectrum_ready:
+            value = "per mode"
         if value not in ("per mode", "entire spectrum"):
             raise ValueError(f"Unknown Viewer normalization: {value!r}")
         if self._selection_sync:
@@ -997,6 +1063,7 @@ class ModalViserViewer:
 
         if self.data.spectrum.view_id != str(label):
             raise ValueError("Spectrum panel did not apply its selected view")
+        self._set_selected_normalization(self.data.spectrum.amplitude_normalization)
         self.request_render(None)
 
     def _current_foreground_colors(self) -> Tensor | None:
@@ -1024,6 +1091,21 @@ class ModalViserViewer:
         graph_edge_count = len(self.data.graph_edge_gaussian_index)
         graph_edge_step = max(graph_edge_count // 200, 1)
         with self.server.gui.add_folder("Debug points"):
+            control_count = len(self.data.control_point_gaussian_index)
+            self.show_controls_only = (
+                self.server.gui.add_checkbox("Show control points only", False)
+                if control_count else None
+            )
+            self.control_point_size = (
+                self.server.gui.add_slider("Control point size", min=0.0002, max=0.008,
+                                           step=0.0001, initial_value=0.002)
+                if control_count else None
+            )
+            if control_count:
+                self.server.gui.add_markdown(
+                    f"**Control points:** {control_count:,}. All controls are shown, colored by geometry component. "
+                    "Use **Canonical** to inspect their static distribution."
+                )
             self.hide_render = self.server.gui.add_checkbox(
                 "Hide Gaussian render", False
             )
@@ -1050,6 +1132,10 @@ class ModalViserViewer:
                 initial_value=0.002,
             )
             self.server.gui.add_markdown(self.data.support_legend)
+            self.server.gui.add_markdown(
+                "Role colors describe **Modal role mode** only. Solo playback selects the same role frequency; "
+                "when multiple modes are enabled, displayed motion is their sum."
+            )
             self.support_mode_labels = tuple(
                 f"Mode {index}: {frequency:.3f} Hz"
                 for index, frequency in enumerate(self.data.frequencies_hz)
@@ -1058,7 +1144,7 @@ class ModalViserViewer:
                 self.server.gui.add_dropdown(
                     "Modal role mode",
                     options=self.support_mode_labels,
-                    initial_value=self.support_mode_labels[0],
+                    initial_value=self.support_mode_labels[self.data.frequency_order[int(self.phase_mode.value)]],
                 )
                 if len(self.support_mode_labels) > 1
                 else None
@@ -1086,6 +1172,8 @@ class ModalViserViewer:
                 initial_value=1.0,
             )
         debug_handles = (
+            self.show_controls_only,
+            self.control_point_size,
             self.hide_render,
             self.hide_background,
             self.show_support,
@@ -1104,11 +1192,35 @@ class ModalViserViewer:
     def _on_debug_update(self, event: Any) -> None:
         """Remove a stale cloud when hidden and refresh the Viewer."""
 
-        if not bool(self.show_support.value):
+        only_controls = self._controls_only_enabled()
+        if only_controls or not bool(self.show_support.value):
             self._remove_support_cloud()
-        if not bool(self.show_component_graph.value):
+        if only_controls or not bool(self.show_component_graph.value):
             self._remove_component_graph()
+        if not only_controls:
+            self._remove_control_cloud()
         self.request_render(event)
+
+    def _controls_only_enabled(self) -> bool:
+        handle = getattr(self, "show_controls_only", None)
+        return handle is not None and bool(handle.value)
+
+    def _remove_control_cloud(self) -> None:
+        if getattr(self, "_control_point_cloud", None) is not None:
+            self._control_point_cloud.remove()
+            self._control_point_cloud = None
+
+    def _update_control_cloud(self, means: Tensor) -> None:
+        indices = torch.as_tensor(self.data.control_point_gaussian_index, device=means.device)
+        points = means[indices].detach().cpu().numpy()
+        if self._control_point_cloud is None:
+            self._control_point_cloud = self.server.scene.add_point_cloud(
+                "/debug/control_points", points=points, colors=self.data.control_point_colors,
+                point_size=float(self.control_point_size.value),
+            )
+        else:
+            self._control_point_cloud.points = points
+            self._control_point_cloud.point_size = float(self.control_point_size.value)
 
     def _remove_support_cloud(self) -> None:
         """Remove the current Viser support-role point cloud."""
@@ -1363,10 +1475,17 @@ class ModalViserViewer:
 
         q, scale = self._current_coordinate()
         means = self.data.deformed_means(q, scale)
-        self._update_support_cloud(means)
-        self._update_component_graph(means)
+        only_controls = self._controls_only_enabled()
+        if only_controls:
+            self._remove_support_cloud()
+            self._remove_component_graph()
+            self._update_control_cloud(means)
+        else:
+            self._remove_control_cloud()
+            self._update_support_cloud(means)
+            self._update_component_graph(means)
         camera = self._render_camera(client)
-        if bool(self.hide_render.value):
+        if only_controls or bool(self.hide_render.value):
             return np.full((camera.height, camera.width, 3), 255, dtype=np.uint8)
         colors = self._current_foreground_colors()
         rendered = self.data.scene.render_deformed(
@@ -1398,13 +1517,14 @@ def run_modal_viewer(
     host: str = "0.0.0.0",
     port: int = 8080,
     viewer_resolution: int = 2048,
+    preview: bool = False,
 ) -> None:
     """Load one complete modal result and run its full Viser interface."""
 
     # Load the CUDA backend synchronously. Deferring this to a render worker
     # leaves a connected but blank Viewer when compiler activation fails.
     _load_gsplat_rasterization()
-    data = ModalViewerData(result_dir)
+    data = ModalViewerData(result_dir, preview=preview)
     viewer = ModalViserViewer(
         data,
         work_dir=work_dir,

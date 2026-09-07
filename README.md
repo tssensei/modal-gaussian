@@ -5,12 +5,14 @@ analysis. The first migrated vertical slice validates ordered image/mask
 sequences, optionally stabilizes them to a reference frame, computes dense
 reference-to-frame Farneback flow, and evaluates the per-pixel temporal FFT.
 
-The current user-selected Corn motion baseline is
-`corn_neural_fragment_propagation_001`: a neural complex modal field with all
-spatial mutual-KNN edges retained, deformation/rotation penalties both 0.1,
-and post-training local fragment motion propagation. The accepted artifact
-contains one frequency, **0.225 Hz**. See [BASELINE.md](BASELINE.md) for its
-result identity, exact parameters, metrics, launch command, and historical references.
+The current user-selected neural motion baseline is
+`bush_neural_capacity_0744_001/features32`: width **256**, **32** local features,
+and **three** message-passing layers, using whole-component control fields and
+separate reliable propagation donors. The accepted preview contains **0.744 Hz**;
+deformation/rotation penalties remain 0.1/0.1. Use
+`configs/neural_component_field.json` for subsequent experiment overrides.
+See [BASELINE.md](BASELINE.md) for the exact result, frozen configuration and
+historical corn references.
 
 ## Code organization
 
@@ -411,7 +413,7 @@ Jacobians and calibrated modal phase display also use the radial model. Original
 images, masks and flow/FFT artifacts retain their coordinate system and need no
 undistortion. Free-orbit Viser cameras remain virtual pinhole cameras.
 
-New static bundles are version 2 and record the projection convention in camera,
+Newly trained static bundles are version 2 and record the projection convention in camera,
 dataset, scene and resume identities. Existing version-1 scenes keep their
 original pinhole behavior and identities; they are not silently reinterpreted.
 To use the correction, start a new `static train` from existing joint COLMAP,
@@ -432,6 +434,84 @@ result = scene.render(
     outputs=("rgb", "alpha", "expected_depth"),
 )
 ```
+
+## Post-training motion-subject repartition
+
+`static repartition` reclassifies **all** trained Gaussians using the original
+sweep/reference masks and full-scene visibility. It does not train, delete or
+change Gaussian parameters, build a control graph, write PNGs, or start Viser.
+The original scene and existing motion baseline remain separate.
+
+```powershell
+modal-gaussians static repartition `
+  --scene C:\outputs\static_scene `
+  --output C:\outputs\static_scene_repartitioned `
+  --device cuda
+```
+
+The source must be a distortion-aware static v2/v3 scene. Mask paths come from
+its embedded dataset/cameras; `--dataset-root` can relocate the source directory,
+but every mask must still match its recorded SHA-256 and calibrated dimensions.
+Use each camera's corresponding mask, not the temporal mask union.
+
+Before classification, dilate that original mask by **10 pixels** with a 21x21
+square kernel. The dilated region is foreground and its exact complement is
+background: there is no erosion or ignored boundary band. This preprocessing
+does not edit source mask files or change masks used by static/motion training.
+
+For every view, two fixed-geometry feature adjoints accumulate each Gaussian's
+depth-composited contribution `T * alpha` in the dilated mask-interior and
+mask-exterior pixels. Both old foreground and background participate as occluders.
+This uses the complete splat footprint and existing radial warp, without
+topology contributors, center-only projection votes, or mean-depth equality.
+Occluded, offscreen and weakly contributing points provide no effective vote.
+
+Defaults (initial engineering settings, not calibrated on the bush data):
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--mask-dilation-pixels` | 10 | Foreground dilation radius in original-image pixels; background is its complement |
+| `--min-visible-mass` | 0.5 | Minimum sum of visible alpha contribution over FG/BG pixels, in original-resolution pixel units |
+| `--min-visible-groups` | 2 | Require evidence from at least two distinct pose groups |
+| `--class-fraction` | 0.8 | At least 80% FG or at least 80% BG contribution makes a decisive view |
+| `--view-angle-degrees` | 10 | Maximum optical-axis angle to a group's representative |
+| `--view-position-fraction` | 0.05 | Maximum center distance, relative to the robust 1–99% camera-trajectory extent |
+
+Every camera is evaluated. A camera joins the first representative close in
+**both** position and optical axis. Normalize FG/BG contributions within each
+effective view, average within pose groups, then average groups equally.
+Repeated nearby frames do not independently satisfy the support requirement.
+Any decisive FG/BG disagreement, even within a group, stays **uncertain**;
+an effective mixed-mask footprint also stays uncertain rather than being hidden
+by majority voting. Always-occluded or insufficiently supported points are
+uncertain. No spatial propagation or largest-component assumption is applied.
+
+The output is a loadable **static scene v3**:
+
+- `foreground`: only confident subject points; this is the downstream motion domain.
+- `background`: all non-motion points, including confident background **and uncertain**.
+- `partition.npz`: independent three-way `label` (`0=uncertain`, `1=subject`,
+  `2=background`), uncertainty `reason`, contribution/vote evidence, and
+  `new_to_source_index`. Evidence and labels use the parent's concatenated
+  `[old_foreground, old_background]` order; the mapping maps the new concatenated
+  tensor order back to that parent order. Reordering is stable within each set.
+- `partition-summary.json`: class transitions, uncertainty reasons, view-group
+  counts, subject bounding box and robust extent for later control-scale checks.
+
+The v3 identity includes the partition configuration, source identities, camera
+groups, mask hashes and evidence checksum. Loading rechecks classification and
+reconstructs the parent tensor identities, verifying that no Gaussian parameters
+were changed. Old v1/v2 loading and existing erosion-based v3 partitions are
+preserved; new dilation partitions record method v2 and their dilation radius.
+Fewer than two subject points or
+two non-motion points cannot form a valid current static bundle and fails without
+publishing a completed scene. An existing output directory is never overwritten.
+
+Rebuild topology, measurements/alignment, motion and derived outputs using this
+new scene identity; do not reuse old foreground indices or completed modes.
+Existing static optimization and source optical flow/FFT need not be repeated.
+This feature has synthetic CPU and actual CUDA renderer checks; no bush
+repartition or motion experiment was run as part of its implementation.
 
 ## Pixel-to-Gaussian observation topology
 
@@ -845,8 +925,8 @@ post-fit cannot be mistaken for a spatial-field improvement.
 
 ## Neural full-foreground complex displacement fields
 
-`motion fit-neural` constructs completed-modes v8 with
-`completion_method: neural_complex_displacement_field`. It exports a fixed
+`motion fit-neural` now defaults to completed-modes **v10** with
+`completion_method: neural_field_with_training_fragment_fill`. It exports a fixed
 `phi[K,G_fg,3]` complex64 field in the static foreground's Gaussian order.
 Playback uses this exported field and the existing modal coordinate convention;
 it does not run the neural network inside Viser.
@@ -892,10 +972,57 @@ view supplies support, a contradiction when both endpoints are visible, or
 unknown evidence. Supported edges require no contradictory view; wholly unknown
 edges use the shorter radius and explicit weaker weight. Occlusion is not a
 contradiction. Small disconnected components and isolated nodes are retained.
-Graph-distance farthest-point sampling covers the foreground within `h=0.03L`,
+Graph-distance farthest-point sampling covers the host components within `h=0.03L`,
 where `L` is its bounding-box diagonal. Every control inside graph distance
 `2h` contributes through a normalized Wendland kernel; there is no top-four
-truncation or interpolation across disconnected components.
+truncation within a host component. Small fragments receive no independent controls.
+Their only connection to a host is the explicitly recorded attachment described below.
+
+Fresh runs now default to **surface attachments (v11)**: hosts need at least
+101 Gaussians and two controls at the configured radius. Other components use
+size-aware surface attachment and spatially varying, fixed interpolation before
+the loss. Existing preparations retain their recorded strategy. See
+[the v11 rules and configuration](docs/neural_surface_attachments.md) and
+[the iteration override](configs/neural_surface_attachments.json). This version
+has development checks only and has not replaced a trained baseline.
+
+The following compact-fragment description applies to the retained **v10**
+strategy. Before training, its fragment rules identify compact components with
+at most 16 nodes and extent at most 0.016. The existing host-core, distance,
+ambiguity and anchor-coverage checks select a fixed local patch. Host control
+sampling excludes **all** candidate fragments, including those that cannot attach.
+No largest-component assumption is used; every non-fragment component remains a host.
+
+For an accepted fragment, precompute `N_fragment = sum_j beta_j * N_host_j`.
+Using these rows in the field formula below is algebraically identical to
+`Phi_fragment = sum_j beta_j * (Phi_j + R_j cross (x_fragment-x_j))`.
+Thus every training forward pass includes filled fragment motion in the full
+foreground renderer; gradients from fragment pixels reach host controls.
+There is no per-step neighbor search, detached fill, additional network input
+for fragments, or post-training overwrite. Final-Gaussian deformation loss also
+uses this completed field; the host control graph supplies rotation variation.
+
+Image support is shared by each host component and its attached fragments.
+An attached fragment with image evidence can therefore supervise its host.
+Unattached fragments have empty interpolation and exactly zero unresolved motion,
+even if they have image evidence; they are not treated as independently movable
+controls. Their original image-support record is retained. Static rendering,
+occlusion, alpha, observation scales and loss coefficients remain unchanged;
+residuals involving unresolved fragments can remain unexplained.
+
+The v10 artifact stores the original full geometry, host index mapping, host
+control graph, attachments and composed sparse interpolation. Its loader replays
+attachment/interpolation and reconstructs `phi` from saved weights. Host-local
+control indices are mapped through `t_host_gaussian_index`; the final field keeps
+the original full-foreground order. Viewer support colors include propagated
+fragments in yellow. This implementation has synthetic CPU/CUDA checks only;
+no new plant experiment has established its visual quality or speed.
+
+For direct `fit-neural`, `--fragment-config <json>` overrides the existing
+attachment thresholds. `--fragment-treatment post-training` preserves the v8
+independent-component producer for an explicit legacy comparison or old resume;
+it does not itself run the separate v9 postprocessor. Existing v8/v9 artifacts
+keep their identities and loaders.
 
 The exported field is
 
@@ -929,12 +1056,67 @@ relative tolerance 1e-6, and checkpoints every 100 iterations. Every setting is
 available as a CLI option; see `motion fit-neural --help`. `--resume` requires
 matching source identities and configuration. Production feature rendering
 requires CUDA; CPU synthetic checks do not provide a production CPU renderer.
+
+Optional **control-local features** add a learned vector to each control, independently
+for each frequency. `--local-feature-dim 16` feeds the normalized coordinates and
+16 learned values into the encoder; the output head receives the graph features,
+coordinates and the same local vector directly. Codes start from seeded
+`Normal(0, 0.01)` values, while the output head still starts at zero. Codes are
+optimized with the existing Adam optimizer, stored in the network/checkpoint and
+bound to the saved control order. There are no independent Gaussian or fragment
+codes, and geometry, interpolation, losses and observation normalization are unchanged.
+No extra feature penalty is introduced. This is additional local capacity, not a
+guarantee against noisy or inconsistent motion.
+
+`local_feature_dim` defaults to **0**, preserving old model shapes and serialized
+configuration identities. Enabling it changes the training contract and requires
+a new experiment; it cannot resume a coordinate-only checkpoint. For the current
+bush preparation, [the local-feature iteration override](configs/neural_local_features.json)
+keeps the width-256 surface-attachment settings and adds only 16-dimensional
+control features. Other neural, graph, interpolation and loss parameters are
+inherited from that preparation. Viser and rendered-design continue to use baked `phi`.
+
+The earlier [pointwise fill and optional observation correction](docs/pointwise-motion-fill.md)
+uses components with at least six Gaussians as learning hosts and transfers motion
+to individual smaller points without an attachment distance cutoff. Select it with
+`configs/neural_pointwise.json`. `motion iterate-neural --refine-observations` adds
+an independent post-training full-render correction, retaining propagation in
+unobservable directions. Both previews can share one trained model. This new
+v12/v13 strategy remains available for reproducing previous experiments.
+
+The earlier [guarded neighbor residuals](docs/guarded-motion-fill.md) remain available
+with `configs/neural_guarded.json`: 10–100 point components may learn reliable
+observable corrections around stable neighbor motion; 1–9 point components and
+weakly observed interior points propagate only. Donors must meet the earlier
+stable-host size/control requirements and the new reliable-observation gate.
+Optional observation refinement obeys the same restrictions and retains the
+total neighbor-residual prior. This v14/v15 path is retained for reproducing its
+experiments; it does not change the selected baseline.
+
+The current baseline uses [whole-component fields with separate donors](docs/component-field.md)
+and `configs/neural_component_field.json` (v16), with width 256, local features 32
+and three message layers. Every member of an observed
+component with at least 10 Gaussians and two controls uses its own component's
+control field. Single-control components are now removed from the network and
+propagate as complete components. Visibility, contribution mass and reliable-point
+count restrict external donors only. Smaller or entirely unobserved components transfer
+motion from those donors. All learning-component edges participate in the
+structural loss. The neighbor residual penalty, per-point directional projection
+and observation post-refinement are disabled for this strategy. The two-control
+gate has synthetic development validation and completed bush/corn runs; the user
+selected the bush 32-feature result as the current baseline. Earlier v16
+experiments retain their original settings and remain reproducible.
+
 Work directories retain the original fixed observations, graph, renderer
 contribution masses, support masks and normalization scales. Resume uses these
 persisted inputs, because CUDA gradient reductions are not bitwise deterministic.
 It still checks source/configuration/runtime identities and the current rendered
 alpha within tolerance. Latest model/optimizer/RNG state is saved separately
 from the best model used to export `phi`.
+Full and prefix exports reconstruct that saved model on CPU, matching the strict
+loader's evaluation backend. The resulting baked `phi` is also used for the
+CUDA-rendered predictions. This avoids near-zero component mismatches caused by
+CPU/CUDA reduction roundoff without loosening validation or changing GPU training.
 
 For a shorter preview after stopping a run, `motion export-neural-prefix`
 accepts the same five source paths and `--work-dir`, plus `--count 5` and a
@@ -1349,3 +1531,107 @@ Attachments do not alter the parent geometry graph. Viewer debug roles mark
 propagated fragments yellow and retain original image-contribution counts
 separately. Rebuild rendered design, direct coordinates and the final result from
 the new v9 modes before playback. No automatic baseline replacement occurs.
+
+### Fast neural experiment iteration
+
+Prepare one immutable observation snapshot from a full v8/v9/v10/v11/v12 neural result:
+
+```bat
+python -m modal_gaussians.cli motion prepare-neural --from-result outputs\bush_neural_repartitioned_001\modal_result --cache-dir outputs\_cache --output outputs\bush_neural_prepared_001
+```
+
+Alternatively provide `--scene`, `--topology`, `--measurements`, `--graph`, and
+`--alignment-from` instead of `--from-result`. Preparation accepts `--config`
+with a flat JSON object of `NeuralModesConfig` overrides. Source video, camera,
+foreground, frequency or observation-sampling changes require a new preparation;
+the snapshot intentionally does not follow subsequent edits to raw videos.
+Its small payload and linked scientific inputs are checked on every iteration.
+
+An experiment's optional configuration contains `neural`, `fragment`, and/or
+`design` sections. Missing values inherit the preparation's resolved baseline;
+unknown keys fail. For example, `{"neural":{"deformation_weight":0.05}}`
+changes that weight. Training now defaults to host controls with fragment fill
+inside the loss, using the preparation's existing `fragment` thresholds and
+remaining baseline settings. Set thresholds in the `fragment` section; changing
+them now changes training interpolation and requires a new training run.
+For an explicit legacy comparison only, `{"neural":{"training_fragment_config":null}}`
+retains independent-component training followed by v9 postprocessing.
+
+```bat
+python -m modal_gaussians.cli motion iterate-neural --prepared outputs\bush_neural_prepared_001 --config experiment.json --output outputs\bush_trial_001
+```
+
+The default `--stage modes` stops after training with fixed fragment fill and
+strict validation of the final v10 or v11 3D modes (status `modes_ready`). The exact
+artifact path is `completed_modes` in the experiment's `outputs.json`; it can
+refer directly to immutable trained modes in the shared cache.
+It does not build rendered-design/preview data, fit per-frame modal coordinates,
+evaluate video-flow R², or load full spectra. The existing 2D modal-image training
+supervision and complex alpha alignment remain unchanged.
+
+When a visual preview is requested, reuse the same experiment and settings:
+
+```bat
+python -m modal_gaussians.cli motion iterate-neural --prepared outputs\bush_neural_prepared_001 --config experiment.json --output outputs\bush_trial_001 --stage preview
+python -m modal_gaussians.cli viewer --preview outputs\bush_trial_001\preview --work-dir outputs\bush_trial_001\work\viewer --host 127.0.0.1 --port 8087 --viewer-res 1024
+```
+
+The preview stage stops at headless readiness and never starts a server or
+writes diagnostic PNGs. Preview includes manual oscillation, cameras, graph,
+support roles and exact-DFT Original/Reconstructed modal images. It contains no
+fictitious video coordinates or flow-fit scores. Full raw spectra are cached or
+loaded explicitly in the background with **Load full spectrum**. Until loaded,
+the raw spectrum plot is hidden and normalization uses **per mode**.
+
+Only when the user explicitly requests video-coordinate fitting and full
+evaluation, use the separately retained compatibility path below. A normal
+pipeline run or a request to view 3D modes does not require this stage:
+
+```bat
+python -m modal_gaussians.cli motion iterate-neural --prepared outputs\bush_neural_prepared_001 --config experiment.json --output outputs\bush_trial_001 --stage full
+python -m modal_gaussians.cli viewer --result outputs\bush_trial_001\modal_result --work-dir outputs\bush_trial_001\work\viewer --host 127.0.0.1 --port 8087 --viewer-res 1024
+```
+
+Use the same configuration (or omit it in both commands). Full evaluation reuses
+the learned modes and adds coordinates, result materialization and spectral
+caches. Existing v8/v9 identities and complete-result formats remain loadable.
+The v10 change is the control domain and when fill is applied, while loss
+functions, precision, fixed alignment and observation normalization stay unchanged.
+
+Caches under `outputs/_cache` separate fixed observations, fine geometry,
+controls/interpolation, learned modes, dense DFT values and raw spectrum
+statistics. Loss/network changes reuse geometry; control-spacing changes only
+rebuild controls; connectivity changes rebuild the graph and controls. Geometry
+support roles are recomputed from the current graph and fixed attachments.
+V10 attachment changes invalidate controls/interpolation and trained modes,
+while observations and the fine graph remain reusable. Only legacy postprocessing
+trials can change propagation without retraining. An experiment is resumed only with identical
+resolved settings, source identity and relevant algorithm revision; changed
+settings require a new experiment directory. Work uses OS locks and cache
+publication is atomic. No cache eviction or old-output cleanup is automatic.
+
+Full flow loading still hashes source bytes. Finiteness receipts are bound to
+those hashes and the validator version; identity calculation reuses hashes from
+that load. Dense DFT caches are independent of topology, but each newly published
+artifact still records its own selection/topology provenance. Prepared iterations
+read mask/metadata snapshots rather than opening full flow/spectrum arrays.
+
+Each experiment records `iteration.json`, `overrides.json`, `outputs.json`,
+`diagnostics.json`, `status.json` and per-stage timing reports. Timing records
+include cache hits, training steps, instrumented bytes and Windows process read
+transfers (not physical disk throughput). Nested stage timings overlap and must
+not be summed as independent wall time. A complete result still references its
+input artifacts and shared cache: retain those dependencies when moving or
+cleaning experiments.
+
+Measured with the explicit preview endpoint on the existing bush 0.05 Hz scene
+(RTX 5090, 2026-09-07; before the default endpoint changed to modes): first
+preparation took 335.6 s; a fresh fit from warm input caches reached preview
+readiness in 320.7 s, with optimization starting about 7 s after command launch.
+Three headless Viewer-data loads took 18.50 / 18.27 / 18.37 s. Preparation,
+caches, and the new experiment together occupied about 285 MB, including the
+subsequent full evaluation. The upgrade reused unchanged trained modes and
+checkpoints; preview/full manual deformations and modal-image displays matched
+byte for byte. These are iteration measurements, not a GPU kernel speedup or
+visual-quality approval. Detailed local records are in
+`outputs/bush_iteration_benchmark_001/benchmark-report.md` and its JSON companion.

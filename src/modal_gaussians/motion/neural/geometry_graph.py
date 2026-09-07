@@ -22,7 +22,7 @@ import math
 from typing import Any, Mapping, Sequence
 
 import numpy as np
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import dijkstra
 import scipy.spatial as spatial
 
@@ -510,28 +510,55 @@ def build_control_graph(
     adjacency = coo_matrix((np.concatenate((lengths, lengths)),
                             (np.concatenate((edges[:, 0], edges[:, 1])),
                              np.concatenate((edges[:, 1], edges[:, 0])))), shape=(len(points), len(points))).tocsr()
+    # Disconnected vertices cannot affect a shortest path. Group once, then
+    # solve inside each component instead of allocating a G-vector per seed.
+    grouped_nodes = np.argsort(component, kind="stable")
+    offsets = np.concatenate(([0], np.cumsum(sizes)))
+    local_index = np.empty(len(points), dtype=np.int64)
+    local_index[grouped_nodes] = np.arange(len(points)) - np.repeat(offsets[:-1], sizes)
+    grouped_adjacency = adjacency[grouped_nodes][:, grouped_nodes].tocsr()
+    grouped_adjacency.sort_indices()
+    component_adjacency: list[csr_matrix] = []
+    for start, stop in zip(offsets[:-1], offsets[1:]):
+        first, last = grouped_adjacency.indptr[start], grouped_adjacency.indptr[stop]
+        component_adjacency.append(csr_matrix((
+            grouped_adjacency.data[first:last],
+            grouped_adjacency.indices[first:last] - start,
+            grouped_adjacency.indptr[start:stop + 1] - first,
+        ), shape=(stop - start, stop - start)))
     nearest = np.full(len(points), np.inf, dtype=np.float64)
     owners = np.full(len(points), -1, dtype=np.int64)
     control_nodes: list[int] = []
+    control_node_buffer = np.empty(min(settings.max_controls, len(points)), dtype=np.int64)
+    component_controls: list[list[int]] = [[] for _ in sizes]
     support_rows: list[np.ndarray] = []
     support_columns: list[np.ndarray] = []
     support_values: list[np.ndarray] = []
-    control_distances: list[np.ndarray] = []
+    control_distances: list[tuple[np.ndarray, np.ndarray]] = []
 
     def add_control(node: int) -> None:
         slot = len(control_nodes)
-        distances = np.asarray(dijkstra(adjacency, directed=False, indices=node), dtype=np.float64)
-        control_distances.append(distances[np.asarray(control_nodes, dtype=np.int64)].copy())
-        prior_nodes = np.full(len(points), np.iinfo(np.int64).max, dtype=np.int64)
-        assigned = owners >= 0
-        if control_nodes:
-            prior_nodes[assigned] = np.asarray(control_nodes)[owners[assigned]]
-        take = (distances < nearest) | ((distances == nearest) & np.isfinite(distances) & (node < prior_nodes))
-        nearest[take] = distances[take]
-        owners[take] = slot
+        group = int(component[node])
+        members = grouped_nodes[offsets[group]:offsets[group + 1]]
+        distances = np.asarray(dijkstra(component_adjacency[group], directed=False,
+                                       indices=int(local_index[node])), dtype=np.float64)
+        prior_slots = np.asarray(component_controls[group], dtype=np.int64)
+        control_distances.append((prior_slots,
+                                 distances[local_index[control_node_buffer[prior_slots]]].copy()))
+        prior_nodes = np.full(len(members), np.iinfo(np.int64).max, dtype=np.int64)
+        previous_owners = owners[members]
+        assigned = previous_owners >= 0
+        prior_nodes[assigned] = control_node_buffer[previous_owners[assigned]]
+        take = ((distances < nearest[members])
+                | ((distances == nearest[members]) & np.isfinite(distances) & (node < prior_nodes)))
+        nearest[members[take]] = distances[take]
+        owners[members[take]] = slot
         control_nodes.append(node)
-        rows = np.flatnonzero(distances < 2 * h)
-        ratio = distances[rows] / (2 * h)
+        control_node_buffer[slot] = node
+        component_controls[group].append(slot)
+        local_rows = np.flatnonzero(distances < 2 * h)
+        rows = members[local_rows]
+        ratio = distances[local_rows] / (2 * h)
         weights = (1 - ratio) ** 4 * (4 * ratio + 1)
         support_rows.append(rows)
         support_columns.append(np.full(len(rows), slot, dtype=np.int64))
@@ -563,7 +590,10 @@ def build_control_graph(
         key = (min(owner_a, owner_b), max(owner_a, owner_b))
         boundary[key] = boundary.get(key, 0.0) + float(graph.edge_weight[edge_slot])
     control_edges = np.asarray(sorted(boundary), dtype=np.int64).reshape(-1, 2)
-    control_lengths = np.asarray([control_distances[int(b)][int(a)] for a, b in control_edges], dtype=np.float64)
+    control_lengths = np.asarray([
+        control_distances[int(b)][1][np.searchsorted(control_distances[int(b)][0], a)]
+        for a, b in control_edges
+    ], dtype=np.float64)
     control_weights = np.asarray([boundary[tuple(pair)] for pair in control_edges], dtype=np.float64)
     return ControlGraph(
         control_point_index=controls, positions=points[controls].astype(np.float32),

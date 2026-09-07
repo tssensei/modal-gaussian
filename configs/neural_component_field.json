@@ -1,0 +1,21 @@
+{
+  "neural": {
+    "hidden_dim": 256,
+    "local_feature_dim": 32,
+    "message_layers": 3,
+    "control_radius_fraction": 0.015,
+    "max_controls": 32768,
+    "deformation_weight": 0.1,
+    "rotation_weight": 0.1
+  },
+  "fragment": {
+    "strategy": "component_field",
+    "min_learning_nodes": 10,
+    "min_learning_controls": 2,
+    "min_source_nodes": 101,
+    "min_source_controls": 2,
+    "neighbors": 4,
+    "min_observation_mass": 0.05,
+    "min_observed_points": 3
+  }
+}

@@ -1,6 +1,6 @@
 """Independent neural complex modal fields with frozen full-foreground supervision.
 
-This opt-in v8 producer does not train static appearance, temporal coordinates,
+This v8/v10/v11 producer does not train static appearance, temporal coordinates,
 or rigid bases. Existing rigid artifacts supply only the fixed complex view
 alignment. Production training requires CUDA; the field math is CPU-testable.
 """
@@ -24,6 +24,9 @@ import torch
 from modal_gaussians import __version__
 from modal_gaussians.numpy_io import save_named_arrays
 from modal_gaussians.progress import report_progress
+from .pointwise_attachments import MODE_ARRAYS as POINTWISE_MODE_ARRAYS
+from .guarded_attachments import MODE_ARRAYS as GUARDED_MODE_ARRAYS
+from .component_field import MODE_ARRAYS as COMPONENT_MODE_ARRAYS
 
 COMPLETED_MODES_FORMAT = "modal_gaussians.completed_modes"
 COMPLETED_MODES_VERSION = 8
@@ -37,7 +40,7 @@ PREFIX_NORMALIZATION_ARRAYS = {
 MODE_ARRAYS = {
     "alphas", "alpha_identifiable_mask", "observation_view_mask", "support_class",
     "sample_target", "mode_view_rms", "mode_view_loss_scale", "amplitude_scale",
-}
+} | POINTWISE_MODE_ARRAYS | GUARDED_MODE_ARRAYS | COMPONENT_MODE_ARRAYS
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,7 @@ class NeuralModesConfig:
     max_controls: int = 2048
     hidden_dim: int = 64
     message_layers: int = 3
+    local_feature_dim: int = 0
     pixel_sample_stride: int = 2
     alpha_minimum: float = 0.05
     mask_erosion_iterations: int = 1
@@ -67,8 +71,12 @@ class NeuralModesConfig:
     checkpoint_every: int = 100
     device: str = "auto"
     graph_edge_filter: str = "depth"
+    training_fragment_config: dict[str, Any] | None = None
 
     def validate(self) -> None:
+        if self.training_fragment_config is not None:
+            from .training_fragments import config_class
+            config_class(self.training_fragment_config).from_dict(self.training_fragment_config)
         if self.graph_edge_filter not in ("depth", "none"):
             raise ValueError("Neural graph_edge_filter must be depth or none")
         for name in ("graph_neighbors", "max_controls", "hidden_dim", "message_layers",
@@ -77,7 +85,7 @@ class NeuralModesConfig:
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"Neural {name} must be a positive integer")
-        for name in ("seed", "mask_erosion_iterations"):
+        for name in ("seed", "mask_erosion_iterations", "local_feature_dim"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"Neural {name} must be a non-negative integer")
@@ -103,6 +111,10 @@ class NeuralModesConfig:
         result = asdict(self)
         if self.graph_edge_filter == "depth":
             result.pop("graph_edge_filter")
+        if self.training_fragment_config is None:
+            result.pop("training_fragment_config")
+        if self.local_feature_dim == 0:
+            result.pop("local_feature_dim")
         return result
 
     @classmethod
@@ -173,6 +185,7 @@ def _field_config(config: NeuralModesConfig, mode: int = 0) -> Any:
     from modal_gaussians.motion.neural.neural_field import NeuralFieldConfig
     return NeuralFieldConfig(
         hidden_dim=config.hidden_dim, message_layers=config.message_layers,
+        local_feature_dim=config.local_feature_dim,
         learning_rate=config.learning_rate, max_iterations=config.max_iterations,
         gradient_clip=config.gradient_clip, seed=config.seed + mode,
         convergence_patience=config.convergence_patience, relative_tolerance=config.relative_tolerance,
@@ -226,8 +239,16 @@ def _source_identity(source: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _validated_mode_slots(slots: Sequence[int], count: int) -> list[int]:
+    values = list(slots)
+    if (not values or any(type(slot) is not int or not 0 <= slot < count for slot in values)
+            or values != sorted(set(values))):
+        raise ValueError("Selected source mode slots must be nonempty, unique, in range and in source order")
+    return values
+
+
 def _source_mode_slots(manifest: Mapping[str, Any]) -> np.ndarray:
-    """Accept complete sources or an explicit, hash-bound completed prefix only."""
+    """Accept complete sources or explicit, hash-bound completed selections."""
     from modal_gaussians.motion.common.mode_mapping import resolve_source_mode_slots
     if ("source_modes" in manifest) != ("mode_selection" in manifest):
         raise ValueError("Neural prefix requires both source_modes and mode_selection")
@@ -242,13 +263,15 @@ def _source_mode_slots(manifest: Mapping[str, Any]) -> np.ndarray:
     if not isinstance(source_modes, list) or not isinstance(selection, dict):
         raise ValueError("Neural prefix metadata must contain source modes and a selection object")
     slots = resolve_source_mode_slots(modes, source_modes)
-    expected_slots = list(range(len(modes)))
-    if (selection.get("policy") != "completed_prefix"
+    policy = selection.get("policy")
+    expected_slots = (list(range(len(modes))) if policy == "completed_prefix" else
+                      _validated_mode_slots(selection.get("source_mode_slots", []), len(source_modes)))
+    if (policy not in ("completed_prefix", "completed_selection")
             or selection.get("source_mode_slots") != expected_slots
             or any(type(slot) is not int for slot in selection.get("source_mode_slots", []))
             or slots.tolist() != expected_slots
             or any("source_mode_slot" not in mode for mode in modes)):
-        raise ValueError("Neural export must select exactly the completed source prefix in order")
+        raise ValueError("Neural export must select its declared completed source modes in order")
 
     def is_hash(value: Any) -> bool:
         return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
@@ -258,7 +281,7 @@ def _source_mode_slots(manifest: Mapping[str, Any]) -> np.ndarray:
     checkpoints = selection.get("checkpoints")
     if not isinstance(checkpoints, list) or len(checkpoints) != len(modes):
         raise ValueError("Neural prefix checkpoint inventory differs")
-    for slot, checkpoint in enumerate(checkpoints):
+    for slot, checkpoint in zip(expected_slots, checkpoints):
         if (not isinstance(checkpoint, dict) or type(checkpoint.get("source_mode_slot")) is not int
                 or checkpoint["source_mode_slot"] != slot
                 or checkpoint.get("filename") != f"mode_{slot:03d}.pt"
@@ -322,17 +345,61 @@ def support_roles(component_index: np.ndarray, observation_view_mask: np.ndarray
 def _field_geometry(arrays: Mapping[str, np.ndarray], mode: int, device: Any = "cpu") -> Any:
     from modal_gaussians.motion.neural.neural_field import NeuralFieldGeometry
     supported = np.asarray(arrays["support_class"])[mode] != 0
-    return NeuralFieldGeometry.from_arrays({
+    training_fill = "t_host_gaussian_index" in arrays
+    interpolation_prefix = "t_" if training_fill else "c_"
+    control_indices = arrays["c_control_point_index"]
+    if training_fill:
+        control_indices = arrays["t_host_gaussian_index"][control_indices]
+    values = {
         "gaussian_positions": arrays["g_points"], "control_positions": arrays["c_positions"],
         "gaussian_edges": arrays["g_edge_index"], "gaussian_edge_weights": arrays["g_edge_weight"],
         "control_edges": arrays["c_control_edges"], "control_edge_weights": arrays["c_control_edge_weight"],
         "control_edge_lengths": arrays["c_control_edge_length"],
-        "interpolation_indptr": arrays["c_interpolation_indptr"],
-        "interpolation_indices": arrays["c_interpolation_indices"],
-        "interpolation_weights": arrays["c_interpolation_weights"],
+        "interpolation_indptr": arrays[interpolation_prefix + "interpolation_indptr"],
+        "interpolation_indices": arrays[interpolation_prefix + "interpolation_indices"],
+        "interpolation_weights": arrays[interpolation_prefix + "interpolation_weights"],
+        "allow_empty_interpolation": training_fill,
         "gaussian_supported": supported,
-        "control_supported": supported[arrays["c_control_point_index"]],
-    }, device=device)
+        "control_supported": supported[control_indices],
+    }
+    if "p_source_mask" in arrays:
+        source_mask = arrays["p_source_mask"][mode]
+        values["interpolation_supported"] = source_mask
+        values["control_supported"] = source_mask[control_indices]
+        edges = arrays["g_edge_index"]
+        keep = source_mask[edges].all(axis=1)
+        values["gaussian_edges"], values["gaussian_edge_weights"] = edges[keep], arrays["g_edge_weight"][keep]
+        weights = arrays["p_neighbor_weight"][mode]
+        rows, slots = np.nonzero(weights > 0)
+        values.update(transfer_rows=rows, transfer_sources=arrays["p_neighbor_index"][mode][rows, slots],
+                      transfer_weights=weights[rows, slots])
+    if "h_source_mask" in arrays:
+        learning = arrays["h_source_mask"][mode] | arrays["h_residual_mask"][mode]
+        values["interpolation_supported"] = learning
+        values["control_supported"] = arrays["h_control_supported"][mode]
+        edges = arrays["g_edge_index"]
+        keep = learning[edges].all(axis=1)
+        values["gaussian_edges"], values["gaussian_edge_weights"] = edges[keep], arrays["g_edge_weight"][keep]
+        weights = arrays["h_neighbor_weight"][mode]
+        rows, slots = np.nonzero(weights > 0)
+        values.update(transfer_rows=rows, transfer_sources=arrays["h_neighbor_index"][mode][rows, slots],
+                      transfer_weights=weights[rows, slots], residual_projector=arrays["h_residual_projector"][mode],
+                      residual_mask=arrays["h_residual_mask"][mode],
+                      residual_prior_weight=float(arrays["h_residual_prior_weight"]))
+    if "u_own_field_mask" in arrays:
+        own = arrays["u_own_field_mask"][mode]
+        values["interpolation_supported"] = own
+        values["control_supported"] = own[control_indices]
+        # Whole learning components retain every geometric edge, including
+        # edges joining directly supervised and structurally inferred members.
+        edges = arrays["g_edge_index"]
+        keep = own[edges].all(axis=1)
+        values["gaussian_edges"], values["gaussian_edge_weights"] = edges[keep], arrays["g_edge_weight"][keep]
+        weights = arrays["u_neighbor_weight"][mode]
+        rows, slots = np.nonzero(weights > 0)
+        values.update(transfer_rows=rows, transfer_sources=arrays["u_neighbor_index"][mode][rows, slots],
+                      transfer_weights=weights[rows, slots])
+    return NeuralFieldGeometry.from_arrays(values, device=device)
 
 
 def _artifact_identity_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -358,10 +425,77 @@ SEMANTICS = {
 }
 
 
+def _semantics(config: NeuralModesConfig) -> dict[str, Any]:
+    if config.training_fragment_config is None and config.local_feature_dim == 0:
+        return SEMANTICS
+    result = dict(SEMANTICS)
+    if config.local_feature_dim:
+        result["control_features"] = {
+            "dimension": config.local_feature_dim,
+            "parameters": "per_frequency_per_control_in_saved_control_order",
+            "input": "normalized_coordinates_and_learned_features",
+            "head": "graph_features_coordinates_and_direct_local_features",
+            "initialization": "normal_mean_0_std_0.01_frequency_seed; zero_output_head",
+        }
+    if config.training_fragment_config is None:
+        return result
+    result.update({
+            "parameters": "host_controls_only_fixed_fragment_interpolation_before_loss",
+            "fragment_transfer": "N_fragment=sum_anchor beta_anchor*N_anchor; no independent fragment controls",
+            "roles": {**SEMANTICS["roles"], "3": "fragment_propagated_during_training"},
+            "fragment_support": "host_and_attached_fragments_share_image_support; unattached_zero_unresolved"})
+    if config.training_fragment_config.get("strategy") == "surface":
+        result.update(fragment_transfer="per_gaussian_surface_anchor_weights_smoothed_on_fragment_graph; N=A*N_host",
+                      attachment_support="capped_center_distance_and_projected_covariance_support_gap; unknown_visibility_not_veto",
+                      attachment_classification="min_host_nodes_and_provisional_control_count_at_fixed_h",
+                      attachment_sources="static_covariance_and_frozen_visibility_depth; no_rgb_no_rigid_motion")
+    if config.training_fragment_config.get("strategy") == "pointwise":
+        result.update(fragment_transfer="sum_neighbor weight*Phi_neighbor; no_rotation_extrapolation_no_cascades",
+                      attachment_classification="component_size_only_single_control_allowed",
+                      attachment_support="per_mode_nearest_supported_host_no_distance_gap_or_ambiguity_cutoff",
+                      structure_loss="independent_host_edges_only; followers_are_individual_points")
+    if config.training_fragment_config.get("strategy") == "guarded":
+        result.update(
+            parameters="stable_and_qualified_small_component_controls; small_controls_predict_residuals",
+            fragment_transfer="sum_stable_neighbor weight*Phi_neighbor; no_rotation_extrapolation_no_cascades",
+            attachment_classification="stable_min_size_and_provisional_controls; small_min_size_and_reliable_support",
+            attachment_support="visible_surface_with_minimum_feature_mass; nearest_stable_component_no_distance_cutoff",
+            residual="Phi=neighbor_prior+observable_projector*raw_field; nullspace_inherits_neighbor",
+            residual_prior="mean_squared_residual_over_fixed_amplitude_scale; stable_motion_unpenalized",
+            fragment_support="pure_followers_do_not_create_independent_sources; their_images_supervise_shared_donors",
+            structure_loss="reliable_learning_edges_only",
+            roles={"0": "unresolved", "1": "reliable_direct_or_neighbor_regularized", "3": "stable_neighbor_propagated"})
+    if config.training_fragment_config.get("strategy") == "component_field":
+        result.update(
+            parameters="complete_observed_components_use_own_control_field; donor_eligibility_is_separate",
+            fragment_transfer="sum_stable_neighbor weight*Phi_neighbor; no_rotation_extrapolation_no_cascades",
+            attachment_classification="own_field_component_size_and_any_effective_component_observation",
+            attachment_support="donors_only: min_component_size_controls_reliable_count_and_point_visibility_mass",
+            fragment_support="whole_unobserved_components_and_tiny_components_propagate; no_donor_zero_unresolved",
+            structure_loss="all_geometry_edges_within_own_field_components",
+            observation_refinement="disabled",
+            roles={**SEMANTICS["roles"], "3": "stable_neighbor_propagated"})
+        if config.training_fragment_config.get("min_learning_controls", 1) > 1:
+            result["attachment_classification"] = "own_field_component_size_minimum_controls_and_any_effective_component_observation"
+            result["control_eligibility"] = "count_at_fixed_coverage_radius_then_remove_whole_ineligible_components_from_network"
+    return result
+
+
+def _set_support_roles(arrays: dict[str, np.ndarray]) -> np.ndarray:
+    if any(name in arrays for name in ("t_motion_component_index", "p_source_mask", "h_source_mask", "u_own_field_mask")):
+        from .training_fragments import training_support_roles
+        roles, _ = training_support_roles(arrays, arrays["observation_view_mask"])
+    else:
+        roles, _ = support_roles(arrays["g_component_index"], arrays["observation_view_mask"])
+    arrays["support_class"] = roles
+    return roles
+
+
 def _prepare_observation_arrays(scene: Any, source: Mapping[str, Any], dense: Any,
                                 config: NeuralModesConfig, device: torch.device,
                                 alphas: np.ndarray, identifiable: np.ndarray,
                                 frozen_arrays: Mapping[str, np.ndarray] | None = None,
+                                flow_loader: Any = None,
                                 ) -> tuple[dict[str, np.ndarray], list[FrozenModalProjector], list[Any], list[np.ndarray], list[np.ndarray]]:
     from modal_gaussians.flow.artifact import load_flow_analysis_artifact, flow_artifact_identity
     from modal_gaussians.motion.common.projection import (
@@ -387,7 +521,7 @@ def _prepare_observation_arrays(scene: Any, source: Mapping[str, Any], dense: An
         if camera is None or camera.to_manifest_record()["camera_identity"] != view["camera_identity"]:
             raise ValueError("Neural reference camera identity differs")
         camera = camera.to(device)
-        flow = load_flow_analysis_artifact(dense_view["flow_artifact"])
+        flow = (flow_loader or load_flow_analysis_artifact)(dense_view["flow_artifact"])
         if flow_artifact_identity(flow) != view["flow_identity"]:
             raise ValueError("Neural sampling flow identity differs")
         if list(flow.arrays.mask_union.shape) != [camera.height, camera.width]:
@@ -484,6 +618,8 @@ def _prepare_observation_arrays(scene: Any, source: Mapping[str, Any], dense: An
 def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, Any]) -> None:
     """Check domains, support semantics and sparse geometry before loading weights."""
     from modal_gaussians.motion.neural.geometry_graph import GeometryGraph, ControlGraph
+    config = NeuralModesConfig.from_dict(manifest["config"])
+    training_fill = config.training_fragment_config is not None
     required = {
         "phi", "sample_prediction", "support_class", "alphas", "alpha_identifiable_mask",
         "observation_view_mask", "sample_pixels_xy", "sample_view_index", "view_sample_offsets",
@@ -493,12 +629,15 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
     }
     required.update("g_" + f.name for f in fields(GeometryGraph))
     required.update("c_" + f.name for f in fields(ControlGraph))
+    if training_fill:
+        from .training_fragments import array_names
+        required.update(array_names(config.training_fragment_config))
     selected_slots = None
     if "source_modes" in manifest or "mode_selection" in manifest:
         selected_slots = _source_mode_slots(manifest)
         required.update(PREFIX_NORMALIZATION_ARRAYS)
     if set(arrays) != required:
-        raise ValueError("Neural array inventory does not match the v8 schema")
+        raise ValueError("Neural array inventory does not match its schema")
     K, G, V = (int(manifest["counts"][name]) for name in ("modes", "foreground_gaussians", "views"))
     if min(K, G, V) <= 0:
         raise ValueError("Neural artifact counts must be positive")
@@ -523,8 +662,10 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
     for name in ("observation_view_mask", "alpha_identifiable_mask"):
         if arrays[name].dtype != np.bool_:
             raise ValueError(f"Neural {name} must be boolean")
-    if arrays["support_class"].dtype != np.int8 or not np.isin(arrays["support_class"], (0, 1, 2)).all():
+    if arrays["support_class"].dtype != np.int8 or not np.isin(arrays["support_class"], (0, 1, 2, 3) if training_fill else (0, 1, 2)).all():
         raise ValueError("Neural support classes are invalid")
+    if "a_view_visible" in arrays and arrays["a_view_visible"].shape != (G, V):
+        raise ValueError("Surface attachment view domain differs from observations")
     if not np.all(arrays["alphas"][:, 0] == 1) or not arrays["alpha_identifiable_mask"][:, 0].all():
         raise ValueError("Neural reference alpha gauge must remain one and identifiable")
     if arrays["scene_scale"].shape != () or arrays["measurement_rms_floor"].shape != ():
@@ -537,7 +678,11 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
                     & arrays["alpha_identifiable_mask"][:, None, :])
     if not np.array_equal(arrays["observation_view_mask"], expected_obs):
         raise ValueError("Neural observation support differs from renderer contribution")
-    roles, supported = support_roles(arrays["g_component_index"], expected_obs)
+    if training_fill:
+        from .training_fragments import training_support_roles
+        roles, supported = training_support_roles(arrays, expected_obs)
+    else:
+        roles, supported = support_roles(arrays["g_component_index"], expected_obs)
     if not np.array_equal(roles, arrays["support_class"]):
         raise ValueError("Neural support classes disagree with geometry connectivity")
     if np.any(arrays["phi"][~supported] != 0):
@@ -604,15 +749,23 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
     elif np.any(graph.edge_evidence_kind == 2):
         raise ValueError("Depth-filtered neural configuration cannot contain unfiltered spatial-prior edges")
     control = ControlGraph.from_dict({name[2:]: value for name, value in arrays.items() if name.startswith("c_")})
-    if (len(control.interpolation_indptr) != G + 1 or len(control.owner) != G
-            or np.any(control.control_point_index < 0) or np.any(control.control_point_index >= G)):
+    control_graph, control_count = graph, G
+    if training_fill:
+        from .training_fragments import validate_training_controls, host_subgraph
+        validate_training_controls(arrays, graph, geometry_config=_geometry_config(config),
+                                   fragment_config=config.training_fragment_config,
+                                   scene_scale=float(arrays["scene_scale"]))
+        control_graph = host_subgraph(graph, arrays["t_host_gaussian_index"])
+        control_count = len(control_graph.points)
+    if (len(control.interpolation_indptr) != control_count + 1 or len(control.owner) != control_count
+            or np.any(control.control_point_index < 0) or np.any(control.control_point_index >= control_count)):
         raise ValueError("Neural control and Gaussian index domains differ")
-    if not np.array_equal(control.positions, graph.points[control.control_point_index]):
+    if not np.array_equal(control.positions, control_graph.points[control.control_point_index]):
         raise ValueError("Neural control locations differ from foreground indices")
-    if not np.array_equal(control.component_index, graph.component_index[control.control_point_index]):
+    if not np.array_equal(control.component_index, control_graph.component_index[control.control_point_index]):
         raise ValueError("Neural control components differ from Gaussian geometry")
-    interpolation_rows = np.repeat(np.arange(G), np.diff(control.interpolation_indptr))
-    if np.any(graph.component_index[interpolation_rows] != control.component_index[control.interpolation_indices]):
+    interpolation_rows = np.repeat(np.arange(control_count), np.diff(control.interpolation_indptr))
+    if np.any(control_graph.component_index[interpolation_rows] != control.component_index[control.interpolation_indices]):
         raise ValueError("Neural interpolation crosses disconnected geometry")
     if not math.isclose(float(control.scene_scale), float(arrays["scene_scale"]), rel_tol=1e-7):
         raise ValueError("Neural geometry length scales differ")
@@ -623,7 +776,7 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
     for mode in range(K):
         valid = arrays["alpha_identifiable_mask"][mode]
         denominator = float(np.sum(np.abs(arrays["alphas"][mode, valid].astype(np.complex128)) ** 2 * view_sensitivity[valid]))
-        if denominator <= 0 or not np.any(roles[mode] == 1):
+        if denominator <= 0 or not np.any(expected_obs[mode].any(axis=1) & supported[mode]):
             raise ValueError("Neural mode has no effective observation sensitivity")
         expected_scale = max(1e-6 * float(arrays["scene_scale"]), math.sqrt(float(np.sum(expected_rms[mode, valid] ** 2)) / denominator))
         if not math.isclose(float(arrays["amplitude_scale"][mode]), expected_scale, rel_tol=1e-7):
@@ -653,6 +806,19 @@ def _check_persisted_sources(manifest: Mapping[str, Any], arrays: Mapping[str, n
     points = scene.foreground.active()["means"].detach().cpu().numpy()
     if not np.array_equal(points, arrays["g_points"]):
         raise ValueError("Neural foreground point order differs from static scene")
+    if "a_covariance" in arrays:
+        from .surface_attachments import scene_covariance
+        # Float32 CPU/CUDA activations differ by a few ulps. Off-diagonal
+        # covariance entries can nearly cancel, so scale error per matrix,
+        # not relative to those near-zero entries.
+        expected_covariance = scene_covariance(scene)
+        covariance_error = np.linalg.norm(expected_covariance - arrays["a_covariance"], axis=(1, 2))
+        covariance_scale = np.linalg.norm(expected_covariance, axis=(1, 2))
+        if np.any(covariance_error > 2e-6 * covariance_scale + 1e-15):
+            raise ValueError("Surface attachment covariance differs from static scene")
+        visible = arrays["contribution_mass"] > arrays["contribution_threshold"][None]
+        if np.any(arrays["a_view_visible"] & ~visible):
+            raise ValueError("Surface attachment visibility has no observed contribution")
     for view, modes in enumerate(dense.view_modes):
         lo, hi = arrays["view_sample_offsets"][view:view + 2]
         pixels = arrays["sample_pixels_xy"][lo:hi]
@@ -668,15 +834,20 @@ def _check_persisted_sources(manifest: Mapping[str, Any], arrays: Mapping[str, n
 
 
 def load_neural_completed_modes(path: str | Path) -> NeuralModesArtifact:
-    """Load v8, validate all sources, and reproduce baked phi from network weights."""
+    """Load v8/v10/v11/v12/v14 and reproduce baked phi from saved network weights."""
     from modal_gaussians.motion.neural.neural_field import evaluate_model
     root = Path(path).expanduser().resolve(strict=True)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     if (manifest.get("format") != COMPLETED_MODES_FORMAT or type(manifest.get("version")) is not int
-            or manifest["version"] != 8 or manifest.get("completion_method") != COMPLETION_METHOD):
+            or manifest["version"] not in (8, 10, 11, 12, 14, 16)):
         raise ValueError("Unsupported neural completed-mode artifact")
     config = NeuralModesConfig.from_dict(manifest["config"])
-    if manifest.get("semantics") != SEMANTICS or manifest.get("quality_gate") != QUALITY_GATE:
+    from .training_fragments import artifact_contract
+    training_fill = config.training_fragment_config is not None
+    version, method = artifact_contract(config.training_fragment_config)
+    if manifest["version"] != version or manifest.get("completion_method") != method:
+        raise ValueError("Unsupported neural artifact version/method/configuration combination")
+    if manifest.get("semantics") != _semantics(config) or manifest.get("quality_gate") != QUALITY_GATE:
         raise ValueError("Neural completed-mode semantics differ")
     if manifest.get("arrays_file") != ARRAYS_FILENAME or manifest.get("networks_file") != MODELS_FILENAME:
         raise ValueError("Neural artifact file names differ")
@@ -744,9 +915,12 @@ def _mode_diagnostics(arrays: Mapping[str, np.ndarray], mode: int) -> dict[str, 
         records.append({"view_index": view, "supervised": True,
                         "nrmse": math.sqrt(error / max(energy, 1e-24))})
     roles = arrays["support_class"][mode]
-    return {"mode_slot": mode, "full_render_modal_nrmse_fixed_alpha": math.sqrt(total_error / max(total_energy, 1e-24)),
+    result = {"mode_slot": mode, "full_render_modal_nrmse_fixed_alpha": math.sqrt(total_error / max(total_energy, 1e-24)),
             "per_view": records, "directly_supervised": int(np.sum(roles == 1)),
             "structure_inferred": int(np.sum(roles == 2)), "unresolved": int(np.sum(roles == 0))}
+    if "t_host_gaussian_index" in arrays:
+        result["fragment_propagated"] = int(np.sum(roles == 3))
+    return result
 
 
 def _prepare_work(work: Path, destination: Path, source: Mapping[str, Any],
@@ -816,12 +990,16 @@ def _publish_artifact(destination: Path, source: Mapping[str, Any], arrays: Mapp
             networks["source_mode_slots"] = _source_mode_slots(source).tolist()
         torch.save(networks, temporary / MODELS_FILENAME)
         mode_count, point_count, _ = arrays["phi"].shape
+        from .training_fragments import artifact_contract
+        training_fill = config.training_fragment_config is not None
+        version, method = artifact_contract(config.training_fragment_config)
         manifest = {
-            "format": COMPLETED_MODES_FORMAT, "version": 8, "completion_method": COMPLETION_METHOD,
+            "format": COMPLETED_MODES_FORMAT, "version": version,
+            "completion_method": method,
             **source, "source_identity": _source_identity(source), "config": config.to_dict(),
             "runtime": dict(runtime), "run_identity": run_identity, "geometry_graph": dict(graph_metadata),
             "producer": {"project_version": __version__, "created_utc": datetime.now(timezone.utc).isoformat(), "command": list(command)},
-            "semantics": SEMANTICS, "quality_gate": QUALITY_GATE,
+            "semantics": _semantics(config), "quality_gate": QUALITY_GATE,
             "counts": {"modes": mode_count, "foreground_gaussians": point_count, "views": arrays["alphas"].shape[1],
                        "geometry_edges": len(arrays["g_edge_index"]), "controls": len(arrays["c_positions"]),
                        "measurement_samples": len(arrays["sample_confidence"])},
@@ -832,6 +1010,9 @@ def _publish_artifact(destination: Path, source: Mapping[str, Any], arrays: Mapp
             "arrays_identity": _arrays_identity(arrays), "arrays_file_sha256": _sha256(temporary / ARRAYS_FILENAME),
             "networks_sha256": _sha256(temporary / MODELS_FILENAME),
         }
+        if training_fill:
+            from .training_fragments import diagnostics
+            manifest["diagnostics"]["training_fragments"] = diagnostics(arrays)
         manifest["completed_modes_identity"] = _identity(_artifact_identity_payload(manifest))
         _atomic_json(temporary / "manifest.json", manifest)
         load_neural_completed_modes(temporary)
@@ -849,11 +1030,15 @@ def _publish_artifact(destination: Path, source: Mapping[str, Any], arrays: Mapp
 def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | Path,
                                   measurements_dir: str | Path, graph_dir: str | Path,
                                   alignment_from: str | Path, work_dir: str | Path,
-                                  output_dir: str | Path, count: int,
+                                  output_dir: str | Path, count: int | None = None,
+                                  mode_slots: Sequence[int] | None = None,
+                                  flow_loader: Any = None,
                                   command: Sequence[str] = ()) -> NeuralModesArtifact:
-    """Bake a completed source prefix without modifying work or running optimization."""
+    """Bake a completed prefix or explicit selection with original normalization."""
     from modal_gaussians.motion.neural.neural_field import evaluate_model
-    if type(count) is not int or count <= 0:
+    if mode_slots is not None and count is not None:
+        raise ValueError("Specify either a prefix count or source mode slots")
+    if mode_slots is None and (type(count) is not int or count <= 0):
         raise ValueError("Neural prefix count must be a positive integer")
     work = Path(work_dir).expanduser().resolve(strict=True)
     destination = Path(output_dir).expanduser().resolve()
@@ -874,8 +1059,10 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
         if (destination == parent or destination.is_relative_to(parent) or parent.is_relative_to(destination)
                 or work == parent or work.is_relative_to(parent) or parent.is_relative_to(work)):
             raise ValueError("Neural prefix work/output must be disjoint from input artifacts")
-    if count > len(source["modes"]):
+    if mode_slots is None and count > len(source["modes"]):
         raise ValueError("Neural prefix count exceeds the complete source mode count")
+    slots = _validated_mode_slots(range(count) if mode_slots is None else mode_slots, len(source["modes"]))
+    count = len(slots)
     if not torch.cuda.is_available():
         raise RuntimeError("Full Gaussian neural prefix rendering requires CUDA")
     device = torch.device("cuda")
@@ -885,7 +1072,7 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
     if parent_contract != original_contract or frozen["sample_target"].shape[0] != len(source["modes"]):
         raise ValueError("Neural prefix work contract changed or its complete source count differs")
     checkpoints, payloads = [], []
-    for mode in range(count):
+    for mode in slots:
         checkpoint = work / f"mode_{mode:03d}.pt"
         if not checkpoint.is_file() or checkpoint.is_symlink():
             raise ValueError(f"Neural prefix requires completed checkpoint {checkpoint.name}")
@@ -908,17 +1095,18 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
         scene, source, dense, settings, device,
         np.asarray(alignment.arrays["alphas"], dtype=np.complex64),
         np.asarray(alignment.arrays["alpha_identifiable_mask"], dtype=bool), frozen_arrays=frozen,
+        flow_loader=flow_loader,
     )
-    arrays = {name: value[:count].copy() if name in MODE_ARRAYS else value for name, value in frozen.items()}
+    arrays = {name: value[slots].copy() if name in MODE_ARRAYS else value for name, value in frozen.items()}
     arrays["normalization_source_mode_view_rms"] = frozen["mode_view_rms"].copy()
     arrays["normalization_source_alpha_identifiable_mask"] = frozen["alpha_identifiable_mask"].copy()
-    selection = {"policy": "completed_prefix", "source_mode_slots": list(range(count)),
+    selection = {"policy": "completed_prefix" if mode_slots is None else "completed_selection", "source_mode_slots": slots,
                  "parent_run_identity": parent_contract["run_identity"],
                  "parent_fixed_arrays_identity": parent_contract["fixed_arrays_identity"],
                  "checkpoints": checkpoints}
     subset_source = {**source, "source_modes": source["modes"], "mode_selection": selection,
-                     "modes": [{**source["modes"][mode], "mode_slot": mode, "source_mode_slot": mode}
-                               for mode in range(count)]}
+                     "modes": [{**source["modes"][slot], "mode_slot": local, "source_mode_slot": slot}
+                               for local, slot in enumerate(slots)]}
     _source_mode_slots(subset_source)
     run_contract = {"format": "modal_gaussians.neural_modes_work", "version": 1,
                     "source_identity": _source_identity(subset_source), "config": settings.to_dict(),
@@ -930,10 +1118,12 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
     model_states, optimization = [], []
     for mode, payload in enumerate(payloads):
         state = payload["best_model_state"]
-        field = evaluate_model(state, _field_geometry(arrays, mode, device),
+        # Bake on the same CPU backend used by strict loading. CUDA scatter and
+        # GEMM roundoff can exceed elementwise tolerances near a mode's zeros.
+        field = evaluate_model(state, _field_geometry(arrays, mode, "cpu"),
                                length_scale=float(arrays["scene_scale"]),
                                amplitude_scale=float(arrays["amplitude_scale"][mode]),
-                               config=_field_config(settings, mode))[0]
+                               config=_field_config(settings, slots[mode]))[0].to(device)
         arrays["phi"][mode] = field.detach().cpu().numpy().astype(np.complex64)
         with torch.no_grad():
             for view, projector in enumerate(projectors):
@@ -944,7 +1134,7 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
         if not np.isfinite(arrays["phi"][mode]).all() or not np.isfinite(arrays["sample_prediction"][mode]).all():
             raise FloatingPointError("Neural prefix field or rendered prediction is non-finite")
         model_states.append(state)
-        optimization.append(dict(payload["summary"]))
+        optimization.append({**payload["summary"], "mode_slot": mode, "source_mode_slot": slots[mode]})
     for checkpoint in checkpoints:
         if _sha256(work / checkpoint["filename"]) != checkpoint["sha256"]:
             raise ValueError("Neural prefix checkpoints changed during export")
@@ -956,8 +1146,10 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
                                measurements_dir: str | Path, graph_dir: str | Path,
                                alignment_from: str | Path, work_dir: str | Path,
                                output_dir: str | Path, config: NeuralModesConfig | None = None,
-                               resume: bool = False, command: Sequence[str] = ()) -> NeuralModesArtifact:
-    """Train on explicit invocation only; bake independently learned fields as v8."""
+                               resume: bool = False, command: Sequence[str] = (),
+                               prepared_inputs: Any = None, timings: Any = None,
+                               mode_slots: Sequence[int] | None = None) -> NeuralModesArtifact:
+    """Train on explicit invocation only; bake the full field as v8 or v10."""
     from modal_gaussians.motion.neural.geometry_graph import (
         build_geometry_graph_arrays,
         build_control_graph,
@@ -968,7 +1160,10 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         train_single_frequency,
         evaluate_model,
     )
-    settings = config or NeuralModesConfig()
+    from .surface_attachments import SurfaceAttachmentConfig
+    settings = config or NeuralModesConfig(training_fragment_config=SurfaceAttachmentConfig().to_dict())
+    from modal_gaussians.iteration_cache import Timings
+    timings = timings or Timings()
     settings.validate()
     destination = Path(output_dir).expanduser().resolve()
     work = Path(work_dir).expanduser().resolve()
@@ -981,6 +1176,8 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         scene_dir=scene_dir, topology_dir=topology_dir, measurements_dir=measurements_dir,
         graph_dir=graph_dir, alignment_from=alignment_from,
     )
+    selected_slots = (list(range(len(source["modes"]))) if mode_slots is None else
+                      _validated_mode_slots(mode_slots, len(source["modes"])))
     runtime = {"device": "cuda", "torch_version": str(torch.__version__), "cuda_version": getattr(torch, "version").cuda,
                "gpu_name": torch.cuda.get_device_name(device)}
     frozen, previous_contract = None, None
@@ -988,12 +1185,19 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         frozen, previous_contract = _read_frozen_resume(work, source, settings, runtime)
         _prepare_work(work, destination, source, previous_contract, resume=True)
     report_progress("neural modes: freezing full-foreground observation renderer")
-    arrays, projectors, cameras, depths, alpha_images = _prepare_observation_arrays(
-        scene, source, dense, settings, device,
-        np.asarray(alignment.arrays["alphas"], dtype=np.complex64),
-        np.asarray(alignment.arrays["alpha_identifiable_mask"], dtype=bool),
-        frozen_arrays=frozen,
-    )
+    if prepared_inputs is not None:
+        arrays, projectors, cameras, depths, alpha_images = prepared_inputs.training_inputs(
+            source, scene, old_graph, settings, device, timings)
+        if frozen is not None and _arrays_identity(arrays) != _arrays_identity(frozen):
+            raise ValueError("Prepared fixed inputs differ from resumed work")
+        frozen = arrays
+    else:
+        arrays, projectors, cameras, depths, alpha_images = _prepare_observation_arrays(
+            scene, source, dense, settings, device,
+            np.asarray(alignment.arrays["alphas"], dtype=np.complex64),
+            np.asarray(alignment.arrays["alpha_identifiable_mask"], dtype=bool),
+            frozen_arrays=frozen,
+        )
     endpoint, jump = depth_thresholds_from_manifest(old_graph.manifest, [view["label"] for view in source["views"]])
     geometry_settings = _geometry_config(settings)
     if frozen is None:
@@ -1006,17 +1210,41 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
             rendered_depths=depths, rendered_alphas=alpha_images,
             endpoint_thresholds=endpoint, depth_jump_thresholds=jump, config=geometry_settings,
         )
-        controls = build_control_graph(graph, config=geometry_settings, scene_scale=float(arrays["scene_scale"]))
         arrays.update({"g_" + name: value for name, value in graph.as_dict().items()})
-        arrays.update({"c_" + name: value for name, value in controls.as_dict().items()})
-        roles, _ = support_roles(graph.component_index, arrays["observation_view_mask"])
-        arrays["support_class"] = roles
+        if settings.training_fragment_config is not None:
+            from .training_fragments import build_training_controls
+            attachment_inputs = None
+            if settings.training_fragment_config.get("strategy") == "surface":
+                from .surface_attachments import observation_inputs
+                attachment_inputs = observation_inputs(scene, cameras, depths, alpha_images, endpoint,
+                    arrays["contribution_mass"], arrays["contribution_threshold"])
+            if settings.training_fragment_config.get("strategy") == "pointwise":
+                attachment_inputs = {"p_observation_view_mask": arrays["observation_view_mask"]}
+            if settings.training_fragment_config.get("strategy") == "guarded":
+                from .guarded_attachments import observation_inputs
+                attachment_inputs = observation_inputs(arrays["g_points"], cameras, depths, alpha_images,
+                                                        endpoint, settings.alpha_minimum)
+                attachment_inputs.update(observation_view_mask=arrays["observation_view_mask"],
+                                         contribution_mass=arrays["contribution_mass"])
+            if settings.training_fragment_config.get("strategy") == "component_field":
+                from .component_field import observation_inputs
+                attachment_inputs = observation_inputs(arrays["g_points"], cameras, depths, alpha_images,
+                                                        endpoint, settings.alpha_minimum)
+                attachment_inputs.update(observation_view_mask=arrays["observation_view_mask"],
+                                         contribution_mass=arrays["contribution_mass"])
+            arrays.update(build_training_controls(graph, geometry_config=geometry_settings,
+                          fragment_config=settings.training_fragment_config, scene_scale=float(arrays["scene_scale"]),
+                          attachment_inputs=attachment_inputs))
+        else:
+            controls = build_control_graph(graph, config=geometry_settings, scene_scale=float(arrays["scene_scale"]))
+            arrays.update({"c_" + name: value for name, value in controls.as_dict().items()})
+        roles = _set_support_roles(arrays)
     else:
         from modal_gaussians.motion.neural.geometry_graph import GeometryGraph
         graph = GeometryGraph.from_dict({name[2:]: value for name, value in arrays.items() if name.startswith("g_")})
         roles = arrays["support_class"]
-    for mode in range(len(roles)):
-        if not np.any(roles[mode] == 1):
+    for mode in selected_slots:
+        if not np.any(arrays["observation_view_mask"][mode].any(axis=1) & (roles[mode] != 0)):
             raise ValueError(f"Neural mode {mode} has no effective Gaussian observation contribution")
     geometry_metadata = {
         "policy": ("all_foreground_mutual_knn_no_depth_filter" if settings.graph_edge_filter == "none"
@@ -1027,12 +1255,23 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         "interpolation": "all_graph_distance_supports_within_2h_normalized_wendland_c2",
         "control_edge_length": "original_geometry_graph_shortest_path",
     }
+    if settings.training_fragment_config is not None:
+        geometry_metadata["interpolation"] = (
+            "host_wendland_then_per_point_displacement_transfer"
+            if settings.training_fragment_config.get("strategy") in ("pointwise", "guarded", "component_field") else
+            "host_wendland_with_fixed_fragment_anchor_composition")
+        geometry_metadata["fragment_training"] = settings.training_fragment_config
+        from .training_fragments import diagnostics
+        report_progress("neural attachment preflight: " + json.dumps(diagnostics(arrays), allow_nan=False))
     run_contract = {"format": "modal_gaussians.neural_modes_work", "version": 1,
                     "source_identity": _source_identity(source), "config": settings.to_dict(), "runtime": runtime,
                     "geometry_graph": geometry_metadata, "fixed_arrays_identity": _arrays_identity(arrays)}
     run_identity = _identity(run_contract)
     run_contract["run_identity"] = run_identity
     _prepare_work(work, destination, source, run_contract, resume)
+    if settings.training_fragment_config is not None:
+        from .training_fragments import diagnostics
+        _atomic_json(work / "attachment_preflight.json", diagnostics(arrays))
     fixed_path = work / "fixed_inputs.npz"
     if fixed_path.exists():
         with np.load(fixed_path, allow_pickle=False) as archive:
@@ -1046,7 +1285,7 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
     arrays["phi"] = np.zeros((mode_count, len(graph.points), 3), dtype=np.complex64)
     arrays["sample_prediction"] = np.zeros((mode_count, sample_count, 2), dtype=np.complex64)
     model_states, optimization = [], []
-    for mode in range(mode_count):
+    for mode in selected_slots:
         checkpoint = work / f"mode_{mode:03d}.pt"
         payload = None
         if checkpoint.exists():
@@ -1081,16 +1320,24 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
                 report_progress(f"neural mode {mode + 1}/{mode_count}: step {step}")
 
             report_progress(f"neural mode {mode + 1}/{mode_count}: fitting {source['modes'][mode]['frequency_hz']:.6g} Hz")
-            fitted = train_single_frequency(
-                geometry, observations, length_scale=float(arrays["scene_scale"]),
-                amplitude_scale=float(arrays["amplitude_scale"][mode]), config=field_config,
-                resume_state=None if payload is None else payload["trainer_state"], checkpoint_callback=save_checkpoint,
-            )
+            with timings.stage("network_optimization", mode=mode):
+                fitted = train_single_frequency(
+                    geometry, observations, length_scale=float(arrays["scene_scale"]),
+                    amplitude_scale=float(arrays["amplitude_scale"][mode]), config=field_config,
+                    resume_state=None if payload is None else payload["trainer_state"], checkpoint_callback=save_checkpoint,
+                )
+            timings.records[-1]["iterations"] = fitted.iterations
             field, state = fitted.field, fitted.best_model_state
             summary = {"mode_slot": mode, "iterations": fitted.iterations, "best_step": fitted.best_step,
                        "best_loss": fitted.best_loss, "converged": fitted.converged, "history": fitted.history}
             _atomic_torch(checkpoint, {"run_identity": run_identity, "mode": mode, "complete": True,
                                        "trainer_state": fitted.latest_state, "best_model_state": state, "summary": summary})
+        # The saved network, baked field, and rendered predictions must all use
+        # the loader's CPU evaluation. Keep optimization and checkpoints on CUDA.
+        field = evaluate_model(state, _field_geometry(arrays, mode, "cpu"),
+                               length_scale=float(arrays["scene_scale"]),
+                               amplitude_scale=float(arrays["amplitude_scale"][mode]),
+                               config=field_config)[0].to(device)
         arrays["phi"][mode] = field.detach().cpu().numpy().astype(np.complex64)
         with torch.no_grad():
             for view, projector in enumerate(projectors):
@@ -1103,6 +1350,13 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
             raise FloatingPointError("Neural learned motion or rendered prediction is non-finite")
         model_states.append(state)
         optimization.append(summary)
+    if mode_slots is not None:
+        # Preserve the full frozen normalization contract and source-index seeds;
+        # only completed selected checkpoints are published, never zero placeholders.
+        return export_neural_prefix_artifact(scene_dir=scene_dir, topology_dir=topology_dir,
+            measurements_dir=measurements_dir, graph_dir=graph_dir, alignment_from=alignment_from,
+            work_dir=work, output_dir=destination, mode_slots=selected_slots, command=command,
+            flow_loader=None if prepared_inputs is None else prepared_inputs.flow)
     return _publish_artifact(destination, source, arrays, model_states, settings, runtime, run_identity,
                              geometry_metadata, optimization, command)
 

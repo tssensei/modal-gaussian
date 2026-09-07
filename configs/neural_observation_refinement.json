@@ -1,0 +1,8 @@
+{
+  "max_iterations": 20,
+  "prior_weight": 0.1,
+  "initial_step": 1.0,
+  "max_backtracking": 16,
+  "relative_tolerance": 0.000001,
+  "observable_rtol": 0.001
+}

@@ -451,7 +451,7 @@ def _smooth_homographies(
         upper = min(len(parameters), index + radius + 1)
         kernel_lower = lower - (index - radius)
         weights = kernel[kernel_lower : kernel_lower + (upper - lower)]
-        weights /= np.sum(weights)
+        weights = weights / np.sum(weights)
         output[index] = np.sum(parameters[lower:upper] * weights[:, None], axis=0)
     return [
         np.asarray(
@@ -464,6 +464,32 @@ def _smooth_homographies(
         )
         for value in output
     ]
+
+
+def _anchor_homographies(
+    homographies: list[np.ndarray], reference_index: int
+) -> np.ndarray:
+    """Keep the original reference pixel frame after temporal smoothing.
+
+    Apply one common change of output coordinates to every homography. Merely
+    resetting the reference matrix would introduce a discontinuity at that frame.
+    """
+    values = np.asarray(homographies, dtype=np.float64)
+    if values.ndim != 3 or values.shape[1:] != (3, 3) or not np.isfinite(values).all():
+        raise ValueError("Homographies must be finite [T,3,3] matrices")
+    if not 0 <= reference_index < len(values):
+        raise ValueError("Reference index is outside the homographies")
+    try:
+        reference_inverse = np.linalg.inv(values[reference_index])
+    except np.linalg.LinAlgError as error:
+        raise ValueError("Smoothed reference homography is singular") from error
+    anchored = reference_inverse[None] @ values
+    scale = anchored[:, 2, 2]
+    if not np.isfinite(anchored).all() or np.any(np.abs(scale) <= 1e-12):
+        raise ValueError("Cannot normalize reference-anchored homographies")
+    anchored = anchored / scale[:, None, None]
+    anchored[reference_index] = np.eye(3, dtype=np.float64)
+    return anchored
 
 
 def _stabilize_frames(
@@ -605,7 +631,7 @@ def _stabilize_frames(
     smoothed = _smooth_homographies(
         filled, config.temporal_smoothing_radius
     )
-    homographies = np.stack(smoothed, axis=0)
+    homographies = _anchor_homographies(smoothed, reference_index)
 
     stabilized_gray: DenseArray = (
         np.empty(shape, dtype=np.float32) if output_directory is None

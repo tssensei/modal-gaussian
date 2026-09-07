@@ -25,6 +25,7 @@ from modal_gaussians.flow.spectrum import exact_dft_basis
 from modal_gaussians.flow.storage import spatial_blocks
 from modal_gaussians.frequency import load_frequency_selection
 from modal_gaussians.progress import Progress
+from modal_gaussians.iteration_cache import DEFAULT_CACHE, load_entry, put_entry
 
 
 MODES_FORMAT = "modal_gaussians.complex_2d_modes"
@@ -220,14 +221,27 @@ def load_complex_2d_modes(path: str | Path) -> Complex2DModesArtifact:
     return Complex2DModesArtifact(root, manifest, tuple(loaded))
 
 
+def dense_cache_contract(flow_identity: str, frequencies_hz: np.ndarray) -> dict[str, Any]:
+    return {"implementation": "dense_exact_dft_v1", "flow_identity": flow_identity,
+            "frequencies_hz": np.asarray(frequencies_hz, dtype=np.float64).tolist(),
+            "transform": TRANSFORM_CONVENTION, "dtype": MODES_DTYPE.name}
+
+
 def _write_dense_exact_dft(
     artifact: FlowAnalysisArtifact,
     frequencies_hz: np.ndarray,
     destination: Path,
+    cache_dir: str | Path = DEFAULT_CACHE,
 ) -> None:
     """Write one view's full-image selected-frequency DFT directly to a memmap."""
 
     flow = artifact.arrays.flow
+    contract = dense_cache_contract(flow_artifact_identity(artifact), frequencies_hz)
+    cache_root = Path(cache_dir) / "dense_dft"
+    previous = load_entry(cache_root, contract)
+    if previous is not None:
+        np.save(destination, previous["modes"], allow_pickle=False)
+        return
     frame_count, height, width, _ = flow.shape
     basis, window = exact_dft_basis(
         frame_count,
@@ -266,6 +280,7 @@ def _write_dense_exact_dft(
         modes.flush()
     finally:
         del modes
+    put_entry(cache_root, contract, {"modes": np.load(destination, mmap_mode="r", allow_pickle=False)})
 
 
 def build_complex_2d_modes_artifact(

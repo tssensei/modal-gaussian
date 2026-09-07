@@ -1,6 +1,6 @@
 # Validation and recovery
 
-Read before executing the pipeline. Contents: input/resource preflight; CUDA probe; stage gates; headless final readiness; recovery and handoff.
+Reference for actual errors, changed inputs/environments, or explicit diagnostic requests. Routine runs rely on built-in stage validation; do not repeat these checklists, inspect visuals, or create extra verification scripts. Contents: input/resource preflight; CUDA probe; stage gates; 3D-mode completion and optional headless preview; recovery and handoff.
 
 ## Input and resource preflight
 
@@ -63,74 +63,36 @@ Every loader below is under `modal_gaussians`. Use it rather than manually decid
 
 | Stage | Loader | Evidence to record before continuing |
 | --- | --- | --- |
-| Flow | `flow.artifact.load_flow_analysis_artifact` and `flow_artifact_identity` | T/H/W/FPS/ref identity; nonempty valid mask; finite flow/spectrum; exactly zero reference flow; displacement percentiles, mask overlay and several representative frames. Inspect stabilization if used. |
+| Flow | `flow.artifact.load_flow_analysis_artifact` and `flow_artifact_identity` | T/H/W/FPS/ref identity; nonempty valid mask; finite flow/spectrum; exactly zero reference flow; existing flow diagnostics; visual assessment is left to the user. |
 | COLMAP | `static.load_static_dataset` | Every requested sampled sweep/ref registered; nonempty finite sparse cloud; reference labels; rigid poses and finite K; no foreground mask passed to feature extraction; copied RGB/masks unchanged. Check a few point reprojections and camera layout. |
-| Static | `static.load_static_scene(path, "cpu")` | Pure-tensor `weights_only=True` bundle; FG/BG identities/counts; training step/epoch/termination summary; sweep and refs used; finite loss and reasonable alpha/depth; every ref and representative sweep GT/render pairs. All-white/empty foreground or obviously wrong cameras are blockers, not a metric warning to ignore. |
+| Static | `static.load_static_scene(path, "cpu")` | Pure-tensor `weights_only=True` bundle; FG/BG identities/counts; training step/epoch/termination summary; sweep and refs used; finite loss and reasonable alpha/depth; saved numeric training diagnostics; do not inspect or rerender QA images during ordinary runs. |
 | Topology | `topology.load_observation_topology` | Per-view samples and contributor coverage; indices strictly within the frozen foreground domain; matching K/ref pixel geometry; finite weights and valid offsets. |
 | Frequency | `frequency.load_frequency_selection` | Exactly requested K unique candidates in greedy order; per-prefix macro/worst-view R2, rank, conditioning, energy and sample counts. Weak fit is a reported limitation; invalid/no observable motion is not successful reconstruction. |
 | Dense modes | `modes.load_complex_2d_modes` | Per-view complex64 `[K,H,W,2]`, unchanged order, signs/window/time convention. Compare selected topology pixels to direct exact-DFT values for a few modes, including an off-bin candidate when present. |
 | Measurements | `measurements.load_gaussian_measurements` | `[K,P,2]`, exact agreement with dense fields at sampled topology pixels and correct sample/view order. |
-| Structure graph | `structure_graph.load_observed_structure_graph` | Candidate/kept edges, component sizes, isolated nodes and accepted components; filtering reasons. Empty or unusable structure needs diagnosis, not automatic threshold relaxation. |
-| Rigid | `rigid.load_rigid_modes` | Per-mode identifiable views/complex alphas, overlap, solver residuals/rank/conditioning, trusted components and trusted Gaussian counts. Zero trusted support cannot be disguised as solved motion. |
-| Motion fill | `motion_fill.load_completed_modes` | Finite complex phi with frozen FG indexing; per-mode counts of trusted rigid, promoted rigid, pointwise fill and unresolved. Verify trusted seeds unchanged. Unresolved zeros are explicitly unsolved. |
-| Rendered design | `rendered_design.load_rendered_modal_design` | Sample counts per view, `[P,2,2K]`, real/imaginary sign and finite/nonzero projected energy; built-in render-linearity checks passed. All-zero columns will also break the spectrum data preparation. |
-| Direct coordinates | `direct_coordinates.load_direct_modal_coordinates` | Per-view frame offsets/FPS and mean-zero q; fit residual/R2 and conditioning; reconstruction uses `q(t)-q(ref)`; finite values across all frames. |
-| Physics post-fit | `physics_coordinates.load_physics_modal_coordinates` | Same K/view/FG identities; direct-vs-post-fit flow residuals/R2, coordinate deviation, oscillator/forcing diagnostics. Report regularization tradeoffs without expecting every fit metric to improve. |
-| Materialized result | `result.load_modal_result` | Static/mode/design/direct/physics cross-identities; exact coordinate kind; every linked source accessible; manifest result identity. Then run the headless readiness check below. |
+| Structure graph | `motion.rigid.structure_graph.load_observed_structure_graph` | Candidate/kept edges, component sizes, isolated nodes and accepted components; filtering reasons. Empty or unusable structure needs diagnosis, not automatic threshold relaxation. |
+| Rigid | `motion.rigid.rigid.load_rigid_modes` | Per-mode identifiable views/complex alphas, overlap, solver residuals/rank/conditioning, trusted components and trusted Gaussian counts. Zero trusted support cannot be disguised as solved motion. |
+| Neural preparation | `motion.neural.prepared.load_prepared` | Snapshot identity, fixed alpha/targets/normalization, source-frequency mapping, accepted baseline settings; matching independent caches. |
+| Neural modes | `motion.neural.neural_modes.load_neural_completed_modes` | Exactly requested frequency slots, finite complex64 `[K,G,3]`, foreground order, fixed alpha, network reconstruction, geometry/controls/interpolation, direct/structural/unresolved roles. |
+| Fragment propagation / final modes | `motion.neural.fragment_propagation.load_fragment_modes` or unified `motion.common.completed_modes.load_completed_modes` | Accepted attachment rules, immutable parent, unchanged hosts, explicit unresolved points, requested mode mapping. Record `modes_ready` and STOP for a default run. |
+| Optional rendered-design | `rendered_design.load_rendered_modal_design` | Only for a requested preview: source identities, sample counts, `[P,2,2K]`, signs and render-linearity checks. No time-coordinate solve. |
+| Optional preview | `motion.neural.preview.load_preview` | Independent scene/modes/design/prepared bindings; manual oscillation, no coordinates; publication checks only; no Viewer initialization or visual inspection. |
 
 Do not invent dataset-independent PSNR/R2/trust-coverage acceptance thresholds. Respect user-supplied criteria. Report measured quality and limitations and continue with usable provisional candidates; if a physical/observability failure prevents a meaningful result, ask for the necessary scientific decision. Structural corruption, mismatched identities and invalid geometry always block downstream consumption.
 
-## Final readiness without running Viser
+## Final mode completion
 
-A linked result manifest alone is insufficient for this repository's full viewer. The spectrum panel additionally loads measurement/topology/dense-mode/flow artifacts, the full rFFT, and **original reference RGBs from the image directories recorded in each flow manifest**. Keep those files available at their bound paths.
+Rely on the successful command and its built-in completed-modes validation; only when diagnosing an actual inconsistency, compare its ordered modes to the requested frequency/source slots. Check the scene/foreground identity, finite complex `phi`, geometry/control diagnostics, fixed alpha, support classes and fragment invariants using the loaders above. Report `modes_ready`; this is complete without time-dependent coordinates, rendered-design, full spectra or a Viewer.
 
-After all stage gates pass, run this headless check with the materialized result path as `sys.argv[1]`. It uses the actual viewer's data-preparation class but never constructs `ModalViserViewer`, `ViserServer`, or a browser. It validates all spectrum inputs, camera data, GPU tensor loading, finite deformations at representative frames, and one real static-scene rasterization per reference view. It does not validate UI behavior. The rasterization check is required because gsplat's Windows JIT backend may otherwise be initialized for the first time inside a Viewer worker.
+Do not run coordinate fitting as a “remaining validation” step and do not require coordinate-dependent optical-flow R². Report the training modal-image residual and structure/support diagnostics already available from the mode artifact. Existing baseline flow-fit scores are historical references, not mandatory new metrics.
 
-```python
-import json
-import sys
-import torch
-from modal_gaussians.vis.viewer import ModalViewerData
-from modal_gaussians.static import cameras_from_scene_manifest
+## Preview handoff
 
-data = ModalViewerData(sys.argv[1], device="cuda")
-assert len(data.cameras) == len(data.result.manifest["views"])
-reference_cameras = {
-    camera.label: camera
-    for camera in cameras_from_scene_manifest(data.scene.manifest)
-    if camera.role == "reference"
-}
-with torch.no_grad():
-    for index, view in enumerate(data.result.manifest["views"]):
-        frames = {0, int(view["reference_frame_index"]),
-                  int(view["frame_count"]) // 2, int(view["frame_count"]) - 1}
-        for frame in sorted(frames):
-            means = data.deformed_means(data.coordinate(index, frame))
-            assert means.shape == (data.scene.foreground.count, 3)
-            assert torch.isfinite(means).all(), (view["label"], frame)
-        camera = reference_cameras[view["label"]]
-        rendered = data.scene.render_deformed(
-            camera,
-            data.deformed_means(
-                data.coordinate(index, int(view["reference_frame_index"]))
-            ),
-        )
-        assert rendered["rgb"].shape == (camera.height, camera.width, 3)
-        assert all(torch.isfinite(value).all() for value in rendered.values())
-torch.cuda.synchronize()
-print(json.dumps({
-    "status": "viser_ready",
-    "viewer_started": False,
-    "modal_result_identity": data.result.manifest["modal_result_identity"],
-    "views": [view["label"] for view in data.result.manifest["views"]],
-    "mode_count": len(data.frequencies_hz),
-    "foreground_count": data.scene.foreground.count,
-}, indent=2))
-```
-
-Capture the readiness output in the run log. A temporary Python file is acceptable when the shell cannot conveniently pass this snippet and its argument; create it with the approved file editor, and remove only that disposable file afterwards. Do not launch the CLI `viewer` command as a test. If there is no GPU on the intended viewing host, state that requirement; a CPU-only artifact load is not proof of runtime readiness on a different host.
-
-The two Python blocks are probes/templates, not persistent test-suite additions. Check project source before execution if these internal APIs change; do not make the implementation conform to stale probe assumptions. Diagnose and fix readiness failures, then rerun the actual check automatically. If the probe is stale, update it while preserving the required coverage; never bypass a failing check or report readiness prematurely.
+`--stage preview` produces the rendered-design and independent preview artifact,
+with the pipeline's built-in source checks. Stop there and give the launch command.
+Do not initialize `ModalViewerData`, cycle phases/views, inspect images, or run
+headless visualization checks. Record `visualization_checked: false`; the user
+launches Viser and evaluates quality. No coordinates, extra PNGs or full spectra.
 
 ## Resume, output ownership, and code repairs
 
@@ -142,7 +104,8 @@ The [autonomous recovery rules](../SKILL.md#autonomous-repair-and-recovery) appl
 | Successful output already exists | Reload, verify requested inputs/config/code match, and skip. Never append or overwrite. |
 | Static training interrupted before export | Reuse its `work/static/resume.pt` with the identical command plus `--resume`. Reject input/config mismatch. This includes epoch/batch/seed settings. |
 | Static export exists but automatic QA failed | Validate bundle, run `static render` into a fresh QA directory, and retain the error in the run record. Do not retrain or overwrite the bundle just to fix QA. |
-| Rigid/motion-fill interrupted | Repeat the identical command with the same work directory; validated `mode_NNN.npz` entries resume automatically. Do not add an unsupported `--resume` flag. |
+| Historical rigid/motion-fill interrupted (only when selected) | Repeat the identical command with the same work directory; validated `mode_NNN.npz` entries resume automatically. Do not add an unsupported `--resume` flag. |
+| Neural iteration interrupted | Repeat the same prepared/config/output and selected `--stage modes` or requested `--stage preview`; valid stages and checkpoints are reused. Do not change to `full` during recovery. |
 | Other compute stage interrupted | There is no general resume flag. Inspect output/temporary state and live processes. Recompute the incomplete stage into a new unused attempt path if necessary; reuse its valid ancestors. |
 | COLMAP fails | Preserve the external CLI progress log and captured stdout/stderr: its temporary workspace/internal log is removed in `finally` on failure, and the exception contains only a log tail. Diagnose the command/input/environment or implementation defect, repair within the run contract, and rerun; do not assume the failed workspace survives. |
 | Output directory exists but is invalid | Do not delete user data or overwrite it. Record the failure and choose a fresh target; repair the actual cause and update downstream arguments. |
@@ -155,6 +118,6 @@ For a demonstrated implementation defect, make a minimal patch, run/fix focused 
 
 ## Run record and final handoff
 
-Keep one concise `run-status.md` with a stage table (`pending`, `running`, `repairing`, `validated`, `failed`, `blocked`), attempts/paths/identities, metric summaries, logs, code/config changes, process details, and next action. Retain failed attempts in the history while recording the active diagnostic/repair/retry action; use `blocked` only when progress actually requires unavailable input, access, resources, or a user decision. Write `viser_ready / viewer_not_started` only after the final check above. Include the exact launch command, expected local URL (not active), required interpreter/GPU, and the fact that linked ancestors/original reference RGBs must remain available.
+Keep one concise `run-status.md` with a stage table (`pending`, `running`, `repairing`, `validated`, `failed`, `blocked`), attempts/paths/identities, metric summaries, logs, code/config changes, process details, and next action. Retain failed attempts in the history while recording the active diagnostic/repair/retry action; use `blocked` only when progress actually requires unavailable input, access, resources, or a user decision. Write `modes_ready` after strict final-mode validation. Only for a requested preview, write `preview_ready / viewer_not_started` after successful preview publication, with visualization_checked: false and include the exact `viewer --preview` launch command. Retain linked source/cache/prepared dependencies; no coordinate-backed result is required.
 
 Do not claim that Viser was visually tested or that the scientific result was approved. If blocked, retain completed outputs and state the smallest missing input/decision plus a precise resume command. Merely writing a completion note or producing a synthetic scene never satisfies a real-data run request.

@@ -59,5 +59,15 @@
     "host": "127.0.0.1",
     "port": 8080,
     "resolution": 1024
+  },
+  "motion": {
+    "pipeline": "neural",
+    "stop_after": "modes",
+    "fit_modal_coordinates": false,
+    "baseline_result": null,
+    "prepared": null,
+    "prepare_config": null,
+    "iteration_config": null,
+    "cache_dir": null
   }
 }

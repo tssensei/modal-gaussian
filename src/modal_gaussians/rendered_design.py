@@ -445,6 +445,7 @@ def _load_sources(
     completed_modes_dir: str | Path,
     views: Sequence[RenderedDesignViewInput],
     device: torch.device,
+    flow_loader: Any = None,
 ) -> tuple[
     Path,
     ForegroundBackgroundScene,
@@ -501,7 +502,7 @@ def _load_sources(
         camera_identity = camera.to_manifest_record()["camera_identity"]
         if completed_view.get("camera_identity") != camera_identity:
             raise ValueError(f"Completed-mode camera identity for {label!r} differs")
-        flow = load_flow_analysis_artifact(
+        flow = (flow_loader or load_flow_analysis_artifact)(
             Path(source.flow_artifact).expanduser().resolve(strict=True)
         )
         flow_identity = flow_artifact_identity(flow)
@@ -550,6 +551,7 @@ def build_rendered_modal_design_artifact(
     output_dir: str | Path,
     config: RenderedDesignConfig | None = None,
     command: Sequence[str] = (),
+    flow_loader: Any = None,
 ) -> RenderedModalDesignArtifact:
     """Render completed full-foreground modes and publish the compact C16 artifact."""
 
@@ -568,7 +570,7 @@ def build_rendered_modal_design_artifact(
         cameras,
         flows,
         view_records,
-    ) = _load_sources(scene_dir, completed_modes_dir, views, device)
+    ) = _load_sources(scene_dir, completed_modes_dir, views, device, flow_loader=flow_loader)
     scene_manifest = scene.manifest
     if scene_manifest is None:
         raise ValueError("Static scene has no manifest")

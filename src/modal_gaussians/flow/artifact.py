@@ -16,6 +16,7 @@ from modal_gaussians import __version__
 from modal_gaussians.flow.storage import (
     DenseArray, copy_array, create_array, open_array, storage_sha256, validate_finite,
 )
+from modal_gaussians.iteration_cache import DEFAULT_CACHE, load_entry, put_entry
 
 
 ARTIFACT_FORMAT = "modal_gaussians.flow_analysis"
@@ -54,6 +55,7 @@ class FlowAnalysisArtifact:
     path: Path
     manifest: dict[str, Any]
     arrays: FlowAnalysisArrays
+    verified_hashes: dict[str, str] | None = None
 
 
 def flow_artifact_identity(artifact: FlowAnalysisArtifact) -> str:
@@ -79,7 +81,9 @@ def flow_artifact_identity(artifact: FlowAnalysisArtifact) -> str:
     for name in ARRAY_FILES:
         filename = str(manifest["arrays"][name]["file"])
         digest.update(name.encode("utf-8"))
-        digest.update(storage_sha256(artifact.path / filename).encode("ascii"))
+        checksum = (artifact.verified_hashes[name] if artifact.verified_hashes is not None
+                    else storage_sha256(artifact.path / filename))
+        digest.update(checksum.encode("ascii"))
     return digest.hexdigest()
 
 
@@ -165,7 +169,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
 
 
 def _validate_arrays(
-    arrays: Mapping[str, DenseArray], manifest: Mapping[str, Any]
+    arrays: Mapping[str, DenseArray], manifest: Mapping[str, Any], *, check_finite: bool = True
 ) -> None:
     for name in ARRAY_FILES:
         array = arrays[name]
@@ -189,8 +193,9 @@ def _validate_arrays(
         raise ValueError("Flow artifact mask_union is invalid or empty")
     if spectrum.shape != (frequency_count, height, width, 2):
         raise ValueError("Flow artifact spectrum shape is invalid")
-    for name in ("flow", "spectrum"):
-        validate_finite(arrays[name], f"Flow artifact {name}")
+    if check_finite:
+        for name in ("flow", "spectrum"):
+            validate_finite(arrays[name], f"Flow artifact {name}")
     reference_index = int(manifest["reference_frame_index"])
     if not np.array_equal(flow[reference_index], np.zeros_like(flow[reference_index])):
         raise ValueError("Flow artifact reference-to-reference flow is not exactly zero")
@@ -264,6 +269,11 @@ def _validate_stabilized_sequence(
         or not np.isfinite(homography_values).all()
     ):
         raise ValueError("Stabilized sequence homography array is invalid")
+    stabilization = manifest["parameters"]["stabilization"]
+    if stabilization.get("implementation_version", 1) >= 2 and not np.array_equal(
+        homography_values[int(manifest["reference_frame_index"])], np.eye(3)
+    ):
+        raise ValueError("Stabilized reference homography must be exactly identity")
     statistics = stabilized.get("statistics")
     if not isinstance(statistics, dict) or statistics.get("file") != "statistics.json":
         raise ValueError("Stabilized sequence statistics record is invalid")
@@ -275,20 +285,22 @@ def _validate_stabilized_sequence(
             raise ValueError("Stabilized sequence statistics root must be an object")
 
 
-def load_flow_analysis_artifact(path: str | Path) -> FlowAnalysisArtifact:
+def load_flow_analysis_artifact(path: str | Path, *, cache_dir: str | Path | None = DEFAULT_CACHE) -> FlowAnalysisArtifact:
     root = Path(path).expanduser()
     if not root.is_dir():
         raise FileNotFoundError(f"Flow artifact directory does not exist: {root}")
     manifest = _load_manifest(root)
     _validate_manifest(manifest)
     loaded: dict[str, Any] = {}
+    hashes: dict[str, str] = {}
     files = LEGACY_ARRAY_FILES if manifest["version"] == 6 else ARRAY_FILES
     for name, filename in files.items():
         array_path = root / filename
         if not array_path.exists():
             raise FileNotFoundError(f"Flow artifact is missing {filename}")
+        hashes[name] = storage_sha256(array_path)
         if manifest["version"] == ARTIFACT_VERSION:
-            if storage_sha256(array_path) != manifest["arrays"][name]["sha256"]:
+            if hashes[name] != manifest["arrays"][name]["sha256"]:
                 raise ValueError(f"Flow artifact {filename} SHA-256 differs")
         if name != "mask_union" and manifest["version"] == ARTIFACT_VERSION:
             array = open_array(array_path)
@@ -303,12 +315,19 @@ def load_flow_analysis_artifact(path: str | Path) -> FlowAnalysisArtifact:
             if not isinstance(array, np.ndarray):
                 raise ValueError(f"Flow artifact {filename} must contain one array")
         loaded[name] = array
-    _validate_arrays(loaded, manifest)
+    contract = {"validator": "flow_finite_v1", "hashes": hashes,
+                "arrays": manifest["arrays"]}
+    finite_root = None if cache_dir is None else Path(cache_dir) / "flow_validation"
+    previous = None if finite_root is None else load_entry(finite_root, contract)
+    _validate_arrays(loaded, manifest, check_finite=previous is None)
     _validate_stabilized_sequence(root, manifest, loaded)
+    if finite_root is not None and previous is None:
+        put_entry(finite_root, contract, {})
     return FlowAnalysisArtifact(
         path=root,
         manifest=manifest,
         arrays=FlowAnalysisArrays(**loaded),
+        verified_hashes=hashes,
     )
 
 
