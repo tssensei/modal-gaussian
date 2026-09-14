@@ -572,6 +572,11 @@ class ModalSpectrumPanel:
             options=controller.available_view_ids,
             initial_value=controller.view_id,
         )
+        self.frequency_range = server.gui.add_dropdown(
+            "Frequency range",
+            options=("full spectrum", "selected modes"),
+            initial_value="full spectrum",
+        )
         self.component = server.gui.add_dropdown(
             "Modal image component",
             options=("U", "V"),
@@ -598,6 +603,10 @@ class ModalSpectrumPanel:
         enable_all = server.gui.add_button("Enable all modes")
         self.status = server.gui.add_markdown(controller.status)
         self.load_spectrum = server.gui.add_button("Load full spectrum", visible=not controller.full_spectrum_ready)
+        server.gui.add_markdown(
+            "Both spectra show **mean 2D motion amplitude** on shared axes. "
+            "Reconstruction contains **trained frequencies only**, not a video FFT."
+        )
 
         @self.load_spectrum.on_click
         def _load(_) -> None:
@@ -625,7 +634,7 @@ class ModalSpectrumPanel:
                 float(controller.frequencies_hz[controller.reconstructed_index]),
                 maximum,
             ),
-            series=self._series("Original power", "#4c9aff"),
+            series=self._series("Original mean amplitude", "#4c9aff"),
             title=f"Original {controller.view_id} spectrum",
             scales=self._scales(maximum),
             legend=viser.uplot.Legend(show=True),
@@ -638,7 +647,7 @@ class ModalSpectrumPanel:
                 float(controller.frequencies_hz[controller.reconstructed_index]),
                 maximum,
             ),
-            series=self._series("Reconstructed power", "#ff9f43"),
+            series=self._series("Reconstructed mean amplitude", "#ff9f43"),
             title=f"Reconstructed {controller.view_id} spectrum",
             scales=self._scales(maximum),
             legend=viser.uplot.Legend(show=True),
@@ -670,6 +679,11 @@ class ModalSpectrumPanel:
             if not self._updating:
                 on_component_selected(str(self.component.value))
 
+        @self.frequency_range.on_update
+        def _(_) -> None:
+            if not self._updating:
+                self._refresh()
+
         @self.normalization.on_update
         def _(_) -> None:
             if not self._updating:
@@ -696,8 +710,14 @@ class ModalSpectrumPanel:
             viser.uplot.Series(label="Selected frequency", stroke="#ff3b30", width=1),
         )
 
+    def _frequency_limits(self) -> tuple[float, float]:
+        if self.frequency_range.value == "full spectrum":
+            frequencies = self.controller.raw_frequencies_hz
+            return float(frequencies[0]), float(frequencies[-1])
+        return self.controller.frequency_limits
+
     def _shared_power_max(self) -> float:
-        lower, upper = self.controller.frequency_limits
+        lower, upper = self._frequency_limits()
         raw_visible = (
             (self.controller.raw_frequencies_hz >= lower)
             & (self.controller.raw_frequencies_hz <= upper)
@@ -723,7 +743,7 @@ class ModalSpectrumPanel:
     def _scales(self, maximum: float) -> dict[str, viser.uplot.Scale]:
         return {
             "x": viser.uplot.Scale(
-                time=False, range=self.controller.frequency_limits
+                time=False, range=self._frequency_limits()
             ),
             "y": viser.uplot.Scale(range=(0.0, maximum)),
         }
