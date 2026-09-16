@@ -408,11 +408,22 @@ def publish_flow_analysis_artifact(
         with (temporary / "manifest.json").open("w", encoding="utf-8") as stream:
             json.dump(manifest, stream, indent=2, sort_keys=True, allow_nan=False)
             stream.write("\n")
-        load_flow_analysis_artifact(temporary)
+        validated = load_flow_analysis_artifact(temporary)
+        getattr(validated.arrays.flow, "store").close()
+        getattr(validated.arrays.spectrum, "store").close()
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"Flow artifact target already exists: {destination}")
         os.replace(temporary, destination)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    return load_flow_analysis_artifact(destination)
+    destination = destination.resolve()
+    return FlowAnalysisArtifact(
+        destination, validated.manifest,
+        FlowAnalysisArrays(
+            flow=open_array(destination / ARRAY_FILES["flow"]),
+            mask_union=validated.arrays.mask_union,
+            spectrum=open_array(destination / ARRAY_FILES["spectrum"]),
+        ),
+        verified_hashes=validated.verified_hashes,
+    )

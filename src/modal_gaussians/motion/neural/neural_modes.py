@@ -130,6 +130,7 @@ class NeuralModesArtifact:
     path: Path
     manifest: dict[str, Any]
     arrays: dict[str, np.ndarray]
+    rotation: np.ndarray | None = None
 
 
 def _canonical(value: Any) -> bytes:
@@ -614,10 +615,10 @@ def _prepare_observation_arrays(scene: Any, source: Mapping[str, Any], dense: An
     return arrays, projectors, cameras, depths, alpha_images
 
 
-def _validate_arrays(arrays, manifest):
+def _validate_arrays(arrays, manifest, *, check_field_geometry=True):
     """Stable entry point; format validation lives in artifacts.py."""
     from .artifacts import _validate_arrays as implementation
-    return implementation(arrays, manifest)
+    return implementation(arrays, manifest, check_field_geometry=check_field_geometry)
 
 
 def _check_persisted_sources(manifest, arrays):
@@ -760,7 +761,50 @@ def _publish_artifact(destination: Path, source: Mapping[str, Any], arrays: Mapp
         if temporary.exists() and temporary.parent == destination.parent.resolve() and temporary.name.startswith(f".{destination.name}."):
             shutil.rmtree(temporary)
         raise
-    return NeuralModesArtifact(destination, validated.manifest, validated.arrays)
+    return NeuralModesArtifact(destination, validated.manifest, validated.arrays, validated.rotation)
+
+
+def _prepare_mode_selection(work: Path, source: Mapping[str, Any], fixed: Mapping[str, np.ndarray],
+                            parent_contract: Mapping[str, Any], slots: Sequence[int], policy: str
+                            ) -> tuple[dict[str, Any], dict[str, np.ndarray], list[dict[str, Any]], str]:
+    checkpoints, payloads = [], []
+    for mode in slots:
+        checkpoint = work / f"mode_{mode:03d}.pt"
+        if not checkpoint.is_file() or checkpoint.is_symlink():
+            raise ValueError(f"Neural prefix requires completed checkpoint {checkpoint.name}")
+        checksum = _sha256(checkpoint)
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        if (payload.get("run_identity") != parent_contract["run_identity"]
+                or type(payload.get("mode")) is not int or payload["mode"] != mode
+                or payload.get("complete") is not True
+                or not isinstance(payload.get("best_model_state"), dict)
+                or not isinstance(payload.get("summary"), dict)
+                or type(payload["summary"].get("mode_slot")) is not int
+                or payload["summary"]["mode_slot"] != mode):
+            raise ValueError(f"Neural prefix checkpoint {checkpoint.name} is incomplete or has a different mode/run")
+        if _sha256(checkpoint) != checksum:
+            raise ValueError(f"Neural prefix checkpoint changed while reading: {checkpoint.name}")
+        checkpoints.append({"source_mode_slot": mode, "filename": checkpoint.name, "sha256": checksum})
+        payloads.append(payload)
+    mode_arrays = MODE_ARRAYS | {"phi", "sample_prediction"}
+    arrays = {name: value[slots].copy() if name in mode_arrays else value for name, value in fixed.items()}
+    arrays["normalization_source_mode_view_rms"] = fixed["mode_view_rms"].copy()
+    arrays["normalization_source_alpha_identifiable_mask"] = fixed["alpha_identifiable_mask"].copy()
+    selection = {"policy": policy, "source_mode_slots": list(slots),
+                 "parent_run_identity": parent_contract["run_identity"],
+                 "parent_fixed_arrays_identity": parent_contract["fixed_arrays_identity"],
+                 "checkpoints": checkpoints}
+    subset_source = {**source, "source_modes": source["modes"], "mode_selection": selection,
+                     "modes": [{**source["modes"][slot], "mode_slot": local, "source_mode_slot": slot}
+                               for local, slot in enumerate(slots)]}
+    _source_mode_slots(subset_source)
+    run_contract = {"format": "modal_gaussians.neural_modes_work", "version": 1,
+                    "source_identity": _source_identity(subset_source), "config": parent_contract["config"],
+                    "runtime": parent_contract["runtime"], "geometry_graph": parent_contract["geometry_graph"],
+                    "fixed_arrays_identity": _arrays_identity({name: value for name, value in arrays.items()
+                                                              if name not in ("phi", "sample_prediction")}),
+                    "mode_selection": selection}
+    return subset_source, arrays, payloads, _identity(run_contract)
 
 
 def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | Path,
@@ -807,25 +851,9 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
     frozen, parent_contract = _read_frozen_resume(work, source, settings, runtime)
     if parent_contract != original_contract or frozen["sample_target"].shape[0] != len(source["modes"]):
         raise ValueError("Neural prefix work contract changed or its complete source count differs")
-    checkpoints, payloads = [], []
-    for mode in slots:
-        checkpoint = work / f"mode_{mode:03d}.pt"
-        if not checkpoint.is_file() or checkpoint.is_symlink():
-            raise ValueError(f"Neural prefix requires completed checkpoint {checkpoint.name}")
-        checksum = _sha256(checkpoint)
-        payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        if (payload.get("run_identity") != parent_contract["run_identity"]
-                or type(payload.get("mode")) is not int or payload["mode"] != mode
-                or payload.get("complete") is not True
-                or not isinstance(payload.get("best_model_state"), dict)
-                or not isinstance(payload.get("summary"), dict)
-                or type(payload["summary"].get("mode_slot")) is not int
-                or payload["summary"]["mode_slot"] != mode):
-            raise ValueError(f"Neural prefix checkpoint {checkpoint.name} is incomplete or has a different mode/run")
-        if _sha256(checkpoint) != checksum:
-            raise ValueError(f"Neural prefix checkpoint changed while reading: {checkpoint.name}")
-        checkpoints.append({"source_mode_slot": mode, "filename": checkpoint.name, "sha256": checksum})
-        payloads.append(payload)
+    subset_source, arrays, payloads, run_identity = _prepare_mode_selection(
+        work, source, frozen, parent_contract, slots,
+        "completed_prefix" if mode_slots is None else "completed_selection")
     report_progress(f"neural prefix: baking {count} completed checkpoints with original frozen normalization")
     _, projectors, _, _, _ = _prepare_observation_arrays(
         scene, source, dense, settings, device,
@@ -833,22 +861,6 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
         np.asarray(alignment.arrays["alpha_identifiable_mask"], dtype=bool), frozen_arrays=frozen,
         flow_loader=flow_loader,
     )
-    arrays = {name: value[slots].copy() if name in MODE_ARRAYS else value for name, value in frozen.items()}
-    arrays["normalization_source_mode_view_rms"] = frozen["mode_view_rms"].copy()
-    arrays["normalization_source_alpha_identifiable_mask"] = frozen["alpha_identifiable_mask"].copy()
-    selection = {"policy": "completed_prefix" if mode_slots is None else "completed_selection", "source_mode_slots": slots,
-                 "parent_run_identity": parent_contract["run_identity"],
-                 "parent_fixed_arrays_identity": parent_contract["fixed_arrays_identity"],
-                 "checkpoints": checkpoints}
-    subset_source = {**source, "source_modes": source["modes"], "mode_selection": selection,
-                     "modes": [{**source["modes"][slot], "mode_slot": local, "source_mode_slot": slot}
-                               for local, slot in enumerate(slots)]}
-    _source_mode_slots(subset_source)
-    run_contract = {"format": "modal_gaussians.neural_modes_work", "version": 1,
-                    "source_identity": _source_identity(subset_source), "config": settings.to_dict(),
-                    "runtime": runtime, "geometry_graph": parent_contract["geometry_graph"],
-                    "fixed_arrays_identity": _arrays_identity(arrays), "mode_selection": selection}
-    run_identity = _identity(run_contract)
     arrays["phi"] = np.zeros((count, len(arrays["g_points"]), 3), dtype=np.complex64)
     arrays["sample_prediction"] = np.zeros_like(arrays["sample_target"])
     model_states, optimization = [], []
@@ -871,7 +883,7 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
             raise FloatingPointError("Neural prefix field or rendered prediction is non-finite")
         model_states.append(state)
         optimization.append({**payload["summary"], "mode_slot": mode, "source_mode_slot": slots[mode]})
-    for checkpoint in checkpoints:
+    for checkpoint in subset_source["mode_selection"]["checkpoints"]:
         if _sha256(work / checkpoint["filename"]) != checkpoint["sha256"]:
             raise ValueError("Neural prefix checkpoints changed during export")
     return _publish_artifact(destination, subset_source, arrays, model_states, settings, runtime,
@@ -1028,15 +1040,13 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
             payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
             if payload.get("run_identity") != run_identity or payload.get("mode") != mode:
                 raise ValueError("Neural checkpoint mode or run identity differs")
-        geometry = _field_geometry(arrays, mode, device)
         field_config = _field_config(settings, mode)
         if payload is not None and payload.get("complete") is True:
             state = payload["best_model_state"]
-            field = evaluate_model(state, geometry, length_scale=float(arrays["scene_scale"]),
-                                   amplitude_scale=float(arrays["amplitude_scale"][mode]), config=field_config)[0]
             summary = payload["summary"]
             report_progress(f"neural mode {mode + 1}/{mode_count}: reusing validated completed checkpoint")
         else:
+            geometry = _field_geometry(arrays, mode, device)
             observations = []
             for view, projector in enumerate(projectors):
                 if not arrays["alpha_identifiable_mask"][mode, view]:
@@ -1063,7 +1073,7 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
                     resume_state=None if payload is None else payload["trainer_state"], checkpoint_callback=save_checkpoint,
                 )
             timings.records[-1]["iterations"] = fitted.iterations
-            field, state = fitted.field, fitted.best_model_state
+            state = fitted.best_model_state
             summary = {"mode_slot": mode, "iterations": fitted.iterations, "best_step": fitted.best_step,
                        "best_loss": fitted.best_loss, "converged": fitted.converged, "history": fitted.history}
             _atomic_torch(checkpoint, {"run_identity": run_identity, "mode": mode, "complete": True,
@@ -1089,10 +1099,14 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
     if mode_slots is not None:
         # Preserve the full frozen normalization contract and source-index seeds;
         # only completed selected checkpoints are published, never zero placeholders.
-        return export_neural_prefix_artifact(scene_dir=scene_dir, topology_dir=topology_dir,
-            measurements_dir=measurements_dir, graph_dir=graph_dir, alignment_from=alignment_from,
-            work_dir=work, output_dir=destination, mode_slots=selected_slots, command=command,
-            flow_loader=None if prepared_inputs is None else prepared_inputs.flow)
+        source, arrays, payloads, run_identity = _prepare_mode_selection(
+            work, source, arrays, run_contract, selected_slots, "completed_selection")
+        model_states = [payload["best_model_state"] for payload in payloads]
+        optimization = [{**payload["summary"], "mode_slot": local, "source_mode_slot": slot}
+                        for local, (slot, payload) in enumerate(zip(selected_slots, payloads))]
+        for checkpoint in source["mode_selection"]["checkpoints"]:
+            if _sha256(work / checkpoint["filename"]) != checkpoint["sha256"]:
+                raise ValueError("Neural prefix checkpoints changed during export")
     return _publish_artifact(destination, source, arrays, model_states, settings, runtime, run_identity,
                              geometry_metadata, optimization, command)
 

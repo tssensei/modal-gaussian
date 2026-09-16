@@ -456,13 +456,14 @@ class ForegroundBackgroundScene(nn.Module):
         camera: Camera,
         foreground_means: Tensor,
         *,
+        foreground_quaternions: Tensor | None = None,
         foreground_colors: Tensor | None = None,
         include_background: bool = True,
     ) -> dict[str, Tensor]:
         """Render deformed foreground and static background with one depth order.
 
-        The modal viewer supplies only foreground means and, optionally, display
-        colors.  Every other Gaussian parameter remains the trained static value.
+        The modal viewer supplies foreground means and optional world-space
+        orientations and display colors, without modifying the trained scene.
         Foreground and background are concatenated before rasterization so their
         occlusion is identical to the public static ``composition="all"`` path.
         """
@@ -477,6 +478,16 @@ class ForegroundBackgroundScene(nn.Module):
             raise ValueError("foreground_means must have shape [G_foreground,3]")
         if not bool(torch.isfinite(means).all().item()):
             raise ValueError("foreground_means contain non-finite values")
+        quaternions = foreground["quaternions"]
+        if foreground_quaternions is not None:
+            quaternions = foreground_quaternions.to(device=device, dtype=quaternions.dtype).contiguous()
+            if quaternions.shape != foreground["quaternions"].shape:
+                raise ValueError("foreground_quaternions must have shape [G_foreground,4]")
+            norms = torch.linalg.vector_norm(quaternions, dim=-1, keepdim=True)
+            if not bool((torch.isfinite(quaternions).all() & torch.isfinite(norms).all()
+                         & (norms > 0).all()).item()):
+                raise ValueError("foreground_quaternions must be finite with nonzero finite norms")
+            quaternions = quaternions / norms
         if foreground_colors is None:
             colors = foreground["colors"]
         else:
@@ -491,7 +502,7 @@ class ForegroundBackgroundScene(nn.Module):
 
         active = {
             "means": means,
-            "quaternions": foreground["quaternions"],
+            "quaternions": quaternions,
             "scales": foreground["scales"],
             "colors": colors,
             "opacities": foreground["opacities"],

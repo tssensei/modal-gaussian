@@ -357,36 +357,13 @@ def load_rendered_modal_design(path: str | Path) -> RenderedModalDesignArtifact:
 
 
 def _view_diagnostics(
-    design: np.ndarray,
     alpha: np.ndarray,
     *,
     packing_max_abs_error: float,
     packing_relative_l2_error: float,
 ) -> dict[str, Any]:
-    """Compute bounded-memory Gram diagnostics for one view's design columns."""
+    """Record alpha coverage and direct-render packing verification."""
 
-    column_count = design.shape[-1]
-    gram = np.zeros((column_count, column_count), dtype=np.float64)
-    row_count = 0
-    for lower in range(0, len(design), FINITE_BLOCK_SAMPLES):
-        block = np.asarray(
-            design[lower : lower + FINITE_BLOCK_SAMPLES], dtype=np.float64
-        ).reshape(-1, column_count)
-        gram += block.T @ block
-        row_count += len(block)
-    eigenvalues = np.linalg.eigvalsh(gram)
-    singular_values = np.sqrt(np.maximum(eigenvalues, 0.0))[::-1]
-    tolerance = (
-        float(singular_values[0])
-        * max(row_count, column_count)
-        * np.finfo(np.float64).eps
-        if singular_values.size
-        else 0.0
-    )
-    rank = int(np.count_nonzero(singular_values > tolerance))
-    condition = None
-    if singular_values.size and singular_values[-1] > tolerance:
-        condition = float(singular_values[0] / singular_values[-1])
     alpha64 = alpha.astype(np.float64)
     return {
         "alpha": {
@@ -397,12 +374,6 @@ def _view_diagnostics(
             "max": float(alpha64.max()),
             "mean": float(alpha64.mean()),
         },
-        "design_column_rms": np.sqrt(
-            np.maximum(np.diag(gram), 0.0) / max(row_count, 1)
-        ).tolist(),
-        "singular_values": singular_values.tolist(),
-        "numerical_rank": rank,
-        "condition_number": condition,
         "packing_verification": {
             "max_abs_error": packing_max_abs_error,
             "relative_l2_error": packing_relative_l2_error,
@@ -760,7 +731,6 @@ def build_rendered_modal_design_artifact(
                         f"max={max_abs_error:.6g}, relative_l2={relative_l2_error:.6g}"
                     )
                 view_records[view_index]["diagnostics"] = _view_diagnostics(
-                    design[lower:upper],
                     sampled_alpha,
                     packing_max_abs_error=max_abs_error,
                     packing_relative_l2_error=relative_l2_error,
@@ -826,7 +796,9 @@ def build_rendered_modal_design_artifact(
             json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
             encoding="utf-8",
         )
-        load_rendered_modal_design(temporary)
+        validated = load_rendered_modal_design(temporary)
+        # Windows requires releasing the mapping before moving its directory.
+        getattr(validated.design, "_mmap").close()
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(
                 f"Rendered-design output already exists: {destination}"
@@ -835,7 +807,12 @@ def build_rendered_modal_design_artifact(
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    return load_rendered_modal_design(destination)
+    return RenderedModalDesignArtifact(
+        destination,
+        validated.manifest,
+        np.load(destination / DESIGN_FILENAME, mmap_mode="r", allow_pickle=False),
+        validated.samples,
+    )
 
 
 __all__ = [

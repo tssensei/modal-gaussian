@@ -1184,7 +1184,7 @@ def run_static_training(
     resume: bool = False,
     device: str | torch.device | None = None,
 ) -> Path:
-    """Validate inputs, train/resume the static scene, export it, and render QA."""
+    """Validate inputs, train/resume and export; QA uses the explicit render command."""
 
     config = StaticTrainConfig() if config is None else config
     config.validate()
@@ -1245,18 +1245,6 @@ def run_static_training(
     result = trainer.train()
     report_progress("static: exporting trained bundle")
     bundle = export_static_bundle(trainer, output_dir, result)
-    report_progress("static: rendering offline QA")
-    qa_dir = render_static_bundle(
-        scene_dir=bundle,
-        output_dir=work_dir / "qa",
-        role="all",
-        device=selected_device,
-    )
-    qa_metrics = json.loads((qa_dir / "metrics.json").read_text(encoding="utf-8"))
-    summary_path = bundle / "training_summary.json"
-    training_summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    training_summary["qa"] = qa_metrics
-    _atomic_json_write(training_summary, summary_path)
     return bundle
 
 

@@ -363,14 +363,17 @@ def build_gaussian_measurements_artifact(
             encoding="utf-8",
         )
         validated = load_gaussian_measurements(temporary)
-        del validated
+        getattr(validated.measurements, "_mmap").close()
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"Measurement output already exists: {destination}")
         os.replace(temporary, destination)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    return load_gaussian_measurements(destination)
+    return GaussianMeasurementsArtifact(
+        destination, validated.manifest,
+        np.load(destination / MEASUREMENTS_FILENAME, mmap_mode="r", allow_pickle=False),
+    )
 
 
 __all__ = [

@@ -65,6 +65,19 @@ SUPPORT_COLORS = np.asarray(
 )
 
 
+def _rotate_gaussian_quaternions(base: Tensor, rotation_vectors: Tensor) -> Tensor:
+    """Left-compose world rotation vectors with static wxyz orientations."""
+    angles = torch.linalg.vector_norm(rotation_vectors, dim=-1, keepdim=True)
+    scalar = torch.cos(angles / 2)
+    vector = 0.5 * torch.sinc(angles / (2 * math.pi)) * rotation_vectors
+    real, imaginary = base[:, :1], base[:, 1:]
+    rotated = torch.cat((scalar * real - (vector * imaginary).sum(dim=-1, keepdim=True),
+                         scalar * imaginary + real * vector
+                         + torch.linalg.cross(vector, imaginary, dim=-1)), dim=-1)
+    rotated = torch.nn.functional.normalize(rotated, dim=-1)
+    return torch.where(angles == 0, base, rotated)
+
+
 def _stable_uniform_indices(count: int, maximum: int) -> np.ndarray:
     """Select a deterministic uniform subset without reordering its indices."""
 
@@ -473,6 +486,13 @@ class ModalViewerData:
         self.phi = torch.from_numpy(
             np.asarray(self.result.completed_modes.arrays["phi"])
         ).to(self.device)
+        rotation = self.result.completed_modes.rotation
+        self.rotation = None
+        if rotation is not None:
+            if (rotation.dtype != np.complex64 or rotation.shape != tuple(self.phi.shape)
+                    or not np.isfinite(rotation).all()):
+                raise ValueError("Viewer rotation modes must be finite complex64 [K,G,3]")
+            self.rotation = torch.from_numpy(rotation).to(self.device)
         self.coordinates = None if preview else np.asarray(
             self.result.coordinates.coordinates, dtype=np.complex64
         )
@@ -584,6 +604,25 @@ class ModalViewerData:
         offset = torch.einsum("k,kgc->gc", q_tensor.real, self.phi.real)
         offset -= torch.einsum("k,kgc->gc", q_tensor.imag, self.phi.imag)
         return self.scene.foreground.active()["means"] + float(scale) * offset
+
+    def deformed_quaternions(self, q: np.ndarray, scale: float = 1.0) -> Tensor | None:
+        """Derive orientations from the same modal coefficients as the centers."""
+        if self.rotation is None:
+            return None
+        values = np.array(q, dtype=np.complex64, copy=True)
+        if values.shape != (len(self.frequencies_hz),):
+            raise ValueError("Viewer modal coordinate has the wrong mode count")
+        if not np.isfinite(values).all() or not math.isfinite(scale):
+            raise ValueError("Viewer modal coordinate and scale must be finite")
+        if scale == 0 or not np.any(values):
+            return None
+        coefficients = torch.from_numpy(values).to(self.device)
+        angles = torch.einsum("k,kgc->gc", coefficients.real, self.rotation.real)
+        angles -= torch.einsum("k,kgc->gc", coefficients.imag, self.rotation.imag)
+        # ponytail: blended control rotation is a kinematic prior; infer local
+        # rotations from center motion if this approximation fails visually.
+        return _rotate_gaussian_quaternions(
+            self.scene.foreground.active()["quaternions"], float(scale) * angles)
 
     def phase_colors(
         self,
@@ -843,6 +882,11 @@ class ModalViserViewer:
                 step=0.001,
                 initial_value=0.04,
             )
+            self.rotate_ellipsoids = self.server.gui.add_checkbox(
+                "Rotate Gaussian ellipsoids", self.data.rotation is not None,
+                disabled=self.data.rotation is None,
+            )
+            self.rotate_ellipsoids.on_update(self.request_render)
             disable_all = self.server.gui.add_button("Turn off all modes")
             modes_by_index: dict[int, dict[str, Any]] = {}
             for display_index, mode_index in enumerate(self.data.frequency_order):
@@ -1491,6 +1535,9 @@ class ModalViserViewer:
         rendered = self.data.scene.render_deformed(
             camera,
             means,
+            foreground_quaternions=(
+                self.data.deformed_quaternions(q, scale) if self.rotate_ellipsoids.value else None
+            ),
             foreground_colors=colors,
             include_background=(
                 self.hide_background is None or not bool(self.hide_background.value)

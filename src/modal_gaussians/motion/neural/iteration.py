@@ -200,7 +200,6 @@ def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slot
         outputs["propagation_modes"] = str(propagation_path)
     if stage == "modes":
         atomic_json(root / "outputs.json", outputs)
-        atomic_json(root / "diagnostics.json", completed.manifest["diagnostics"])
         atomic_json(root / "status.json", {"status": "modes_ready", "viewer_started": False,
                                           "stage_requested": stage, "outputs": outputs})
         return root
@@ -258,7 +257,6 @@ def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slot
                 data.spectrum.load_full_spectrum(label)
             del data
     atomic_json(root / "outputs.json", outputs)
-    atomic_json(root / "diagnostics.json", completed.manifest["diagnostics"])
     atomic_json(root / "status.json", {"status": "preview_ready" if stage == "preview" else "viser_ready",
                                       "viewer_started": False, "visualization_checked": False,
                                       "stage_requested": stage, "outputs": outputs})

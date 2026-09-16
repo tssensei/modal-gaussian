@@ -379,9 +379,9 @@ run. RGB is ignored only in the uncertain eroded mask boundary. Depth inputs
 and the inverse-depth losses are deliberately not connected yet; all depth
 weights remain zero until the aligned-depth artifact is specified.
 
-The work directory stores `resume.pt` and, after training, an offline `qa/`
-render set. Resume only when the joint-COLMAP input and all resolved training
-settings are unchanged:
+The work directory stores `resume.pt`. Training ends after exporting the scene;
+offline QA is run explicitly with `static render`. Resume only when the
+joint-COLMAP input and all resolved training settings are unchanged:
 
 ```powershell
 modal-gaussians static train `
@@ -394,7 +394,9 @@ modal-gaussians static train `
 The published `static_scene/` contains only `manifest.json`, a class-free
 `tensors.pt`, and `training_summary.json`. It contains separate, stable final
 foreground and background index domains and no trajectory, motion-basis, or
-modal placeholder state. Render the stored sweep/reference cameras again with:
+modal placeholder state. Its training summary does not include automatic QA
+metrics. Render the stored sweep/reference cameras and save QA images, depth
+and metrics with:
 
 ```powershell
 modal-gaussians static render `
@@ -1622,7 +1624,9 @@ artifact still records its own selection/topology provenance. Prepared iteration
 read mask/metadata snapshots rather than opening full flow/spectrum arrays.
 
 Each experiment records `iteration.json`, `overrides.json`, `outputs.json`,
-`diagnostics.json`, `status.json` and per-stage timing reports. Timing records
+`status.json` and per-stage timing reports. Diagnostics are stored in the
+completed artifact's `manifest.json`; `outputs.json` identifies that artifact.
+Existing standalone diagnostic reports are left untouched. Timing records
 include cache hits, training steps, instrumented bytes and Windows process read
 transfers (not physical disk throughput). Nested stage timings overlap and must
 not be summed as independent wall time. A complete result still references its

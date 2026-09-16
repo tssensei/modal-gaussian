@@ -399,14 +399,19 @@ def build_complex_2d_modes_artifact(
             encoding="utf-8",
         )
         validated = load_complex_2d_modes(temporary)
-        del validated
+        for modes in validated.view_modes:
+            getattr(modes, "_mmap").close()
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"Complex mode output already exists: {destination}")
         os.replace(temporary, destination)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    return load_complex_2d_modes(destination)
+    return Complex2DModesArtifact(
+        destination, validated.manifest,
+        tuple(np.load(destination / view["modes_file"], mmap_mode="r", allow_pickle=False)
+              for view in validated.manifest["views"]),
+    )
 
 
 __all__ = [

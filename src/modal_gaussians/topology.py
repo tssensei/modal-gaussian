@@ -699,7 +699,7 @@ def _publish_topology(
     arrays: TopologyArrays,
     manifest: dict[str, Any],
 ) -> ObservationTopologyArtifact:
-    """Atomically publish and reload a two-file topology artifact."""
+    """Validate a two-file topology artifact once before atomic publication."""
 
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"Topology output already exists: {destination}")
@@ -728,14 +728,14 @@ def _publish_topology(
             json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
             encoding="utf-8",
         )
-        load_observation_topology(temporary)
+        validated = load_observation_topology(temporary)
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"Topology output already exists: {destination}")
         os.replace(temporary, destination)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    return load_observation_topology(destination)
+    return ObservationTopologyArtifact(destination.resolve(), validated.manifest, validated.arrays)
 
 
 def build_observation_topology_artifact(

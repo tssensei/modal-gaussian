@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from modal_gaussians.iteration_cache import (
-    DEFAULT_CACHE, Timings, atomic_json, cached, identity, put_entry, sha256, module_revision,
+    DEFAULT_CACHE, Timings, atomic_json, cached, identity, sha256, module_revision,
 )
 from modal_gaussians.numpy_io import save_named_arrays
 from modal_gaussians.flow.artifact import FlowAnalysisArtifact, FlowAnalysisArrays, flow_artifact_identity, load_flow_analysis_artifact
@@ -198,7 +198,6 @@ def prepare_neural(*, output_dir, cache_dir=DEFAULT_CACHE, from_result=None,
                    alignment_from=None, config=None, config_overrides=None, timer=None):
     from modal_gaussians.result import load_modal_result
     from modal_gaussians.vis.spectrum import _read_reference_rgb
-    from modal_gaussians.modes import dense_cache_contract
     from .baseline import new_training_config
     from .component_field import ComponentFieldConfig
     from modal_gaussians.motion.common.projection import RenderedDesignConfig
@@ -254,7 +253,6 @@ def prepare_neural(*, output_dir, cache_dir=DEFAULT_CACHE, from_result=None,
             graph_dir=graph_dir, alignment_from=alignment_from)
     arrays, flows, loaded_flows = {}, [], {}
     with timer.stage("flow_validation_and_snapshot"):
-        frequencies = np.array([m["frequency_hz"] for m in source["modes"]])
         for index, view in enumerate(dense.manifest["views"]):
             flow = load_flow_analysis_artifact(view["flow_artifact"], cache_dir=cache_dir)
             flow_id = flow_artifact_identity(flow)
@@ -265,7 +263,6 @@ def prepare_neural(*, output_dir, cache_dir=DEFAULT_CACHE, from_result=None,
             arrays[f"v{index}_rgb"] = _read_reference_rgb(flow)
             flows.append({"path": str(flow.path.resolve()), "manifest": flow.manifest,
                           "hashes": flow.verified_hashes, "identity": flow_id})
-            put_entry(cache_dir / "dense_dft", dense_cache_contract(flow_id, frequencies), {"modes": dense.view_modes[index]})
     with timer.stage("observation_preparation"):
         observed, projectors, _, depths, alpha_images = nm._prepare_observation_arrays(
             scene, source, dense, config, torch.device("cuda"), alignment.arrays["alphas"],

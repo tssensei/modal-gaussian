@@ -9,7 +9,8 @@ import numpy as np
 import torch
 from . import neural_modes as nm
 
-def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, Any]) -> None:
+def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, Any],
+                     *, check_field_geometry: bool = True) -> None:
     """Check domains, support semantics and sparse geometry before loading weights."""
     from modal_gaussians.motion.neural.geometry_graph import GeometryGraph, ControlGraph
     config = nm.NeuralModesConfig.from_dict(manifest["config"])
@@ -96,7 +97,6 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
         raise ValueError("Neural alpha confidence or contribution mass is invalid")
     if np.any(arrays["sample_projection_sensitivity"] < 0):
         raise ValueError("Neural projection sensitivity must be nonnegative")
-    config = nm.NeuralModesConfig.from_dict(manifest["config"])
     expected_rms = np.zeros((K, V), dtype=np.float64)
     for view in range(V):
         lower, upper = offsets[view:view + 2]
@@ -176,7 +176,8 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
         expected_scale = max(1e-6 * float(arrays["scene_scale"]), math.sqrt(float(np.sum(expected_rms[mode, valid] ** 2)) / denominator))
         if not math.isclose(float(arrays["amplitude_scale"][mode]), expected_scale, rel_tol=1e-7):
             raise ValueError("Neural amplitude scale differs from fixed projection sensitivity")
-        nm._field_geometry(arrays, mode)
+        if check_field_geometry:
+            nm._field_geometry(arrays, mode)
 
 
 def _check_persisted_sources(manifest: Mapping[str, Any], arrays: Mapping[str, np.ndarray]) -> None:
@@ -275,18 +276,23 @@ def load_neural_completed_modes(path: str | Path) -> nm.NeuralModesArtifact:
     expected_run = nm._identity(run_contract)
     if expected_run != manifest["run_identity"]:
         raise ValueError("Neural run identity differs from resolved inputs and configuration")
-    nm._validate_arrays(arrays, manifest)
+    # Network replay constructs and validates each field geometry below.
+    nm._validate_arrays(arrays, manifest, check_field_geometry=False)
     nm._check_persisted_sources(manifest, arrays)
     networks = torch.load(root / nm.MODELS_FILENAME, map_location="cpu", weights_only=True)
     if networks.get("run_identity") != manifest["run_identity"] or len(networks.get("model_states", [])) != len(manifest["modes"]):
         raise ValueError("Neural network inventory/run identity differs")
     if "mode_selection" in manifest and networks.get("source_mode_slots") != slots.tolist():
         raise ValueError("Neural network source mode order differs from completed prefix")
+    # Derived at load time; the historical disk schema and identities stay unchanged.
+    rotation = np.empty_like(arrays["phi"]) if manifest["version"] == 16 else None
     for mode, state in enumerate(networks["model_states"]):
         evaluated = evaluate_model(state, nm._field_geometry(arrays, mode), length_scale=float(arrays["scene_scale"]),
                                    amplitude_scale=float(arrays["amplitude_scale"][mode]), config=nm._field_config(config, int(slots[mode])))
         reproduced = evaluated[0].detach().cpu().numpy()
         if not np.allclose(reproduced, arrays["phi"][mode], rtol=3e-5, atol=1e-7 * float(arrays["amplitude_scale"][mode])):
             raise ValueError(f"Neural baked phi differs from network for mode {mode}")
-    return nm.NeuralModesArtifact(root, manifest, arrays)
+        if rotation is not None:
+            rotation[mode] = evaluated[1].detach().cpu().numpy()
+    return nm.NeuralModesArtifact(root, manifest, arrays, rotation)
 
