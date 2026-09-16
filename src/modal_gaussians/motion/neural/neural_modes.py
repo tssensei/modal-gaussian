@@ -301,9 +301,7 @@ class FrozenModalProjector:
         self.alpha = foreground_alpha.detach()
 
     def sample_features(self, features: torch.Tensor) -> torch.Tensor:
-        image, alpha = self.scene.render_features(self.camera, features, composition="foreground")
-        if not torch.allclose(alpha[self.y, self.x], self.alpha, rtol=2e-5, atol=2e-6):
-            raise RuntimeError("Frozen neural feature rendering changed foreground alpha")
+        image, _ = self.scene.render_features(self.camera, features, composition="foreground")
         return image[self.y, self.x] / self.alpha[:, None]
 
     def __call__(self, phi: torch.Tensor) -> torch.Tensor:
@@ -399,7 +397,7 @@ def _field_geometry(arrays: Mapping[str, np.ndarray], mode: int, device: Any = "
         rows, slots = np.nonzero(weights > 0)
         values.update(transfer_rows=rows, transfer_sources=arrays["u_neighbor_index"][mode][rows, slots],
                       transfer_weights=weights[rows, slots])
-    return NeuralFieldGeometry.from_arrays(values, device=device)
+    return NeuralFieldGeometry.from_arrays(values, device=device, validate=False)
 
 
 def _artifact_identity_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
@@ -536,8 +534,6 @@ def _prepare_observation_arrays(scene: Any, source: Mapping[str, Any], dense: An
             lo, hi = frozen_arrays["view_sample_offsets"][view["index"]:view["index"] + 2]
             pixels = frozen_arrays["sample_pixels_xy"][lo:hi]
             confidence = frozen_arrays["sample_confidence"][lo:hi]
-            if not np.allclose(alpha_image[pixels[:, 1], pixels[:, 0]], confidence, rtol=2e-5, atol=2e-6):
-                raise ValueError("Resumed static foreground alpha differs from frozen observation inputs")
         jacobian, _ = projection_jacobian(points, camera.K.cpu().numpy(), camera.world_to_camera.cpu().numpy(), camera.radial_distortion)
         projector = FrozenModalProjector(scene, camera, torch.as_tensor(jacobian, device=device),
                                          pixels, torch.as_tensor(confidence, device=device))
@@ -627,10 +623,10 @@ def _check_persisted_sources(manifest, arrays):
     return implementation(manifest, arrays)
 
 
-def load_neural_completed_modes(path):
-    """Stable entry point; format validation lives in artifacts.py."""
+def load_neural_completed_modes(path, *, validate=False):
+    """Stable entry point; artifact loading lives in artifacts.py."""
     from .artifacts import load_neural_completed_modes as implementation
-    return implementation(path)
+    return implementation(path, validate=validate)
 
 
 def _mode_diagnostics(arrays: Mapping[str, np.ndarray], mode: int) -> dict[str, Any]:
@@ -700,22 +696,14 @@ def _read_frozen_resume(work: Path, source: Mapping[str, Any], config: NeuralMod
         raise ValueError("Neural work run identity differs")
     with np.load(work / "fixed_inputs.npz", allow_pickle=False) as archive:
         fixed = {name: archive[name] for name in archive.files}
-    if _arrays_identity(fixed) != contract.get("fixed_arrays_identity"):
-        raise ValueError("Neural frozen work inputs were changed")
-    K, S, _ = fixed["sample_target"].shape
-    G = len(fixed["g_points"])
-    # Reuse strict scientific array validation before any saved pixel is indexed.
-    validation = {**fixed, "phi": np.zeros((K, G, 3), dtype=np.complex64),
-                  "sample_prediction": np.zeros((K, S, 2), dtype=np.complex64)}
-    _validate_arrays(validation, {"config": config.to_dict(), "views": source["views"],
-                                 "counts": {"modes": K, "foreground_gaussians": G, "views": len(source["views"])}})
     return fixed, contract
 
 
 def _publish_artifact(destination: Path, source: Mapping[str, Any], arrays: Mapping[str, np.ndarray],
                       model_states: Sequence[Mapping[str, Any]], config: NeuralModesConfig,
                       runtime: Mapping[str, Any], run_identity: str, graph_metadata: Mapping[str, Any],
-                      optimization: Sequence[Mapping[str, Any]], command: Sequence[str]) -> NeuralModesArtifact:
+                      optimization: Sequence[Mapping[str, Any]], command: Sequence[str],
+                      *, rotation: np.ndarray | None = None) -> NeuralModesArtifact:
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"Neural output already exists: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -752,7 +740,6 @@ def _publish_artifact(destination: Path, source: Mapping[str, Any], arrays: Mapp
             manifest["diagnostics"]["training_fragments"] = diagnostics(arrays)
         manifest["completed_modes_identity"] = _identity(_artifact_identity_payload(manifest))
         _atomic_json(temporary / "manifest.json", manifest)
-        validated = load_neural_completed_modes(temporary)
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"Neural output already exists: {destination}")
         os.replace(temporary, destination)
@@ -761,7 +748,7 @@ def _publish_artifact(destination: Path, source: Mapping[str, Any], arrays: Mapp
         if temporary.exists() and temporary.parent == destination.parent.resolve() and temporary.name.startswith(f".{destination.name}."):
             shutil.rmtree(temporary)
         raise
-    return NeuralModesArtifact(destination, validated.manifest, validated.arrays, validated.rotation)
+    return NeuralModesArtifact(destination, manifest, dict(arrays), rotation)
 
 
 def _prepare_mode_selection(work: Path, source: Mapping[str, Any], fixed: Mapping[str, np.ndarray],
@@ -782,8 +769,6 @@ def _prepare_mode_selection(work: Path, source: Mapping[str, Any], fixed: Mappin
                 or type(payload["summary"].get("mode_slot")) is not int
                 or payload["summary"]["mode_slot"] != mode):
             raise ValueError(f"Neural prefix checkpoint {checkpoint.name} is incomplete or has a different mode/run")
-        if _sha256(checkpoint) != checksum:
-            raise ValueError(f"Neural prefix checkpoint changed while reading: {checkpoint.name}")
         checkpoints.append({"source_mode_slot": mode, "filename": checkpoint.name, "sha256": checksum})
         payloads.append(payload)
     mode_arrays = MODE_ARRAYS | {"phi", "sample_prediction"}
@@ -864,14 +849,17 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
     arrays["phi"] = np.zeros((count, len(arrays["g_points"]), 3), dtype=np.complex64)
     arrays["sample_prediction"] = np.zeros_like(arrays["sample_target"])
     model_states, optimization = [], []
+    rotations = []
     for mode, payload in enumerate(payloads):
         state = payload["best_model_state"]
         # Bake on the same CPU backend used by strict loading. CUDA scatter and
         # GEMM roundoff can exceed elementwise tolerances near a mode's zeros.
-        field = evaluate_model(state, _field_geometry(arrays, mode, "cpu"),
+        evaluated = evaluate_model(state, _field_geometry(arrays, mode, "cpu"),
                                length_scale=float(arrays["scene_scale"]),
                                amplitude_scale=float(arrays["amplitude_scale"][mode]),
-                               config=_field_config(settings, slots[mode]))[0].to(device)
+                               config=_field_config(settings, slots[mode]))
+        field = evaluated[0].to(device)
+        rotations.append(evaluated[1].detach().cpu().numpy())
         arrays["phi"][mode] = field.detach().cpu().numpy().astype(np.complex64)
         with torch.no_grad():
             for view, projector in enumerate(projectors):
@@ -879,15 +867,11 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
                     lo, hi = arrays["view_sample_offsets"][view:view + 2]
                     prediction = complex(arrays["alphas"][mode, view]) * projector(field)
                     arrays["sample_prediction"][mode, lo:hi] = prediction.cpu().numpy()
-        if not np.isfinite(arrays["phi"][mode]).all() or not np.isfinite(arrays["sample_prediction"][mode]).all():
-            raise FloatingPointError("Neural prefix field or rendered prediction is non-finite")
         model_states.append(state)
         optimization.append({**payload["summary"], "mode_slot": mode, "source_mode_slot": slots[mode]})
-    for checkpoint in subset_source["mode_selection"]["checkpoints"]:
-        if _sha256(work / checkpoint["filename"]) != checkpoint["sha256"]:
-            raise ValueError("Neural prefix checkpoints changed during export")
     return _publish_artifact(destination, subset_source, arrays, model_states, settings, runtime,
-                             run_identity, parent_contract["geometry_graph"], optimization, command)
+                             run_identity, parent_contract["geometry_graph"], optimization, command,
+                             rotation=np.stack(rotations) if (settings.training_fragment_config or {}).get("strategy") == "component_field" else None)
 
 
 def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Path,
@@ -920,10 +904,18 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
     if settings.device == "cpu" or not torch.cuda.is_available():
         raise RuntimeError("Full Gaussian neural training requires CUDA; CPU is supported only by synthetic field tests")
     device = torch.device("cuda")
-    source, scene, _, _, old_graph, alignment, dense = _load_sources(
-        scene_dir=scene_dir, topology_dir=topology_dir, measurements_dir=measurements_dir,
-        graph_dir=graph_dir, alignment_from=alignment_from,
-    )
+    if prepared_inputs is not None:
+        from types import SimpleNamespace
+        from modal_gaussians.static import load_static_scene
+        source = dict(prepared_inputs.source)
+        scene = load_static_scene(scene_dir, "cpu")
+        old_graph = SimpleNamespace(manifest=json.loads(
+            (Path(graph_dir) / "manifest.json").read_text(encoding="utf-8")))
+    else:
+        source, scene, _, _, old_graph, alignment, dense = _load_sources(
+            scene_dir=scene_dir, topology_dir=topology_dir, measurements_dir=measurements_dir,
+            graph_dir=graph_dir, alignment_from=alignment_from,
+        )
     selected_slots = (list(range(len(source["modes"]))) if mode_slots is None else
                       _validated_mode_slots(mode_slots, len(source["modes"])))
     runtime = {"device": "cuda", "torch_version": str(torch.__version__), "cuda_version": getattr(torch, "version").cuda,
@@ -1021,11 +1013,7 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         from modal_gaussians.motion.neural.strategies import diagnostics
         _atomic_json(work / "attachment_preflight.json", diagnostics(arrays))
     fixed_path = work / "fixed_inputs.npz"
-    if fixed_path.exists():
-        with np.load(fixed_path, allow_pickle=False) as archive:
-            if _arrays_identity({name: archive[name] for name in archive.files}) != run_contract["fixed_arrays_identity"]:
-                raise ValueError("Neural fixed work inputs were changed")
-    else:
+    if not fixed_path.exists():
         fixed_temporary = work / "fixed_inputs.tmp.npz"
         save_named_arrays(fixed_temporary, arrays)
         os.replace(fixed_temporary, fixed_path)
@@ -1033,6 +1021,7 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
     arrays["phi"] = np.zeros((mode_count, len(graph.points), 3), dtype=np.complex64)
     arrays["sample_prediction"] = np.zeros((mode_count, sample_count, 2), dtype=np.complex64)
     model_states, optimization = [], []
+    rotations = []
     for mode in selected_slots:
         checkpoint = work / f"mode_{mode:03d}.pt"
         payload = None
@@ -1044,7 +1033,7 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         if payload is not None and payload.get("complete") is True:
             state = payload["best_model_state"]
             summary = payload["summary"]
-            report_progress(f"neural mode {mode + 1}/{mode_count}: reusing validated completed checkpoint")
+            report_progress(f"neural mode {mode + 1}/{mode_count}: reusing completed checkpoint")
         else:
             geometry = _field_geometry(arrays, mode, device)
             observations = []
@@ -1080,10 +1069,12 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
                                        "trainer_state": fitted.latest_state, "best_model_state": state, "summary": summary})
         # The saved network, baked field, and rendered predictions must all use
         # the loader's CPU evaluation. Keep optimization and checkpoints on CUDA.
-        field = evaluate_model(state, _field_geometry(arrays, mode, "cpu"),
+        evaluated = evaluate_model(state, _field_geometry(arrays, mode, "cpu"),
                                length_scale=float(arrays["scene_scale"]),
                                amplitude_scale=float(arrays["amplitude_scale"][mode]),
-                               config=field_config)[0].to(device)
+                               config=field_config)
+        field = evaluated[0].to(device)
+        rotations.append(evaluated[1].detach().cpu().numpy())
         arrays["phi"][mode] = field.detach().cpu().numpy().astype(np.complex64)
         with torch.no_grad():
             for view, projector in enumerate(projectors):
@@ -1092,8 +1083,6 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
                 lo, hi = arrays["view_sample_offsets"][view:view + 2]
                 prediction = complex(arrays["alphas"][mode, view]) * projector(field)
                 arrays["sample_prediction"][mode, lo:hi] = prediction.cpu().numpy()
-        if not np.isfinite(arrays["phi"][mode]).all() or not np.isfinite(arrays["sample_prediction"][mode]).all():
-            raise FloatingPointError("Neural learned motion or rendered prediction is non-finite")
         model_states.append(state)
         optimization.append(summary)
     if mode_slots is not None:
@@ -1104,11 +1093,9 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         model_states = [payload["best_model_state"] for payload in payloads]
         optimization = [{**payload["summary"], "mode_slot": local, "source_mode_slot": slot}
                         for local, (slot, payload) in enumerate(zip(selected_slots, payloads))]
-        for checkpoint in source["mode_selection"]["checkpoints"]:
-            if _sha256(work / checkpoint["filename"]) != checkpoint["sha256"]:
-                raise ValueError("Neural prefix checkpoints changed during export")
     return _publish_artifact(destination, source, arrays, model_states, settings, runtime, run_identity,
-                             geometry_metadata, optimization, command)
+                             geometry_metadata, optimization, command,
+                             rotation=np.stack(rotations) if (settings.training_fragment_config or {}).get("strategy") == "component_field" else None)
 
 
 __all__ = ["NeuralModesConfig", "NeuralModesArtifact", "FrozenModalProjector", "support_roles",

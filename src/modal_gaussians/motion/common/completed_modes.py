@@ -1,7 +1,7 @@
 """Stable full-foreground motion interface, independent of the fitting method.
 
-Method-specific validators are imported lazily. Historical format strings and
-strict version/identity validation remain unchanged.
+Method-specific loaders are imported lazily. Neural experiments use saved data
+without automatic scientific validation; historical format strings are unchanged.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ MOTION_BASIS_COMPLETION_METHOD = "shared_motion_basis_blend"
 
 @dataclass(frozen=True)
 class CompletedModesArtifact:
-    """Represent one validated full-foreground completed modal-field artifact."""
+    """Represent one saved full-foreground completed modal-field artifact."""
 
     path: Path
     manifest: dict[str, Any]
@@ -28,7 +28,7 @@ class CompletedModesArtifact:
 
 
 def load_completed_modes(path: str | Path) -> CompletedModesArtifact:
-    """Load each supported completed-mode method through its strict validator."""
+    """Load each supported completed-mode method through its format-specific loader."""
 
     root = Path(path).expanduser().resolve(strict=True)
     manifest_path = root / "manifest.json"

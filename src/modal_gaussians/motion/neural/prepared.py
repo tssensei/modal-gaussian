@@ -169,27 +169,30 @@ class PreparedNeuralInputs:
         return arrays, projectors, cameras, depths, alphas
 
 
-def load_prepared(path: str | Path) -> PreparedNeuralInputs:
+def load_prepared(path: str | Path, *, validate: bool = False) -> PreparedNeuralInputs:
     root = Path(path).expanduser().resolve(strict=True)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("format") != FORMAT or manifest.get("version") != 1:
         raise ValueError("Unsupported neural preparation")
-    expected = identity({k: v for k, v in manifest.items() if k != "prepared_identity"})
-    if expected != manifest.get("prepared_identity") or sha256(root / "arrays.npz") != manifest.get("arrays_sha256"):
-        raise ValueError("Neural preparation checksum/identity differs")
+    if validate:
+        expected = identity({k: v for k, v in manifest.items() if k != "prepared_identity"})
+        if expected != manifest.get("prepared_identity") or sha256(root / "arrays.npz") != manifest.get("arrays_sha256"):
+            raise ValueError("Neural preparation checksum/identity differs")
     with np.load(root / "arrays.npz", allow_pickle=False) as archive:
         arrays = {name: archive[name] for name in archive.files}
-    if nm._arrays_identity(arrays) != manifest.get("arrays_identity"):
-        raise ValueError("Neural preparation arrays differ")
-    if nm._source_identity(manifest["source"]) != manifest["source_identity"]:
-        raise ValueError("Neural preparation source metadata differs")
+    if validate:
+        if nm._arrays_identity(arrays) != manifest.get("arrays_identity"):
+            raise ValueError("Neural preparation arrays differ")
+        if nm._source_identity(manifest["source"]) != manifest["source_identity"]:
+            raise ValueError("Neural preparation source metadata differs")
     result = PreparedNeuralInputs(root, manifest, arrays)
     if len(manifest["flows"]) != len(manifest["source"]["views"]):
         raise ValueError("Neural preparation flow/view counts differ")
-    for view, record in zip(manifest["source"]["views"], manifest["flows"]):
-        flow = result.flow(record["path"])
-        if flow_artifact_identity(flow) != view["flow_identity"]:
-            raise ValueError("Neural preparation flow/view source differs")
+    if validate:
+        for view, record in zip(manifest["source"]["views"], manifest["flows"]):
+            flow = result.flow(record["path"])
+            if flow_artifact_identity(flow) != view["flow_identity"]:
+                raise ValueError("Neural preparation flow/view source differs")
     return result
 
 
@@ -285,7 +288,7 @@ def prepare_neural(*, output_dir, cache_dir=DEFAULT_CACHE, from_result=None,
                 "defaults": {"neural": config.to_dict(), "fragment": fragment_config, "design": design_config}}
     manifest["prepared_identity"] = identity(manifest)
     atomic_json(temporary / "manifest.json", manifest)
-    prepared = load_prepared(temporary)
+    prepared = PreparedNeuralInputs(temporary, manifest, arrays)
     os.rename(temporary, destination)
     prepared.path = destination
     # Populate geometry/control caches now; training starts with warm geometry.

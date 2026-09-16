@@ -98,12 +98,17 @@ class GeometryGraph:
         return {field.name: np.ascontiguousarray(getattr(self, field.name)) for field in fields(self)}
 
     @classmethod
-    def from_dict(cls, arrays: Mapping[str, Any]) -> GeometryGraph:
+    def from_dict(cls, arrays: Mapping[str, Any], *, validate: bool = False) -> GeometryGraph:
         names = {field.name for field in fields(cls)}
         if set(arrays) != names:
             raise ValueError("Geometry graph array inventory does not match its schema")
         graph = cls(**{name: np.asarray(arrays[name]) for name in names})
-        _validate_geometry_arrays(graph)
+        if validate:
+            _validate_geometry_arrays(graph)
+        elif (graph.points.ndim != 2 or graph.points.shape[1] != 3
+              or graph.edge_index.ndim != 2 or graph.edge_index.shape[1] != 2
+              or np.any(graph.edge_index < 0) or np.any(graph.edge_index >= len(graph.points))):
+            raise ValueError("Invalid geometry point/edge index domain")
         return graph
 
 
@@ -127,7 +132,7 @@ class ControlGraph:
         return {field.name: np.asarray(getattr(self, field.name)) for field in fields(self)}
 
     @classmethod
-    def from_dict(cls, arrays: Mapping[str, Any]) -> ControlGraph:
+    def from_dict(cls, arrays: Mapping[str, Any], *, validate: bool = False) -> ControlGraph:
         names = {field.name for field in fields(cls)}
         if set(arrays) != names:
             raise ValueError("Control graph array inventory does not match its schema")
@@ -138,7 +143,8 @@ class ControlGraph:
                 raise ValueError(f"Control graph {name} must be a scalar")
             values[name] = float(values[name])
         graph = cls(**values)
-        _validate_control_arrays(graph)
+        if validate:
+            _validate_control_arrays(graph)
         return graph
 
 

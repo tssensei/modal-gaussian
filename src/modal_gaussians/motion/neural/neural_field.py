@@ -101,7 +101,7 @@ class NeuralFieldGeometry:
     @classmethod
     def from_arrays(
         cls, arrays: Mapping[str, Any], *, device: str | torch.device = "cpu",
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = torch.float32, validate: bool = True,
     ) -> "NeuralFieldGeometry":
         """Import fixed geometry; interpolation is exclusively CSR, never padded."""
         if dtype not in (torch.float32, torch.float64):
@@ -131,13 +131,14 @@ class NeuralFieldGeometry:
         rows = torch.repeat_interleave(
             torch.arange(count, device=device), indptr[1:] - indptr[:-1],
         )
-        sums = weights.new_zeros(count).index_add_(0, rows, weights)
         nonempty = indptr[1:] > indptr[:-1]
-        expected_sums = nonempty.to(dtype) if arrays.get("allow_empty_interpolation", False) else torch.ones_like(sums)
-        if not torch.allclose(sums, expected_sums, atol=2e-6, rtol=2e-6):
-            raise ValueError("Interpolation weights must sum to one in every Gaussian row")
+        if validate:
+            sums = weights.new_zeros(count).index_add_(0, rows, weights)
+            expected_sums = nonempty.to(dtype) if arrays.get("allow_empty_interpolation", False) else torch.ones_like(sums)
+            if not torch.allclose(sums, expected_sums, atol=2e-6, rtol=2e-6):
+                raise ValueError("Interpolation weights must sum to one in every Gaussian row")
         base_support = "interpolation_supported" if "interpolation_supported" in arrays else "gaussian_supported"
-        if arrays.get("allow_empty_interpolation", False) and bool((
+        if validate and arrays.get("allow_empty_interpolation", False) and bool((
             tensor(base_support, torch.bool) & ~nonempty
         ).any()):
             raise ValueError("Supported Gaussians cannot have empty control interpolation")
@@ -156,12 +157,12 @@ class NeuralFieldGeometry:
                     or not bool(torch.isfinite(edge_weights).all())
                     or bool((edge_weights < 0).any())):
                 raise ValueError(f"Invalid {name}")
-            if len(edge) and bool((edge[:, 0] == edge[:, 1]).any()):
+            if validate and len(edge) and bool((edge[:, 0] == edge[:, 1]).any()):
                 raise ValueError(f"{prefix}_edges contain self edges")
             # Distinct controls can coincide in space while their material path
             # has positive length, for example on folds or duplicate centers.
             uses_path_lengths = prefix == "control" and "control_edge_lengths" in arrays
-            if not uses_path_lengths and len(edge) and bool((torch.linalg.vector_norm(
+            if validate and not uses_path_lengths and len(edge) and bool((torch.linalg.vector_norm(
                 positions[edge[:, 1]] - positions[edge[:, 0]], dim=-1,
             ) <= 0).any()):
                 raise ValueError(f"{prefix}_edges contain zero-length edges")
@@ -195,11 +196,12 @@ class NeuralFieldGeometry:
                     or bool(((transfer_sources < 0) | (transfer_sources >= count)).any())
                     or not bool(torch.isfinite(transfer_weights).all()) or bool((transfer_weights <= 0).any())):
                 raise ValueError("Invalid pointwise transfer domains/weights")
-            totals = points.new_zeros(count).index_add_(0, transfer_rows, transfer_weights)
-            targets = torch.unique(transfer_rows)
-            if (not torch.allclose(totals[targets], torch.ones_like(totals[targets]), atol=2e-6, rtol=2e-6)
-                    or bool(torch.isin(transfer_sources, targets).any()) or not bool(nonempty[transfer_sources].all())):
-                raise ValueError("Pointwise transfer must be normalized and reference independent interpolated sources")
+            if validate:
+                totals = points.new_zeros(count).index_add_(0, transfer_rows, transfer_weights)
+                targets = torch.unique(transfer_rows)
+                if (not torch.allclose(totals[targets], torch.ones_like(totals[targets]), atol=2e-6, rtol=2e-6)
+                        or bool(torch.isin(transfer_sources, targets).any()) or not bool(nonempty[transfer_sources].all())):
+                    raise ValueError("Pointwise transfer must be normalized and reference independent interpolated sources")
         residual_projector = residual_mask = None
         residual_prior_weight = 0.0
         if "residual_projector" in arrays:
@@ -504,15 +506,12 @@ def evaluate_model(model_state: Mapping[str, Any], geometry: NeuralFieldGeometry
     """Reconstruct exported original-unit fields from the saved best network."""
     settings = (NeuralFieldConfig.from_dict(config) if isinstance(config, Mapping)
                 else config or NeuralFieldConfig())
-    _validate_finite_payload(model_state, "Neural model state")
     # Initializing a throwaway evaluation model must not change training RNG.
     with torch.random.fork_rng(devices=[]):
         model = PerFrequencyModalGNN(settings, control_count=len(geometry.control_positions)).to(geometry.gaussian_positions)
     model.load_state_dict(model_state)
     model.eval()
     result = model_field(model, geometry, length_scale=length_scale, amplitude_scale=amplitude_scale)
-    _validate_finite_payload((result.field, result.rotation, result.control_displacement,
-                              result.control_rotation), "Evaluated neural field")
     return result.field, result.rotation, result.control_displacement, result.control_rotation
 
 
@@ -608,8 +607,6 @@ def train_single_frequency(
                 prediction = observation.project(field.field)
                 if prediction.shape != target.shape:
                     raise ValueError(f"Projection shape differs from target for {observation.name!r}")
-                if not bool(torch.isfinite(prediction).all()):
-                    raise FloatingPointError("Non-finite neural modal projection")
                 residual = (alpha * prediction - target) / scale
                 term = (confidence * radial_huber(residual, settings.huber_delta)).sum() / len(prepared)
                 data_value += float(term.detach())

@@ -1018,8 +1018,9 @@ occlusion, alpha, observation scales and loss coefficients remain unchanged;
 residuals involving unresolved fragments can remain unexplained.
 
 The v10 artifact stores the original full geometry, host index mapping, host
-control graph, attachments and composed sparse interpolation. Its loader replays
-attachment/interpolation and reconstructs `phi` from saved weights. Host-local
+control graph, attachments and composed sparse interpolation. Its default loader
+reads the saved fields; explicit diagnostic validation can replay attachments
+and reconstruct `phi` from saved weights. Host-local
 control indices are mapped through `t_host_gaussian_index`; the final field keeps
 the original full-foreground order. Viewer support colors include propagated
 fragments in yellow. This implementation has synthetic CPU/CUDA checks only;
@@ -1117,13 +1118,13 @@ experiments retain their original settings and remain reproducible.
 Work directories retain the original fixed observations, graph, renderer
 contribution masses, support masks and normalization scales. Resume uses these
 persisted inputs, because CUDA gradient reductions are not bitwise deterministic.
-It still checks source/configuration/runtime identities and the current rendered
-alpha within tolerance. Latest model/optimizer/RNG state is saved separately
+It retains source/configuration/runtime guards for safe resumption; per-render
+alpha comparison is disabled. Latest model/optimizer/RNG state is saved separately
 from the best model used to export `phi`.
-Full and prefix exports reconstruct that saved model on CPU, matching the strict
-loader's evaluation backend. The resulting baked `phi` is also used for the
+Full and prefix exports reconstruct that saved model on CPU, matching the
+runtime rotation evaluation backend. The resulting baked `phi` is also used for the
 CUDA-rendered predictions. This avoids near-zero component mismatches caused by
-CPU/CUDA reduction roundoff without loosening validation or changing GPU training.
+CPU/CUDA reduction roundoff without changing GPU training.
 
 For a shorter preview after stopping a run, `motion export-neural-prefix`
 accepts the same five source paths and `--work-dir`, plus `--count 5` and a
@@ -1259,8 +1260,8 @@ design[p,:,2k+1] = -Im(J phi_k)
 ```
 
 so multiplying by `[Re(q_k), Im(q_k)]` produces
-`Re(q_k * J phi_k)`. A randomized direct-feature render verifies this sign and
-packing convention for every view before publication.
+`Re(q_k * J phi_k)`. Runtime publication does not perform an extra randomized
+render to verify the packing convention.
 
 ```text
 rendered_design/
@@ -1568,8 +1569,18 @@ retains independent-component training followed by v9 postprocessing.
 python -m modal_gaussians.cli motion iterate-neural --prepared outputs\bush_neural_prepared_001 --config experiment.json --output outputs\bush_trial_001
 ```
 
+Routine neural experiments do not run validation stages. Publication reuses the
+computed arrays and rotation; cached-model and Viewer loading do not rebuild KNN,
+controls or donors, revisit upstream inputs, rehash payloads, or compare network
+replay against saved `phi`. V16 loading still evaluates the saved network once to
+recover runtime ellipsoid rotation. Preview creation skips packing-test renders
+and post-write read-back validation. Strict loader checks are available only by
+explicit `validate=True` for requested diagnostics. Basic input/schema/index
+errors, divergent-training errors, cache selection, safe deserialization, atomic
+writes and no-overwrite protections remain. No new CLI option is required.
+
 The default `--stage modes` stops after training with fixed fragment fill and
-strict validation of the final v10 or v11 3D modes (status `modes_ready`). The exact
+publication of the final 3D modes (status `modes_ready`), without validation. The exact
 artifact path is `completed_modes` in the experiment's `outputs.json`; it can
 refer directly to immutable trained modes in the shared cache.
 It does not build rendered-design/preview data, fit per-frame modal coordinates,
@@ -1589,6 +1600,22 @@ support roles and exact-DFT Original/Reconstructed modal images. It contains no
 fictitious video coordinates or flow-fit scores. Full raw spectra are cached or
 loaded explicitly in the background with **Load full spectrum**. Until loaded,
 the raw spectrum plot is hidden and normalization uses **per mode**.
+
+To inspect an existing neural geometry graph without any frequencies, trained
+networks, or modal results, load the static scene and its geometry cache entry:
+
+```bat
+modal-gaussians viewer --scene outputs\static_scene --geometry-graph outputs\_cache\geometry\GRAPH_KEY --work-dir outputs\graph_viewer --host 127.0.0.1 --port 8087
+```
+
+`--scene` and `--geometry-graph` must be supplied together, instead of `--preview`
+or `--result`. `GRAPH_KEY` is the geometry cache directory whose manifest binds
+the scene's foreground identity and desired graph configuration. This entry
+reads the saved graph; it does not rebuild connectivity. Basic scene/graph
+binding, point order, schema and index checks remain; cache checksums are not
+recomputed at startup. The graph and Gaussian centers appear by default, colored by connected
+component. Camera navigation, Gaussian/background visibility, edge count, and
+line width remain available; motion and spectrum controls are absent.
 
 Only when the user explicitly requests video-coordinate fitting and full
 evaluation, use the separately retained compatibility path below. A normal

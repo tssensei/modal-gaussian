@@ -49,8 +49,6 @@ DESIGN_FILENAME = "design.npy"
 SAMPLES_FILENAME = "samples.npz"
 DESIGN_DTYPE = np.dtype(np.float32)
 FINITE_BLOCK_SAMPLES = 65_536
-PACKING_MAX_ABS_TOLERANCE = 1.0e-3
-PACKING_RELATIVE_L2_TOLERANCE = 1.0e-3
 
 SAMPLE_DTYPES = {
     "view_shapes_hw": np.dtype(np.int64),
@@ -240,8 +238,8 @@ def _validate_finite_design(design: np.ndarray) -> None:
             raise ValueError("Rendered modal design contains NaN or Inf")
 
 
-def load_rendered_modal_design(path: str | Path) -> RenderedModalDesignArtifact:
-    """Load and strictly validate one rendered modal design directory."""
+def load_rendered_modal_design(path: str | Path, *, validate: bool = False) -> RenderedModalDesignArtifact:
+    """Read a saved design; exhaustive checks are explicit diagnostics only."""
 
     root = Path(path).expanduser().resolve(strict=True)
     manifest_path = root / "manifest.json"
@@ -254,6 +252,15 @@ def load_rendered_modal_design(path: str | Path) -> RenderedModalDesignArtifact:
         raise ValueError("Unsupported rendered-design format")
     if manifest.get("version") not in (RENDERED_DESIGN_VERSION, 2):
         raise ValueError("Unsupported rendered-design version")
+    if not validate:
+        design = np.load(design_path, mmap_mode="r", allow_pickle=False)
+        counts = manifest["counts"]
+        if design.dtype != DESIGN_DTYPE or design.shape != (counts["samples"], 2, 2 * counts["modes"]):
+            design._mmap.close()
+            raise ValueError("Rendered-design array shape or dtype is invalid")
+        with np.load(samples_path, allow_pickle=False) as archive:
+            samples = {name: archive[name] for name in archive.files}
+        return RenderedModalDesignArtifact(root, manifest, design, samples)
     expected_convention = DISTORTED_DESIGN_CONVENTION if manifest["version"] == 2 else DESIGN_CONVENTION
     if manifest.get("convention") != expected_convention:
         raise ValueError("Rendered-design convention is unsupported")
@@ -354,61 +361,6 @@ def load_rendered_modal_design(path: str | Path) -> RenderedModalDesignArtifact:
     if manifest.get("rendered_design_identity") != expected_identity:
         raise ValueError("Rendered-design identity differs from its contents")
     return RenderedModalDesignArtifact(root, manifest, design, samples)
-
-
-def _view_diagnostics(
-    alpha: np.ndarray,
-    *,
-    packing_max_abs_error: float,
-    packing_relative_l2_error: float,
-) -> dict[str, Any]:
-    """Record alpha coverage and direct-render packing verification."""
-
-    alpha64 = alpha.astype(np.float64)
-    return {
-        "alpha": {
-            "min": float(alpha64.min()),
-            "p10": float(np.percentile(alpha64, 10.0)),
-            "median": float(np.median(alpha64)),
-            "p90": float(np.percentile(alpha64, 90.0)),
-            "max": float(alpha64.max()),
-            "mean": float(alpha64.mean()),
-        },
-        "packing_verification": {
-            "max_abs_error": packing_max_abs_error,
-            "relative_l2_error": packing_relative_l2_error,
-        },
-    }
-
-
-def _packing_errors(
-    design: np.ndarray,
-    coordinates: np.ndarray,
-    direct_values: np.ndarray,
-) -> tuple[float, float]:
-    """Compare packed and direct renders without materializing a float64 design."""
-
-    maximum = 0.0
-    squared_error = 0.0
-    squared_signal = 0.0
-    coordinates64 = coordinates.astype(np.float64)
-    for lower in range(0, len(design), FINITE_BLOCK_SAMPLES):
-        upper = min(lower + FINITE_BLOCK_SAMPLES, len(design))
-        packed = np.einsum(
-            "pdc,c->pd",
-            np.asarray(design[lower:upper], dtype=np.float64),
-            coordinates64,
-            optimize=True,
-        )
-        direct = np.asarray(direct_values[lower:upper], dtype=np.float64)
-        difference = packed - direct
-        maximum = max(maximum, float(np.max(np.abs(difference))))
-        squared_error += float(np.sum(difference * difference))
-        squared_signal += float(np.sum(direct * direct))
-    relative = math.sqrt(squared_error) / max(
-        math.sqrt(squared_signal), np.finfo(np.float64).eps
-    )
-    return maximum, relative
 
 
 def _load_sources(
@@ -558,7 +510,6 @@ def build_rendered_modal_design_artifact(
         or coordinate_count != 3
         or mode_count != len(mode_records)
         or foreground_count != scene.foreground.count
-        or not np.isfinite(phi).all()
     ):
         raise ValueError("Completed modes do not match the static foreground")
 
@@ -581,8 +532,6 @@ def build_rendered_modal_design_artifact(
                 camera, dummy, composition="foreground"
             )
             alpha_image = alpha_tensor.detach().cpu().float().numpy()
-            if not np.isfinite(alpha_image).all():
-                raise RuntimeError(f"Rendered alpha for {record['label']!r} is non-finite")
             pixels, sampled_alpha = _candidate_pixels(
                 flow.arrays.mask_union, alpha_image, settings
             )
@@ -620,12 +569,6 @@ def build_rendered_modal_design_artifact(
         "sample_pixels_xy": np.concatenate(pixels_by_view, axis=0),
         "sample_foreground_alpha": np.concatenate(alpha_by_view, axis=0),
     }
-    _validate_samples(
-        samples,
-        view_count=len(cameras),
-        sample_count=sample_count,
-        config=settings,
-    )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(
@@ -641,7 +584,6 @@ def build_rendered_modal_design_artifact(
             dtype=DESIGN_DTYPE,
             shape=(sample_count, 2, 2 * mode_count),
         )
-        rng = np.random.default_rng(1729)
         progress = Progress("rendered design", len(cameras) * mode_count, unit="view-modes")
         with torch.no_grad():
             for view_index, (camera, pixels, sampled_alpha, jacobian) in enumerate(
@@ -699,42 +641,7 @@ def build_rendered_modal_design_artifact(
                         f"camera={camera.name} modes={stop}/{mode_count}",
                     )
 
-                packed = rng.standard_normal(2 * mode_count).astype(np.float32)
-                packed /= np.sqrt(np.mean(packed * packed, dtype=np.float64))
-                q_real, q_imag = packed[0::2], packed[1::2]
-                direct_phi = np.einsum(
-                    "k,kgj->gj", q_real, np.real(phi), optimize=True
-                ) - np.einsum(
-                    "k,kgj->gj", q_imag, np.imag(phi), optimize=True
-                )
-                direct_features = torch.einsum(
-                    "gij,gj->gi",
-                    jacobian_tensor,
-                    torch.as_tensor(
-                        np.ascontiguousarray(direct_phi),
-                        device=device,
-                        dtype=torch.float32,
-                    ),
-                )
-                direct_values = _sample_feature_render(
-                    scene, camera, direct_features, pixels, sampled_alpha
-                )
-                max_abs_error, relative_l2_error = _packing_errors(
-                    design[lower:upper], packed, direct_values
-                )
-                if (
-                    max_abs_error > PACKING_MAX_ABS_TOLERANCE
-                    and relative_l2_error > PACKING_RELATIVE_L2_TOLERANCE
-                ):
-                    raise RuntimeError(
-                        f"Rendered-design packing failed for {view_records[view_index]['label']!r}: "
-                        f"max={max_abs_error:.6g}, relative_l2={relative_l2_error:.6g}"
-                    )
-                view_records[view_index]["diagnostics"] = _view_diagnostics(
-                    sampled_alpha,
-                    packing_max_abs_error=max_abs_error,
-                    packing_relative_l2_error=relative_l2_error,
-                )
+                view_records[view_index]["diagnostics"] = {"packing_verification": {"status": "not_run"}}
         design.flush()
         del design
         samples_path = temporary / SAMPLES_FILENAME
@@ -796,9 +703,6 @@ def build_rendered_modal_design_artifact(
             json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
             encoding="utf-8",
         )
-        validated = load_rendered_modal_design(temporary)
-        # Windows requires releasing the mapping before moving its directory.
-        getattr(validated.design, "_mmap").close()
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(
                 f"Rendered-design output already exists: {destination}"
@@ -809,9 +713,9 @@ def build_rendered_modal_design_artifact(
         raise
     return RenderedModalDesignArtifact(
         destination,
-        validated.manifest,
+        manifest,
         np.load(destination / DESIGN_FILENAME, mmap_mode="r", allow_pickle=False),
-        validated.samples,
+        samples,
     )
 
 

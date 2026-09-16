@@ -608,11 +608,14 @@ def build_parser() -> argparse.ArgumentParser:
     result_materialize.add_argument("--coordinates", required=True, type=Path)
     result_materialize.add_argument("--output", required=True, type=Path)
     viewer = command_parsers.add_parser(
-        "viewer", help="Inspect one complete modal result in Viser"
+        "viewer", help="Inspect modal results or a static scene and geometry graph in Viser"
     )
     viewer_input = viewer.add_mutually_exclusive_group(required=True)
     viewer_input.add_argument("--result", type=Path)
     viewer_input.add_argument("--preview", type=Path)
+    viewer_input.add_argument("--scene", type=Path, help="Inspect static geometry without modal results")
+    viewer.add_argument("--geometry-graph", type=Path,
+                        help="Geometry cache entry directory (required with --scene)")
     viewer.add_argument("--work-dir", required=True, type=Path)
     viewer.add_argument("--host", default="0.0.0.0")
     viewer.add_argument("--port", type=_positive_int, default=8080)
@@ -1316,6 +1319,15 @@ def _dispatch(
             print(f"identity: {artifact.manifest['modal_result_identity']}")
             return 0
         if args.command == "viewer":
+            if (args.scene is None) != (args.geometry_graph is None):
+                parser.error("--scene and --geometry-graph must be supplied together")
+            if args.scene is not None:
+                from modal_gaussians.vis.graph_viewer import run_graph_viewer
+
+                run_graph_viewer(scene_dir=args.scene, graph_dir=args.geometry_graph,
+                                 work_dir=args.work_dir, host=str(args.host), port=int(args.port),
+                                 viewer_resolution=int(args.viewer_res))
+                return 0
             from modal_gaussians.vis.viewer import run_modal_viewer
 
             run_modal_viewer(

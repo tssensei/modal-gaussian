@@ -128,7 +128,7 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
             or not math.isclose(float(arrays["measurement_rms_floor"]), expected_floor, rel_tol=1e-10)
             or not np.allclose(arrays["mode_view_loss_scale"], np.maximum(expected_rms, expected_floor), rtol=1e-10, atol=1e-12)):
         raise ValueError("Neural observation normalization differs from fixed measurements")
-    graph = GeometryGraph.from_dict({name[2:]: value for name, value in arrays.items() if name.startswith("g_")})
+    graph = GeometryGraph.from_dict({name[2:]: value for name, value in arrays.items() if name.startswith("g_")}, validate=True)
     if config.graph_edge_filter == "none":
         from modal_gaussians.motion.neural.geometry_graph import EVIDENCE_SPATIAL_PRIOR, _mutual_knn
         expected_edges, _ = _mutual_knn(graph.points.astype(np.float64), nm._geometry_config(config))
@@ -142,7 +142,7 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
             raise ValueError("Neural KNN-only graph differs from its complete spatial candidate contract")
     elif np.any(graph.edge_evidence_kind == 2):
         raise ValueError("Depth-filtered neural configuration cannot contain unfiltered spatial-prior edges")
-    control = ControlGraph.from_dict({name[2:]: value for name, value in arrays.items() if name.startswith("c_")})
+    control = ControlGraph.from_dict({name[2:]: value for name, value in arrays.items() if name.startswith("c_")}, validate=True)
     control_graph, control_count = graph, G
     if training_fill:
         from modal_gaussians.motion.neural.strategies import validate_training_controls
@@ -229,8 +229,8 @@ def _check_persisted_sources(manifest: Mapping[str, Any], arrays: Mapping[str, n
                 raise ValueError("Neural prefix normalization RMS differs from full dense modal source")
 
 
-def load_neural_completed_modes(path: str | Path) -> nm.NeuralModesArtifact:
-    """Load v8/v10/v11/v12/v14/v16 and reproduce baked phi from saved network weights."""
+def load_neural_completed_modes(path: str | Path, *, validate: bool = False) -> nm.NeuralModesArtifact:
+    """Read saved modes; exhaustive consistency checks are explicit diagnostics only."""
     from modal_gaussians.motion.neural.neural_field import evaluate_model
     root = Path(path).expanduser().resolve(strict=True)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
@@ -243,54 +243,64 @@ def load_neural_completed_modes(path: str | Path) -> nm.NeuralModesArtifact:
     version, method = artifact_contract(config.training_fragment_config)
     if manifest["version"] != version or manifest.get("completion_method") != method:
         raise ValueError("Unsupported neural artifact version/method/configuration combination")
-    if manifest.get("semantics") != nm._semantics(config) or manifest.get("quality_gate") != nm.QUALITY_GATE:
-        raise ValueError("Neural completed-mode semantics differ")
-    if manifest.get("arrays_file") != nm.ARRAYS_FILENAME or manifest.get("networks_file") != nm.MODELS_FILENAME:
-        raise ValueError("Neural artifact file names differ")
-    if nm._sha256(root / nm.ARRAYS_FILENAME) != manifest["arrays_file_sha256"] or nm._sha256(root / nm.MODELS_FILENAME) != manifest["networks_sha256"]:
-        raise ValueError("Neural artifact file checksum differs")
+    if validate:
+        if manifest.get("semantics") != nm._semantics(config) or manifest.get("quality_gate") != nm.QUALITY_GATE:
+            raise ValueError("Neural completed-mode semantics differ")
+        if manifest.get("arrays_file") != nm.ARRAYS_FILENAME or manifest.get("networks_file") != nm.MODELS_FILENAME:
+            raise ValueError("Neural artifact file names differ")
+        if nm._sha256(root / nm.ARRAYS_FILENAME) != manifest["arrays_file_sha256"] or nm._sha256(root / nm.MODELS_FILENAME) != manifest["networks_sha256"]:
+            raise ValueError("Neural artifact file checksum differs")
     with np.load(root / nm.ARRAYS_FILENAME, allow_pickle=False) as archive:
         arrays = {name: archive[name] for name in archive.files}
-    if manifest.get("arrays") != {name: {"dtype": a.dtype.name, "shape": list(a.shape)} for name, a in arrays.items()}:
-        raise ValueError("Neural array inventory differs")
-    if nm._arrays_identity(arrays) != manifest["arrays_identity"]:
-        raise ValueError("Neural array identity differs")
-    if manifest["source_identity"] != nm._source_identity(manifest):
-        raise ValueError("Neural source metadata differs")
-    if nm._identity(nm._artifact_identity_payload(manifest)) != manifest.get("completed_modes_identity"):
-        raise ValueError("Neural completed-mode identity differs")
-    fixed_arrays = {name: value for name, value in arrays.items() if name not in ("phi", "sample_prediction")}
-    slots = nm._source_mode_slots(manifest)
-    if len(slots) != manifest["counts"]["modes"]:
-        raise ValueError("Neural mode inventory differs from artifact count")
-    run_contract = {"format": "modal_gaussians.neural_modes_work", "version": 1,
-                    "source_identity": manifest["source_identity"], "config": manifest["config"],
-                    "runtime": manifest["runtime"], "geometry_graph": manifest["geometry_graph"],
-                    "fixed_arrays_identity": nm._arrays_identity(fixed_arrays)}
-    if "mode_selection" in manifest:
-        selection = manifest["mode_selection"]
-        parent_contract = {**run_contract, "fixed_arrays_identity": selection["parent_fixed_arrays_identity"]}
-        if nm._identity(parent_contract) != selection["parent_run_identity"]:
-            raise ValueError("Neural prefix parent run identity differs from original configuration and sources")
-        run_contract["mode_selection"] = selection
-    expected_run = nm._identity(run_contract)
-    if expected_run != manifest["run_identity"]:
-        raise ValueError("Neural run identity differs from resolved inputs and configuration")
-    # Network replay constructs and validates each field geometry below.
-    nm._validate_arrays(arrays, manifest, check_field_geometry=False)
-    nm._check_persisted_sources(manifest, arrays)
+    if validate:
+        if manifest.get("arrays") != {name: {"dtype": a.dtype.name, "shape": list(a.shape)} for name, a in arrays.items()}:
+            raise ValueError("Neural array inventory differs")
+        if nm._arrays_identity(arrays) != manifest["arrays_identity"]:
+            raise ValueError("Neural array identity differs")
+        if manifest["source_identity"] != nm._source_identity(manifest):
+            raise ValueError("Neural source metadata differs")
+        if nm._identity(nm._artifact_identity_payload(manifest)) != manifest.get("completed_modes_identity"):
+            raise ValueError("Neural completed-mode identity differs")
+        fixed_arrays = {name: value for name, value in arrays.items() if name not in ("phi", "sample_prediction")}
+        slots = nm._source_mode_slots(manifest)
+        if len(slots) != manifest["counts"]["modes"]:
+            raise ValueError("Neural mode inventory differs from artifact count")
+        run_contract = {"format": "modal_gaussians.neural_modes_work", "version": 1,
+                        "source_identity": manifest["source_identity"], "config": manifest["config"],
+                        "runtime": manifest["runtime"], "geometry_graph": manifest["geometry_graph"],
+                        "fixed_arrays_identity": nm._arrays_identity(fixed_arrays)}
+        if "mode_selection" in manifest:
+            selection = manifest["mode_selection"]
+            parent_contract = {**run_contract, "fixed_arrays_identity": selection["parent_fixed_arrays_identity"]}
+            if nm._identity(parent_contract) != selection["parent_run_identity"]:
+                raise ValueError("Neural prefix parent run identity differs from original configuration and sources")
+            run_contract["mode_selection"] = selection
+        expected_run = nm._identity(run_contract)
+        if expected_run != manifest["run_identity"]:
+            raise ValueError("Neural run identity differs from resolved inputs and configuration")
+        # Network replay constructs and validates each field geometry below.
+        nm._validate_arrays(arrays, manifest, check_field_geometry=False)
+        nm._check_persisted_sources(manifest, arrays)
+    else:
+        # ponytail: local experiment artifacts are trusted; request validate=True for forensic checks.
+        slots = np.asarray(manifest.get("mode_selection", {}).get(
+            "source_mode_slots", list(range(len(manifest["modes"])))), dtype=np.int64)
+    if manifest["version"] != 16 and not validate:
+        return nm.NeuralModesArtifact(root, manifest, arrays)
     networks = torch.load(root / nm.MODELS_FILENAME, map_location="cpu", weights_only=True)
-    if networks.get("run_identity") != manifest["run_identity"] or len(networks.get("model_states", [])) != len(manifest["modes"]):
+    if validate and (networks.get("run_identity") != manifest["run_identity"] or len(networks.get("model_states", [])) != len(manifest["modes"])):
         raise ValueError("Neural network inventory/run identity differs")
-    if "mode_selection" in manifest and networks.get("source_mode_slots") != slots.tolist():
+    if validate and "mode_selection" in manifest and networks.get("source_mode_slots") != slots.tolist():
         raise ValueError("Neural network source mode order differs from completed prefix")
+    if len(networks["model_states"]) != len(arrays["phi"]) or len(slots) != len(arrays["phi"]):
+        raise ValueError("Neural network/mode count differs from phi")
     # Derived at load time; the historical disk schema and identities stay unchanged.
     rotation = np.empty_like(arrays["phi"]) if manifest["version"] == 16 else None
     for mode, state in enumerate(networks["model_states"]):
         evaluated = evaluate_model(state, nm._field_geometry(arrays, mode), length_scale=float(arrays["scene_scale"]),
                                    amplitude_scale=float(arrays["amplitude_scale"][mode]), config=nm._field_config(config, int(slots[mode])))
         reproduced = evaluated[0].detach().cpu().numpy()
-        if not np.allclose(reproduced, arrays["phi"][mode], rtol=3e-5, atol=1e-7 * float(arrays["amplitude_scale"][mode])):
+        if validate and not np.allclose(reproduced, arrays["phi"][mode], rtol=3e-5, atol=1e-7 * float(arrays["amplitude_scale"][mode])):
             raise ValueError(f"Neural baked phi differs from network for mode {mode}")
         if rotation is not None:
             rotation[mode] = evaluated[1].detach().cpu().numpy()

@@ -145,7 +145,7 @@ class Timings:
                            "byte_accounting": "instrumented file hashing, cache payloads and dense-array reads"})
 
 
-def load_entry(root: Path, contract: dict[str, Any]) -> dict[str, np.ndarray] | None:
+def load_entry(root: Path, contract: dict[str, Any], *, validate: bool = False) -> dict[str, np.ndarray] | None:
     path = root / identity(contract)
     if not path.exists():
         return None
@@ -154,7 +154,7 @@ def load_entry(root: Path, contract: dict[str, Any]) -> dict[str, np.ndarray] | 
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("contract") != contract or manifest.get("version") != 1:
         raise ValueError(f"Cache contract differs: {path}")
-    if sha256(path / "arrays.npz") != manifest.get("sha256"):
+    if validate and sha256(path / "arrays.npz") != manifest.get("sha256"):
         raise ValueError(f"Cache payload checksum differs: {path}")
     read_bytes((path / "arrays.npz").stat().st_size)
     with np.load(path / "arrays.npz", allow_pickle=False) as archive:
@@ -169,27 +169,15 @@ def put_entry(root: Path, contract: dict[str, Any], arrays: dict[str, np.ndarray
         return load_entry(root, contract)  # type: ignore[return-value]
     temporary = Path(tempfile.mkdtemp(prefix=".writing-", dir=root))
     save_named_arrays(temporary / "arrays.npz", arrays)
-    # Validate the temporary payload before making its content address visible.
-    with np.load(temporary / "arrays.npz", allow_pickle=False) as archive:
-        if set(archive.files) != set(arrays):
-            raise ValueError("Written cache inventory differs")
-        for name, expected in arrays.items():
-            actual = archive[name]
-            expected = np.asarray(expected)
-            if (actual.shape != expected.shape or actual.dtype != expected.dtype
-                    or not np.array_equal(np.ascontiguousarray(actual).reshape(-1).view(np.uint8),
-                                          np.ascontiguousarray(expected).reshape(-1).view(np.uint8))):
-                raise ValueError(f"Written cache array differs: {name}")
     atomic_json(temporary / "manifest.json", {"version": 1, "contract": contract,
                                                "sha256": sha256(temporary / "arrays.npz")})
     try:
-        # A successful rename publishes the bytes just checked above. Do not
-        # reopen/decompress/hash that same payload a second time.
+        # Atomic publication; reuse in-memory arrays without a read-back pass.
         os.rename(temporary, destination)
     except OSError:
         if not destination.exists():
             raise
-        # A concurrent winner must pass its own checksum/contract validation.
+        # A concurrent winner must belong to the same cache contract.
         winner = load_entry(root, contract)
         resolved = temporary.resolve()
         if resolved.parent != root.resolve() or not resolved.name.startswith(".writing-"):

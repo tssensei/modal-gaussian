@@ -1311,8 +1311,9 @@ def tensor_dictionary_identity(tensors: Mapping[str, Tensor], prefix: str) -> st
 def load_static_scene(
     path: str | Path,
     device: torch.device | str = "cpu",
+    *, validate: bool = False,
 ) -> ForegroundBackgroundScene:
-    """Load and verify a pure-tensor static scene bundle without legacy classes."""
+    """Read a tensor scene; full provenance/partition checks require explicit validation."""
 
     path = Path(path).expanduser().resolve(strict=True)
     manifest_path = path / "manifest.json"
@@ -1322,7 +1323,7 @@ def load_static_scene(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("format") != "modal_gaussians.static_scene" or manifest.get("version") not in (1, 2, 3):
         raise ValueError(f"Unsupported static scene manifest: {manifest_path}")
-    if _sha256_file(tensors_path) != manifest.get("tensors_sha256"):
+    if validate and _sha256_file(tensors_path) != manifest.get("tensors_sha256"):
         raise ValueError("Static tensors.pt SHA-256 does not match manifest")
     loaded = torch.load(tensors_path, map_location="cpu", weights_only=True)
     if not isinstance(loaded, dict) or not all(isinstance(value, Tensor) for value in loaded.values()):
@@ -1332,36 +1333,37 @@ def load_static_scene(
     }
     if set(loaded) != expected_keys:
         raise ValueError(f"Unexpected static tensor keys: {sorted(set(loaded) ^ expected_keys)}")
-    if tensor_dictionary_identity(loaded, "foreground.") != manifest.get(
-        "foreground_identity"
-    ):
-        raise ValueError("Foreground tensor identity does not match manifest")
-    if tensor_dictionary_identity(loaded, "background.") != manifest.get(
-        "background_identity"
-    ):
-        raise ValueError("Background tensor identity does not match manifest")
-    static_identity_payload = {
-        "dataset_identity": manifest["dataset"]["dataset_identity"],
-        "foreground_identity": manifest["foreground_identity"],
-        "background_identity": manifest["background_identity"],
-        "normalization": manifest["scene_normalization"],
-        "representation": "vanilla_3dgs_direct_rgb",
-    }
-    if manifest["version"] in (2, 3):
-        cameras = cameras_from_scene_manifest(manifest)
-        if not all(c.distortion_applied for c in cameras):
-            raise ValueError("Static v2 requires distortion-aware cameras")
-        static_identity_payload["camera_identities"] = [c.to_manifest_record()["camera_identity"] for c in cameras]
-        static_identity_payload["projection_convention"] = PROJECTION_CONVENTION
-        if manifest["representation"].get("camera_projection") != PROJECTION_CONVENTION:
-            raise ValueError("Static scene representation has inconsistent camera projection")
-    if manifest["version"] == 3:
-        from modal_gaussians.static_partition import validate_partition_bundle
+    if validate:
+        if tensor_dictionary_identity(loaded, "foreground.") != manifest.get(
+            "foreground_identity"
+        ):
+            raise ValueError("Foreground tensor identity does not match manifest")
+        if tensor_dictionary_identity(loaded, "background.") != manifest.get(
+            "background_identity"
+        ):
+            raise ValueError("Background tensor identity does not match manifest")
+        static_identity_payload = {
+            "dataset_identity": manifest["dataset"]["dataset_identity"],
+            "foreground_identity": manifest["foreground_identity"],
+            "background_identity": manifest["background_identity"],
+            "normalization": manifest["scene_normalization"],
+            "representation": "vanilla_3dgs_direct_rgb",
+        }
+        if manifest["version"] in (2, 3):
+            cameras = cameras_from_scene_manifest(manifest)
+            if not all(c.distortion_applied for c in cameras):
+                raise ValueError("Static v2 requires distortion-aware cameras")
+            static_identity_payload["camera_identities"] = [c.to_manifest_record()["camera_identity"] for c in cameras]
+            static_identity_payload["projection_convention"] = PROJECTION_CONVENTION
+            if manifest["representation"].get("camera_projection") != PROJECTION_CONVENTION:
+                raise ValueError("Static scene representation has inconsistent camera projection")
+        if manifest["version"] == 3:
+            from modal_gaussians.static_partition import validate_partition_bundle
 
-        validate_partition_bundle(path, manifest, loaded)
-        static_identity_payload["partition_identity"] = manifest["partition_identity"]
-    if _sha256_json(static_identity_payload) != manifest.get("static_scene_identity"):
-        raise ValueError("Static scene identity does not match manifest contents")
+            validate_partition_bundle(path, manifest, loaded)
+            static_identity_payload["partition_identity"] = manifest["partition_identity"]
+        if _sha256_json(static_identity_payload) != manifest.get("static_scene_identity"):
+            raise ValueError("Static scene identity does not match manifest contents")
     parts: dict[str, GaussianSet] = {}
     for part in ("foreground", "background"):
         raw = {field: loaded[f"{part}.{field}"].float() for field in GAUSSIAN_FIELDS}

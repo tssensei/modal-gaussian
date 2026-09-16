@@ -29,18 +29,19 @@ class ModalPreviewArtifact:
     coordinates: None = None
 
 
-def load_preview(path: str | Path) -> ModalPreviewArtifact:
+def load_preview(path: str | Path, *, validate: bool = False) -> ModalPreviewArtifact:
     root = Path(path).expanduser().resolve(strict=True)
     m = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     if m.get("format") != FORMAT or m.get("version") != 1:
         raise ValueError("Unsupported modal preview")
-    if identity({k: v for k, v in m.items() if k != "preview_identity"}) != m.get("preview_identity"):
+    if validate and identity({k: v for k, v in m.items() if k != "preview_identity"}) != m.get("preview_identity"):
         raise ValueError("Preview identity differs")
     prepared = load_prepared(m["prepared"])
     scene = load_static_scene(m["scene"], "cpu")
     completed = load_completed_modes(m["completed_modes"])
     design = load_rendered_modal_design(m["rendered_design"])
-    _validate_bindings(m, scene, completed, design, prepared)
+    if validate:
+        _validate_bindings(m, scene, completed, design, prepared)
     return ModalPreviewArtifact(root, m, scene, completed, design, prepared)
 
 
@@ -64,7 +65,7 @@ def _validate_bindings(m, scene, completed, design, prepared):
 
 def build_preview(*, prepared_dir, scene_dir, completed_modes_dir, rendered_design_dir, output_dir,
                   prepared=None, completed=None, design=None):
-    """Reuse already validated stage outputs; standalone calls still load strictly."""
+    """Publish references to stage outputs without repeating validation."""
     destination = Path(output_dir).expanduser().resolve()
     if destination.exists():
         raise FileExistsError(destination)
@@ -83,7 +84,6 @@ def build_preview(*, prepared_dir, scene_dir, completed_modes_dir, rendered_desi
          "modes": completed.manifest["modes"], "views": design.manifest["views"],
          "playback": "manual_oscillator_only", "quality_gate": {"status": "preview_candidate_unapproved"}}
     m["preview_identity"] = identity(m)
-    _validate_bindings(m, scene, completed, design, prepared)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
     atomic_json(temporary / "manifest.json", m)
