@@ -441,6 +441,19 @@ def _control_point_gaussian_indices(arrays: dict[str, np.ndarray], gaussian_coun
     return hosts[indices].astype(np.int64, copy=False)
 
 
+def _rigidity_edge_colors(component_colors: np.ndarray, factors: np.ndarray) -> np.ndarray:
+    """Keep unchanged edges colored; encode relative loss-weight reduction in gray."""
+    factors = np.asarray(factors)
+    if (factors.ndim != 2 or factors.shape[1] != len(component_colors)
+            or not np.isfinite(factors).all() or np.any(factors < 0) or np.any(factors > 1)):
+        raise ValueError("Rigidity edge factors must be finite [K,E] values in [0,1]")
+    colors = np.broadcast_to(component_colors, (*factors.shape, 3)).copy()
+    reduced = factors < 1.0
+    # Fixed absolute scale across modes: 0% reduction -> 0.85; 100% -> 0.15.
+    colors[reduced] = (0.15 + 0.70 * factors[reduced])[:, None]
+    return colors
+
+
 class ModalViewerData:
     """Hold strict result data and implement all scientific display transforms."""
 
@@ -518,6 +531,7 @@ class ModalViewerData:
     def _load_graph_display(self) -> None:
         """Select geometry diagnostics belonging to the completed-mode method."""
 
+        self.has_rigidity_edge_factors = False
         if self.result.completed_modes.manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16):
             self.structure_graph = None
             self.graph_edge_gaussian_index, self.graph_edge_colors = _neural_graph_display(
@@ -528,6 +542,18 @@ class ModalViewerData:
                 "**Geometry graph:** distinct colors = connected geometry components. "
                 "Colors indicate connectivity, not rigid trust or observation support."
             )
+            factors = self.result.completed_modes.arrays.get("rigidity_edge_factor")
+            if factors is not None:
+                if len(factors) != len(self.result.completed_modes.arrays["phi"]):
+                    raise ValueError("Rigidity edge factors differ from the saved mode count")
+                self.graph_edge_colors_by_mode = _rigidity_edge_colors(self.graph_edge_colors, factors)
+                self.has_rigidity_edge_factors = True
+                self.graph_legend += (
+                    " **Downweighted edges:** gray, darker = greater relative rigidity-weight reduction "
+                    "at Selected frequency (Hz). Unchanged edges keep component colors. "
+                    "Fixed linear gray scale: 0% reduction = 85% brightness, "
+                    "50% = 50%, 100% = 15%; small reductions remain light gray."
+                )
             return
         graph_path = self.result.completed_modes.manifest.get(
             "observed_structure_graph"
@@ -1201,6 +1227,10 @@ class ModalViserViewer:
             self.show_component_graph = self.server.gui.add_checkbox(
                 "Show component graph", False
             )
+            self.color_downweighted_edges = (
+                self.server.gui.add_checkbox("Color downweighted edges", True)
+                if getattr(self.data, "has_rigidity_edge_factors", False) else None
+            )
             self.component_graph_edge_count = self.server.gui.add_slider(
                 "Max visible graph edges",
                 min=0,
@@ -1226,6 +1256,7 @@ class ModalViserViewer:
             self.support_mode,
             *self.support_filters,
             self.show_component_graph,
+            self.color_downweighted_edges,
             self.component_graph_edge_count,
             self.component_graph_line_width,
         )
@@ -1283,7 +1314,7 @@ class ModalViserViewer:
         self._component_graph_color_mode = None
 
     def _update_component_graph(self, means: Tensor) -> None:
-        """Display observed graph edges with trusted colors and untrusted gray."""
+        """Display graph connectivity and optional selected-mode rigidity weights."""
 
         if not bool(self.show_component_graph.value):
             return
@@ -1299,7 +1330,8 @@ class ModalViserViewer:
         points_numpy = points.detach().cpu().numpy()
         mode_index = None
         colors = self.data.graph_edge_colors
-        if self.data.graph_edge_colors_by_mode is not None:
+        color_downweighted = getattr(self, "color_downweighted_edges", None)
+        if self.data.graph_edge_colors_by_mode is not None and (color_downweighted is None or color_downweighted.value):
             mode_index = self.data.frequency_order[int(self.phase_mode.value)]
             colors = self.data.graph_edge_colors_by_mode[mode_index]
         if (

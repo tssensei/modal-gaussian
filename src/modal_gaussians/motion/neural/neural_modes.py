@@ -39,6 +39,7 @@ PREFIX_NORMALIZATION_ARRAYS = {
 MODE_ARRAYS = {
     "alphas", "alpha_identifiable_mask", "observation_view_mask", "support_class",
     "sample_target", "mode_view_rms", "mode_view_loss_scale", "amplitude_scale",
+    "rigidity_edge_factor", "rigidity_edge_coherence", "rigidity_edge_evidence",
 } | POINTWISE_MODE_ARRAYS | GUARDED_MODE_ARRAYS | COMPONENT_MODE_ARRAYS
 
 
@@ -71,8 +72,14 @@ class NeuralModesConfig:
     device: str = "auto"
     graph_edge_filter: str = "depth"
     training_fragment_config: dict[str, Any] | None = None
+    rigidity_refinement: dict[str, Any] | None = None
 
     def validate(self) -> None:
+        if self.rigidity_refinement is not None:
+            from .rigidity_refinement import RigidityRefinementConfig
+            RigidityRefinementConfig.from_dict(self.rigidity_refinement)
+            if (self.training_fragment_config or {}).get("strategy") != "component_field":
+                raise ValueError("Rigidity refinement requires component_field frozen inputs")
         if self.training_fragment_config is not None:
             from modal_gaussians.motion.neural.strategies import config_class
             config_class(self.training_fragment_config).from_dict(self.training_fragment_config)
@@ -114,6 +121,8 @@ class NeuralModesConfig:
             result.pop("training_fragment_config")
         if self.local_feature_dim == 0:
             result.pop("local_feature_dim")
+        if self.rigidity_refinement is None:
+            result.pop("rigidity_refinement")
         return result
 
     @classmethod
@@ -348,9 +357,13 @@ def _field_geometry(arrays: Mapping[str, np.ndarray], mode: int, device: Any = "
     control_indices = arrays["c_control_point_index"]
     if training_fill:
         control_indices = arrays["t_host_gaussian_index"][control_indices]
+    gaussian_weights = arrays["g_edge_weight"]
+    if "rigidity_edge_factor" in arrays:
+        # Loss-only overlay: never change topology, controls, interpolation or GNN weights.
+        gaussian_weights = gaussian_weights * arrays["rigidity_edge_factor"][mode]
     values = {
         "gaussian_positions": arrays["g_points"], "control_positions": arrays["c_positions"],
-        "gaussian_edges": arrays["g_edge_index"], "gaussian_edge_weights": arrays["g_edge_weight"],
+        "gaussian_edges": arrays["g_edge_index"], "gaussian_edge_weights": gaussian_weights,
         "control_edges": arrays["c_control_edges"], "control_edge_weights": arrays["c_control_edge_weight"],
         "control_edge_lengths": arrays["c_control_edge_length"],
         "interpolation_indptr": arrays[interpolation_prefix + "interpolation_indptr"],
@@ -366,7 +379,7 @@ def _field_geometry(arrays: Mapping[str, np.ndarray], mode: int, device: Any = "
         values["control_supported"] = source_mask[control_indices]
         edges = arrays["g_edge_index"]
         keep = source_mask[edges].all(axis=1)
-        values["gaussian_edges"], values["gaussian_edge_weights"] = edges[keep], arrays["g_edge_weight"][keep]
+        values["gaussian_edges"], values["gaussian_edge_weights"] = edges[keep], gaussian_weights[keep]
         weights = arrays["p_neighbor_weight"][mode]
         rows, slots = np.nonzero(weights > 0)
         values.update(transfer_rows=rows, transfer_sources=arrays["p_neighbor_index"][mode][rows, slots],
@@ -377,7 +390,7 @@ def _field_geometry(arrays: Mapping[str, np.ndarray], mode: int, device: Any = "
         values["control_supported"] = arrays["h_control_supported"][mode]
         edges = arrays["g_edge_index"]
         keep = learning[edges].all(axis=1)
-        values["gaussian_edges"], values["gaussian_edge_weights"] = edges[keep], arrays["g_edge_weight"][keep]
+        values["gaussian_edges"], values["gaussian_edge_weights"] = edges[keep], gaussian_weights[keep]
         weights = arrays["h_neighbor_weight"][mode]
         rows, slots = np.nonzero(weights > 0)
         values.update(transfer_rows=rows, transfer_sources=arrays["h_neighbor_index"][mode][rows, slots],
@@ -392,7 +405,7 @@ def _field_geometry(arrays: Mapping[str, np.ndarray], mode: int, device: Any = "
         # edges joining directly supervised and structurally inferred members.
         edges = arrays["g_edge_index"]
         keep = own[edges].all(axis=1)
-        values["gaussian_edges"], values["gaussian_edge_weights"] = edges[keep], arrays["g_edge_weight"][keep]
+        values["gaussian_edges"], values["gaussian_edge_weights"] = edges[keep], gaussian_weights[keep]
         weights = arrays["u_neighbor_weight"][mode]
         rows, slots = np.nonzero(weights > 0)
         values.update(transfer_rows=rows, transfer_sources=arrays["u_neighbor_index"][mode][rows, slots],
@@ -924,11 +937,22 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
     if resume and (work / "manifest.json").exists():
         frozen, previous_contract = _read_frozen_resume(work, source, settings, runtime)
         _prepare_work(work, destination, source, previous_contract, resume=True)
+    if settings.rigidity_refinement is not None and frozen is None:
+        if prepared_inputs is None:
+            raise ValueError("Rigidity refinement requires prepared inputs")
+        baseline_config = settings.to_dict()
+        baseline_config.pop("rigidity_refinement")
+        with timings.stage("refinement_frozen_inputs"):
+            frozen, _ = _read_frozen_resume(
+                Path(settings.rigidity_refinement["baseline_work_dir"]), source,
+                NeuralModesConfig.from_dict(baseline_config), runtime)
+        report_progress("rigidity refinement: reusing baseline observations, graph, controls, interpolation and donors")
     report_progress("neural modes: freezing full-foreground observation renderer")
     if prepared_inputs is not None:
         arrays, projectors, cameras, depths, alpha_images = prepared_inputs.training_inputs(
-            source, scene, old_graph, settings, device, timings)
-        if frozen is not None and _arrays_identity(arrays) != _arrays_identity(frozen):
+            source, scene, old_graph, settings, device, timings,
+            frozen_arrays=frozen if settings.rigidity_refinement is not None else None)
+        if frozen is not None and arrays is not frozen and _arrays_identity(arrays) != _arrays_identity(frozen):
             raise ValueError("Prepared fixed inputs differ from resumed work")
         frozen = arrays
     else:
@@ -986,6 +1010,10 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
     for mode in selected_slots:
         if not np.any(arrays["observation_view_mask"][mode].any(axis=1) & (roles[mode] != 0)):
             raise ValueError(f"Neural mode {mode} has no effective Gaussian observation contribution")
+    if settings.rigidity_refinement is not None and "rigidity_edge_factor" not in arrays:
+        from .rigidity_refinement import build_rigidity_factors
+        arrays.update(build_rigidity_factors(
+            prepared_inputs, arrays, cameras, settings.rigidity_refinement, selected_slots, timings))
     geometry_metadata = {
         "policy": ("all_foreground_mutual_knn_no_depth_filter" if settings.graph_edge_filter == "none"
                    else "all_foreground_three_state_depth_geometry_no_rgb"),
@@ -1003,6 +1031,12 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         geometry_metadata["fragment_training"] = settings.training_fragment_config
         from modal_gaussians.motion.neural.strategies import diagnostics
         report_progress("neural attachment preflight: " + json.dumps(diagnostics(arrays), allow_nan=False))
+    if settings.rigidity_refinement is not None:
+        geometry_metadata["rigidity_refinement"] = {
+            "application": "gaussian_strain_weights_only",
+            "factor": "1-strength*min(sum_view_eta,1)*weighted_mean_view_inconsistency",
+            "config": settings.rigidity_refinement,
+        }
     run_contract = {"format": "modal_gaussians.neural_modes_work", "version": 1,
                     "source_identity": _source_identity(source), "config": settings.to_dict(), "runtime": runtime,
                     "geometry_graph": geometry_metadata, "fixed_arrays_identity": _arrays_identity(arrays)}

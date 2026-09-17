@@ -24,6 +24,8 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
     }
     required.update("g_" + f.name for f in fields(GeometryGraph))
     required.update("c_" + f.name for f in fields(ControlGraph))
+    if config.rigidity_refinement is not None:
+        required.update(("rigidity_edge_factor", "rigidity_edge_coherence", "rigidity_edge_evidence"))
     if training_fill:
         from modal_gaussians.motion.neural.strategies import array_names
         required.update(array_names(config.training_fragment_config))
@@ -36,6 +38,13 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
     K, G, V = (int(manifest["counts"][name]) for name in ("modes", "foreground_gaussians", "views"))
     if min(K, G, V) <= 0:
         raise ValueError("Neural artifact counts must be positive")
+    if config.rigidity_refinement is not None:
+        for name in ("rigidity_edge_factor", "rigidity_edge_coherence", "rigidity_edge_evidence"):
+            value = arrays[name]
+            if value.shape != (K, len(arrays["g_edge_index"])) or value.dtype != np.float32:
+                raise ValueError(f"Invalid rigidity refinement array {name}")
+            if np.any(value < 0) or np.any(value > 1):
+                raise ValueError(f"Rigidity refinement {name} must lie in [0,1]")
     if selected_slots is not None and len(selected_slots) != K:
         raise ValueError("Neural prefix mode count differs from selected slots")
     for name, value in arrays.items():

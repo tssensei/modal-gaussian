@@ -1579,6 +1579,35 @@ explicit `validate=True` for requested diagnostics. Basic input/schema/index
 errors, divergent-training errors, cache selection, safe deserialization, atomic
 writes and no-overwrite protections remain. No new CLI option is required.
 
+For a controlled relative-rigidity experiment, the iteration's `neural` section
+can include `rigidity_refinement` with an absolute `baseline_work_dir`,
+`window_seconds: 10.0`, `hop_seconds: 2.0`, `strength: 0.5`,
+`amplitude_floor_fraction: 0.05`, `minimum_windows: 3`, and
+`minimum_effective_windows: 3.0`. All fields must be supplied. The baseline is
+an existing neural work directory containing `manifest.json` and
+`fixed_inputs.npz`; its sources, runtime and all other neural settings must
+match. The component-field experiment reuses its exact observations, graph,
+controls, interpolation and donors, then trains from the same frequency seed.
+
+This option reads existing reference-relative flow in occupied spatial tiles
+and computes selected-frequency, mean-centered Hann-window responses. Each
+point uses a fixed dominant x/y component across windows. Reliable surface
+visibility and contribution gates come from the baseline; the amplitude floor
+is a fraction of the median positive response amplitude in each view. At least
+three jointly usable windows and a cross-amplitude effective count of three are
+required. These are availability heuristics, not optical-flow confidence or
+independent-window counts. Stable anti-phase is retained; unknown edges retain
+their old weights. Per-view disagreement is weighted by usable-window coverage;
+the summed coverage is capped at one for the final attenuation strength.
+
+Only Gaussian strain uses `g_edge_weight * rigidity_edge_factor`. Original
+geometry/control weights, connectivity, graph lengths, control positions, GNN
+aggregation, interpolation, rotation smoothness and donor transfer are unchanged.
+Factors, coherence and evidence availability are saved in the mode artifact;
+edge evidence is cached separately under `rigidity_evidence`. No edge is cut,
+and the existing cross-branch control interpolation remains. This experiment
+does not establish material connectivity or recover physical coupling.
+
 The default `--stage modes` stops after training with fixed fragment fill and
 publication of the final 3D modes (status `modes_ready`), without validation. The exact
 artifact path is `completed_modes` in the experiment's `outputs.json`; it can
@@ -1616,6 +1645,15 @@ binding, point order, schema and index checks remain; cache checksums are not
 recomputed at startup. The graph and Gaussian centers appear by default, colored by connected
 component. Camera navigation, Gaussian/background visibility, edge count, and
 line width remain available; motion and spectrum controls are absent.
+
+Depth-filtered graphs also show rejected candidate edges in white by default;
+retained edges and points use the filtered graph's component colors. Use
+`Show retained edges` and `Show removed edges (white)` to inspect either group.
+The visible-edge budget samples both groups, keeping at least one rejected edge
+when available. White means rejected by the complete depth-filtering rule,
+including unsupported edges beyond the short-edge fallback distance; it does
+not imply every white edge crossed a measured depth discontinuity. Hiding the
+Gaussian render uses a dark background so white edges remain visible.
 
 Only when the user explicitly requests video-coordinate fitting and full
 evaluation, use the separately retained compatibility path below. A normal

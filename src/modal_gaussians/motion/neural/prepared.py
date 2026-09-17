@@ -73,13 +73,14 @@ class PreparedNeuralInputs:
             if getattr(config, name) != getattr(baseline, name):
                 raise ValueError(f"Observation setting {name} changed; build a new preparation")
 
-    def training_inputs(self, source, scene, old_graph, config, device, timer):
+    def training_inputs(self, source, scene, old_graph, config, device, timer, *, frozen_arrays=None):
         from modal_gaussians.static import cameras_from_scene_manifest
         from modal_gaussians.motion.neural.geometry_graph import (
             GeometryGraph, build_geometry_graph_arrays, build_control_graph, depth_thresholds_from_manifest,
         )
         self.validate_sources(source, config)
-        arrays = {k[2:]: v.copy() for k, v in self.arrays.items() if k.startswith("o_")}
+        arrays = (frozen_arrays if frozen_arrays is not None else
+                  {k[2:]: v.copy() for k, v in self.arrays.items() if k.startswith("o_")})
         with timer.stage("observation_cache"):
             scene.to(device).eval()
             for parameter in scene.parameters():
@@ -98,6 +99,8 @@ class PreparedNeuralInputs:
                 depths.append(self.arrays[f"v{index}_depth"])
                 alphas.append(self.arrays[f"v{index}_alpha"])
         timer.records[-1]["cache_hit"] = True
+        if frozen_arrays is not None:
+            return arrays, projectors, cameras, depths, alphas
         endpoint, jump = depth_thresholds_from_manifest(old_graph.manifest, [v["label"] for v in source["views"]])
         settings = nm._geometry_config(config)
         from modal_gaussians.motion.neural import geometry_graph as geometry_module

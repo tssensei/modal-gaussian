@@ -11,7 +11,53 @@ import torch
 from modal_gaussians.iteration_cache import identity, load_entry
 from modal_gaussians.motion.neural.geometry_graph import GeometryGraph
 from modal_gaussians.static import load_static_scene, cameras_from_scene_manifest, _load_gsplat_rasterization
-from modal_gaussians.vis.viewer import ModalViserViewer, ViewerCamera, _component_colors, _neural_graph_display
+from modal_gaussians.vis.viewer import (
+    ModalViserViewer, ViewerCamera, _component_colors, _neural_graph_display, _stable_uniform_indices,
+)
+
+
+def _candidate_graph_display(graph):
+    """Keep candidate order; white marks edges absent from the filtered graph."""
+    count = len(graph.points)
+    retained, _ = _neural_graph_display({"g_edge_index": graph.edge_index,
+        "g_component_index": graph.component_index, "g_edge_weight": graph.edge_weight}, count)
+    candidates = np.asarray(graph.candidate_edge_index)
+    if (candidates.ndim != 2 or candidates.shape[1] != 2
+            or not np.issubdtype(candidates.dtype, np.integer)
+            or np.any(candidates < 0) or np.any(candidates >= count)):
+        raise ValueError("Geometry candidate edge indices are invalid")
+
+    def keys(edges):
+        ordered = np.sort(edges.astype(np.int64, copy=False), axis=1)
+        return ordered[:, 0] * count + ordered[:, 1]
+
+    removed = ~np.isin(keys(candidates), keys(retained))
+    if np.count_nonzero(~removed) != len(retained):
+        raise ValueError("Geometry retained edges do not match the candidate edges")
+    colors = np.round(255 * _component_colors(graph.component_index[candidates[:, 0]])).astype(np.uint8)
+    colors[removed] = 255
+    return candidates, colors, removed
+
+
+def _candidate_edge_subset(removed, maximum, show_retained=True, show_removed=True):
+    """Uniformly sample each visible class, reserving room for rare removed edges."""
+    retained = np.flatnonzero(~removed) if show_retained else np.empty(0, dtype=np.int64)
+    rejected = np.flatnonzero(removed) if show_removed else np.empty(0, dtype=np.int64)
+    budget = min(max(int(maximum), 0), len(retained) + len(rejected))
+    if not budget:
+        return np.empty(0, dtype=np.int64)
+    if len(retained) and len(rejected):
+        rejected_budget = max(1, round(budget * len(rejected) / (len(retained) + len(rejected))))
+        if budget > 1:
+            rejected_budget = min(rejected_budget, budget - 1)
+        rejected_budget = min(len(rejected), rejected_budget)
+        retained_budget = min(len(retained), budget - rejected_budget)
+        rejected_budget = budget - retained_budget
+    else:
+        rejected_budget = min(len(rejected), budget)
+        retained_budget = budget - rejected_budget
+    return np.sort(np.concatenate((retained[_stable_uniform_indices(len(retained), retained_budget)],
+                                   rejected[_stable_uniform_indices(len(rejected), rejected_budget)])))
 
 
 class GraphViewerData:
@@ -34,8 +80,7 @@ class GraphViewerData:
         if not np.array_equal(self.graph.points, means):
             raise ValueError("Geometry points differ from the scene's foreground order or positions")
         self.graph_config = contract["config"]
-        self.graph_edge_gaussian_index, self.graph_edge_colors = _neural_graph_display(
-            {"g_" + name: value for name, value in arrays.items()}, len(means))
+        self.graph_edge_gaussian_index, self.graph_edge_colors, self.graph_edge_removed = _candidate_graph_display(self.graph)
         self.graph_edge_colors_by_mode = None
         self.point_colors = _component_colors(self.graph.component_index)
         cameras = cameras_from_scene_manifest(self.scene.manifest)
@@ -57,12 +102,17 @@ class GraphViserViewer(ModalViserViewer):
         gui = self.server.gui
         graph = self.data.graph
         config = self.data.graph_config
+        removed_count = int(self.data.graph_edge_removed.sum())
+        candidate_count = len(self.data.graph_edge_gaussian_index)
         gui.add_markdown(
             f"**Static geometry graph** — {len(graph.points):,} Gaussians, "
-            f"{len(graph.edge_index):,} edges, {len(graph.component_size):,} components.\n\n"
+            f"{len(graph.edge_index):,} retained edges, {removed_count:,} removed edges, "
+            f"{len(graph.component_size):,} components.\n\n"
             f"K = {config['graph_neighbors']}, radius = {config['graph_max_distance']:g} "
             f"(scene units), filter = {config['graph_edge_filter']}. "
-            "Colors show connected components, including isolated points.")
+            "Colors show filtered connected components, including isolated points. "
+            "White edges were removed by the depth filter rules, including unsupported long edges; "
+            "white does not mean downweighted. Edge sampling reserves space for removed edges.")
         self.viewer_resolution = gui.add_slider(
             "Viewer Res", min=64, max=2048, step=1, initial_value=self._viewer_resolution)
         self.hide_render = gui.add_checkbox("Hide Gaussian render", False)
@@ -71,16 +121,38 @@ class GraphViserViewer(ModalViserViewer):
         self.show_points = gui.add_checkbox("Show Gaussian centers", True)
         self.point_size = gui.add_slider("Point size", min=0.0002, max=0.008, step=0.0001, initial_value=0.001)
         self.show_component_graph = gui.add_checkbox("Show component graph", True)
+        self.show_retained_edges = gui.add_checkbox("Show retained edges", True)
+        self.show_removed_edges = gui.add_checkbox("Show removed edges (white)", True, disabled=removed_count == 0)
         self.component_graph_edge_count = gui.add_slider(
-            "Max visible graph edges", min=0, max=max(len(graph.edge_index), 1),
-            step=1, initial_value=min(20_000, len(graph.edge_index)))
+            "Max visible graph edges", min=0, max=max(candidate_count, 1),
+            step=1, initial_value=min(20_000, candidate_count))
         self.component_graph_line_width = gui.add_slider(
             "Graph line width", min=0.1, max=10.0, step=0.1, initial_value=1.0)
         for handle in (self.viewer_resolution, self.hide_render, self.hide_background,
                        self.show_points, self.point_size, self.show_component_graph,
+                       self.show_retained_edges, self.show_removed_edges,
                        self.component_graph_edge_count, self.component_graph_line_width):
             handle.on_update(self.request_render)
         self._build_camera_controls()
+
+    def _update_component_graph(self, means):
+        selected = _candidate_edge_subset(self.data.graph_edge_removed, self.component_graph_edge_count.value,
+                                         self.show_retained_edges.value, self.show_removed_edges.value)
+        if not self.show_component_graph.value or not len(selected):
+            self._remove_component_graph()
+            return
+        edges = self.data.graph_edge_gaussian_index[selected]
+        points = means[torch.as_tensor(edges, device=means.device)].detach().cpu().numpy()
+        if self._component_graph_handle is None or not np.array_equal(selected, self._component_graph_edge_indices):
+            self._remove_component_graph()
+            self._component_graph_handle = self.server.scene.add_line_segments(
+                "/debug/component_graph", points=points,
+                colors=np.repeat(self.data.graph_edge_colors[selected, None, :], 2, axis=1),
+                thickness=float(self.component_graph_line_width.value), thickness_units="screen")
+            self._component_graph_edge_indices = selected
+        else:
+            self._component_graph_handle.points = points
+            self._component_graph_handle.thickness = float(self.component_graph_line_width.value)
 
     @torch.inference_mode()
     def _render(self, client):
@@ -98,7 +170,8 @@ class GraphViserViewer(ModalViserViewer):
             self._point_cloud.point_size = float(self.point_size.value)
         camera = self._render_camera(client)
         if self.hide_render.value:
-            return np.full((camera.height, camera.width, 3), 255, dtype=np.uint8)
+            background = 32 if self.data.graph_edge_removed.any() else 255
+            return np.full((camera.height, camera.width, 3), background, dtype=np.uint8)
         rendered = self.data.scene.render_deformed(
             camera, means, include_background=not self.hide_background.value)["rgb"]
         return rendered.clamp(0, 1).mul(255).round().byte().cpu().numpy()

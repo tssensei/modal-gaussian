@@ -68,11 +68,15 @@ def resolve_mode_slots(modes, frequencies_hz):
     return nm._validated_mode_slots(sorted(slots), len(modes))
 
 
-def training_revision(strategy_config):
+def training_revision(strategy_config, refinement_config=None):
     """Cache only code used by this representation, including artifact replay."""
     from . import artifacts
+    refinement_modules = ()
+    if refinement_config is not None:
+        from . import rigidity_refinement, edge_coherence
+        refinement_modules = (rigidity_refinement, edge_coherence)
     return module_revision(nm, neural_field, geometry_graph, projection, static,
-        camera_geometry, artifacts, strategies, *strategies.implementation_modules(strategy_config))
+        camera_geometry, artifacts, strategies, *strategies.implementation_modules(strategy_config), *refinement_modules)
 
 
 def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", frequencies_hz=None,
@@ -102,7 +106,7 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
     if root == prepared.path or root.is_relative_to(prepared.path):
         raise ValueError("Experiment must not overwrite prepared inputs")
     strategy_config = settings.training_fragment_config
-    neural_revision = training_revision(strategy_config)
+    neural_revision = training_revision(strategy_config, settings.rigidity_refinement)
     contract = {"version": 2, "prepared": str(prepared.path),
                 "prepared_identity": prepared.manifest["prepared_identity"],
                 "config": config, "neural_revision": neural_revision}
