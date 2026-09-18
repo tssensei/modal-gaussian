@@ -290,6 +290,25 @@ def build_parser() -> argparse.ArgumentParser:
     graph_build.add_argument("--min-shared-views", type=_positive_int, default=1)
     graph_build.add_argument("--min-component-nodes", type=_positive_int, default=4)
     graph_build.add_argument("--min-component-edges", type=_positive_int, default=3)
+    gradient_prune = graph_commands.add_parser(
+        "prune-modal-gradient", help="Prune a full KNN cache using visible modal-image gradients")
+    gradient_prune.add_argument("--prepared", required=True, type=Path)
+    gradient_prune.add_argument("--geometry-graph", required=True, type=Path)
+    gradient_prune.add_argument("--view", required=True, action="append", nargs=2,
+                                metavar=("LABEL", "MODAL_IMAGE_DIR"))
+    gradient_prune.add_argument("--frequency", required=True, type=_positive_float)
+    gradient_prune.add_argument("--gradient-threshold", type=_positive_float, default=0.05)
+    gradient_prune.add_argument("--output", required=True, type=Path)
+    similarity_graph = graph_commands.add_parser(
+        "build-modal-similarity", help="Connect KNN candidates only with reliable local modal similarity")
+    for name in ("prepared", "geometry-graph", "output"):
+        similarity_graph.add_argument(f"--{name}", required=True, type=Path)
+    similarity_graph.add_argument("--view", required=True, action="append", nargs=2,
+                                  metavar=("LABEL", "MODAL_IMAGE_DIR"))
+    similarity_graph.add_argument("--frequency", required=True, type=_positive_float)
+    for name, default in (("similarity-threshold", 0.20), ("difference-threshold", 0.30),
+                          ("amplitude-floor-fraction", 0.02), ("max-pixel-distance", 32.0)):
+        similarity_graph.add_argument(f"--{name}", type=_positive_float, default=default)
     rigid_parser = command_parsers.add_parser(
         "rigid",
         help="Bounded-complex view synchronization and rigid modal solve",
@@ -332,9 +351,18 @@ def build_parser() -> argparse.ArgumentParser:
         prepare_neural.add_argument(f"--{name}", type=Path)
     prepare_neural.add_argument("--cache-dir", type=Path, default=Path("outputs/_cache"))
     prepare_neural.add_argument("--output", type=Path, required=True)
+    prepare_selected = motion_commands.add_parser(
+        "prepare-selected-modal", help="Reuse prepared geometry with selected SEA-RAFT modal supervision")
+    prepare_selected.add_argument("--prepared", type=Path, required=True)
+    prepare_selected.add_argument("--view", required=True, action="append", nargs=2,
+                                  metavar=("LABEL", "MODAL_IMAGE_DIR"))
+    prepare_selected.add_argument("--frequency-hz", type=_positive_float, required=True)
+    prepare_selected.add_argument("--output", type=Path, required=True)
     iterate_neural = motion_commands.add_parser("iterate-neural", help="Produce 3D modes; optionally prepare a preview or fit coordinates")
     iterate_neural.add_argument("--prepared", type=Path, required=True)
     iterate_neural.add_argument("--config", type=Path)
+    iterate_neural.add_argument("--geometry-graph", type=Path,
+                                help="Use this saved modal graph and rebuild controls from its retained edges")
     iterate_neural.add_argument("--refine-observations", action="store_true",
                                 help="After v12 propagation, refine visible followers while keeping hosts fixed; reuse training")
     iterate_neural.add_argument("--refinement-config", type=Path,
@@ -857,6 +885,33 @@ def _dispatch(
                 f"{artifact.manifest['gaussian_measurements_identity']}"
             )
             return 0
+        if args.command == "graph" and args.graph_command == "prune-modal-gradient":
+            from modal_gaussians.motion.neural.modal_gradient import ModalGradientConfig
+            from modal_gaussians.motion.neural.modal_gradient_artifact import build_modal_gradient_graph_artifact
+
+            manifest = build_modal_gradient_graph_artifact(
+                prepared_dir=args.prepared, geometry_graph_dir=args.geometry_graph,
+                views=args.view, frequency_hz=args.frequency, output_dir=args.output,
+                config=ModalGradientConfig(gradient_threshold=args.gradient_threshold),
+                command=[parser.prog, *arguments])
+            print(f"Modal-gradient graph: {args.output.resolve()}")
+            print(json.dumps(manifest["summary"], indent=2))
+            return 0
+        if args.command == "graph" and args.graph_command == "build-modal-similarity":
+            from modal_gaussians.motion.neural.modal_similarity import ModalSimilarityConfig
+            from modal_gaussians.motion.neural.modal_gradient_artifact import build_modal_similarity_graph_artifact
+
+            manifest = build_modal_similarity_graph_artifact(
+                prepared_dir=args.prepared, geometry_graph_dir=args.geometry_graph,
+                views=args.view, frequency_hz=args.frequency, output_dir=args.output,
+                config=ModalSimilarityConfig(similarity_threshold=args.similarity_threshold,
+                    difference_threshold=args.difference_threshold,
+                    amplitude_floor_fraction=args.amplitude_floor_fraction,
+                    max_pixel_distance=args.max_pixel_distance),
+                command=[parser.prog, *arguments])
+            print(f"Modal-similarity graph: {args.output.resolve()}")
+            print(json.dumps(manifest["summary"], indent=2))
+            return 0
         if args.command == "graph" and args.graph_command == "build":
             from modal_gaussians.motion.rigid.structure_graph import (
                 ObservedStructureGraphConfig,
@@ -945,10 +1000,18 @@ def _dispatch(
             print(f"prepared: {artifact.path}")
             print(f"prepared_identity: {artifact.manifest['prepared_identity']}")
             return 0
+        if args.command == "motion" and args.motion_command == "prepare-selected-modal":
+            from modal_gaussians.motion.neural.selected_modal import prepare_selected_modal
+            artifact = prepare_selected_modal(prepared_dir=args.prepared, views=args.view,
+                frequency_hz=args.frequency_hz, output_dir=args.output)
+            print(f"Selected-modal prepared: {artifact.path}")
+            print(f"prepared_identity: {artifact.manifest['prepared_identity']}")
+            return 0
         if args.command == "motion" and args.motion_command == "iterate-neural":
             from modal_gaussians.motion.neural.iteration import iterate_neural
             root = iterate_neural(prepared_dir=args.prepared, config_path=args.config,
                                   output_dir=args.output, stage=args.stage, frequencies_hz=args.frequency_hz,
+                                  geometry_graph_dir=args.geometry_graph,
                                   refine_observations=args.refine_observations, refinement_config_path=args.refinement_config)
             print(f"iteration: {root}")
             return 0

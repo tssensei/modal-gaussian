@@ -1,12 +1,81 @@
 # Current neural motion baseline
 
+On **2026-09-18**, the user visually accepted the **Bush 0.744 Hz SEA-RAFT +
+modal-similarity graph** result as the new baseline. This replaces the earlier
+Farneback/features32 result as the starting point for future experiments.
+
+## Accepted Bush result
+
+- Experiment: `outputs/bush_neural_modal_similarity_0744_001/experiment`.
+- Manual preview: `outputs/bush_neural_modal_similarity_0744_001/experiment/preview`.
+- Prepared SEA-RAFT supervision: `outputs/bush_neural_modal_similarity_0744_001/prepared`.
+- Accepted graph: `outputs/bush_graph_modal_similarity_0744_002`.
+- Frozen configuration: [config.json](outputs/bush_neural_modal_similarity_0744_001/config.json).
+- Resolved source/configuration contract: [iteration.json](outputs/bush_neural_modal_similarity_0744_001/experiment/iteration.json).
+- Completed modes: v16, `neural_component_field_with_stable_donors`.
+- Immutable trained modes: `outputs/_cache/trained_modes/0628e6cfefb69e82eacf5973ec0ee345d537f6d98745ae0e985e278af90a087c`.
+- Completed-modes identity: `2be1f71b1b35410deca8713e37581a9d91ceef59571d4b9fb98b99eb81fba517`.
+- Preview identity: `c5ef66b709c373669f855a5b1dac57f0db4e9688835b1fa31262ddbcbd524170`.
+- Frequency: **0.744 Hz**, selected-bundle slot **0**, original candidate index **1**.
+- All three views participate. Training completed at **645 steps**, with **1,382 controls**.
+
+## Default experiment recipe
+
+Use SEA-RAFT reference-to-frame flow and selected-frequency exact DFT modal
+images for both graph construction and training. The accepted sources are
+`outputs/bush1_sea_raft_0744_001`, `outputs/bush2_sea_raft_0744_001`, and
+`outputs/bush3_sea_raft_0744_001`. Recompute complex view alignment and target
+normalization through `motion prepare-selected-modal`; inherited Farneback flow
+metadata supplies reference geometry/timing only. No full spectrum is required.
+
+Start with unfiltered mutual-KNN candidates, **K=16**, maximum radius **0.08**
+in scene units. Apply `graph build-modal-similarity` with similarity threshold
+**0.20**, conflict threshold **0.30**, amplitude floor fraction **0.02**, and
+maximum projected endpoint distance **32 pixels**. Other settings remain:
+amplitude percentile 99, patch radius 1, patch relative dispersion maximum 0.30,
+and alpha minimum 0.05. Require support from at least one reliable view and no
+reliable conflicting view; unknown evidence does not create a connection.
+Visibility uses depth/alpha, but there is no preliminary depth-discontinuity cut.
+The accepted graph contains **770,364 retained edges**.
+
+Pass the saved graph explicitly with `motion iterate-neural --geometry-graph`;
+the neural config uses `graph_edge_filter=none` to avoid another filter.
+Controls and interpolation follow the retained graph. Merely using the new
+K/radius defaults without `--geometry-graph` does **not** reproduce this baseline.
+Graphs remain frequency-specific; use matching inputs/graphs for other scenes
+or frequencies rather than reusing this Bush graph.
+
+Keep width **256**, local features **32**, **3** message layers, control radius
+**0.015L**, maximum 32,768 controls, and deformation/rotation weights **0.1/0.1**.
+Keep learning rate 0.001, maximum 2,000 steps, patience 50, relative tolerance
+1e-6, seed 1729, and the existing `component_field` donor rules. The reusable
+numeric preset is [neural_component_field.json](configs/neural_component_field.json).
+Donor propagation is unchanged: about 105,214 of 231,761 Gaussians receive
+propagated motion, and this separate mechanism can still cross graph boundaries.
+Ellipsoid rotation remains enabled by default in the manual Viewer.
+
+This acceptance records the user's visual judgment of Bush at 0.744 Hz; it does
+not claim this recipe has been evaluated on Corn or other frequencies. No
+experiment validation or modal-coordinate fitting was run. Keep the accepted
+artifacts and their ancestors immutable. This document records the later user
+approval; original `preview_candidate_unapproved`/execution-status fields retain
+their publication-time values.
+
+Launch from the repository in Anaconda Prompt:
+
+```bat
+modal-gaussians viewer --preview "outputs\bush_neural_modal_similarity_0744_001\experiment\preview" --work-dir "outputs\bush_neural_modal_similarity_0744_001\work\viewer" --host 127.0.0.1 --port 8094
+```
+
+## Historical Bush features32 baseline (2026-09-07)
+
 On 2026-09-07, the user selected **only increasing the local feature dimension to
 32**, with width **256** and **three** message-passing layers, as the new baseline
 after comparing the bush capacity experiments. This is the `features32` result,
 not the combined 32-feature/six-layer experiment. The choice is based on the
 user's visual assessment, rather than the lowest training loss.
 
-## Accepted bush result and default experiment recipe
+### Historical result and experiment recipe
 
 - Experiment: `outputs/bush_neural_capacity_0744_001/features32`.
 - Manual preview: `outputs/bush_neural_capacity_0744_001/features32/preview`.
@@ -18,7 +87,8 @@ user's visual assessment, rather than the lowest training loss.
 - Prepared inputs: `outputs/bush_neural_dense_controls_001/prepared`.
 - Frozen experiment config: [features32.json](outputs/bush_neural_capacity_0744_001/configs/features32.json).
 - Resolved configuration and source contract: [iteration.json](outputs/bush_neural_capacity_0744_001/features32/iteration.json).
-- Default overrides for future experiments: [neural_component_field.json](configs/neural_component_field.json).
+- The frozen configuration above preserves the historical defaults; the current
+  `configs/neural_component_field.json` now follows the 2026-09-18 recipe.
 
 The accepted settings are width **256**, local features **32**, **3** message
 layers, control coverage radius `0.015L`, maximum 32,768 controls, and deformation
@@ -34,9 +104,9 @@ donors. Keep the existing donor checks, four-neighbor transfer, geometry,
 interpolation and full modal-image supervision. Observation refinement is off.
 See [component-field.md](docs/component-field.md) for the exact classification.
 
-Future capacity comparisons should start from this recipe and use matching data,
+Historical capacity comparisons should use this frozen recipe and matching data,
 frequency, gain, phase and motion scale. This acceptance covers the bush 0.744 Hz
-result; it does not imply that the 32-feature recipe has already been trained on
+result; it did not imply that the 32-feature recipe had already been trained on
 corn or validated at other frequencies. Historical results and immutable saved
 configs, quality gates and logs remain unchanged. No modal coordinates were fit
 for this preview. The user performs visual evaluation.

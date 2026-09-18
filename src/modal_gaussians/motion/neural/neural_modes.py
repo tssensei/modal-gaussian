@@ -236,6 +236,8 @@ def _source_identity(source: Mapping[str, Any]) -> dict[str, Any]:
         "alignment_identity", "complex_2d_modes_identity", "modes", "views",
     )}
     result["modes"] = source.get("source_modes", source["modes"])
+    if "selected_modal_supervision" in source:
+        result["selected_modal_supervision"] = source["selected_modal_supervision"]
     return result
 
 
@@ -423,10 +425,14 @@ SEMANTICS = {
 }
 
 
-def _semantics(config: NeuralModesConfig) -> dict[str, Any]:
-    if config.training_fragment_config is None and config.local_feature_dim == 0:
+def _semantics(config: NeuralModesConfig, source: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    selected_modal = source is not None and "selected_modal_supervision" in source
+    if config.training_fragment_config is None and config.local_feature_dim == 0 and not selected_modal:
         return SEMANTICS
     result = dict(SEMANTICS)
+    if selected_modal:
+        result.pop("rigid_source_use")
+        result["alignment_source"] = "selected_modal_alignment"
     if config.local_feature_dim:
         result["control_features"] = {
             "dimension": config.local_feature_dim,
@@ -724,7 +730,7 @@ def _publish_artifact(destination: Path, source: Mapping[str, Any], arrays: Mapp
             **source, "source_identity": _source_identity(source), "config": config.to_dict(),
             "runtime": dict(runtime), "run_identity": run_identity, "geometry_graph": dict(graph_metadata),
             "producer": {"project_version": __version__, "created_utc": datetime.now(timezone.utc).isoformat(), "command": list(command)},
-            "semantics": _semantics(config), "quality_gate": QUALITY_GATE,
+            "semantics": _semantics(config, source), "quality_gate": QUALITY_GATE,
             "counts": {"modes": mode_count, "foreground_gaussians": point_count, "views": arrays["alphas"].shape[1],
                        "geometry_edges": len(arrays["g_edge_index"]), "controls": len(arrays["c_positions"]),
                        "measurement_samples": len(arrays["sample_confidence"])},
@@ -995,6 +1001,10 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         "interpolation": "all_graph_distance_supports_within_2h_normalized_wendland_c2",
         "control_edge_length": "original_geometry_graph_shortest_path",
     }
+    if getattr(prepared_inputs, "external_geometry_contract", None) is not None:
+        geometry_metadata.update(policy="saved_modal_graph_with_rebuilt_controls",
+                                 external_graph=prepared_inputs.external_geometry_contract)
+        geometry_metadata["config"]["edge_filter"] = prepared_inputs.external_geometry_contract["config"]["graph_edge_filter"]
     if settings.training_fragment_config is not None:
         geometry_metadata["interpolation"] = (
             "host_wendland_then_per_point_displacement_transfer"

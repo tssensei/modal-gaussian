@@ -7,8 +7,8 @@
     "max_controls": 32768,
     "deformation_weight": 0.1,
     "rotation_weight": 0.1,
-    "graph_neighbors": 8,
-    "graph_max_distance": 0.008,
+    "graph_neighbors": 16,
+    "graph_max_distance": 0.08,
     "graph_edge_filter": "none"
   },
   "fragment": {

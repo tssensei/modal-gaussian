@@ -270,7 +270,9 @@ class SpectrumComparisonController:
         raw_frequencies = np.fft.rfftfreq(
             flow.arrays.flow.shape[0], d=1.0 / float(flow.manifest["fps_hz"])
         )
-        if self.prepared is None:
+        if not self.full_spectrum_available:
+            raw_power = np.zeros(len(raw_frequencies), dtype=np.float32)
+        elif self.prepared is None:
             raw_power = _mean_image_plane_power(flow.arrays.spectrum, pixels)
             self._ready_spectra.add(label)
         else:
@@ -314,6 +316,10 @@ class SpectrumComparisonController:
         self._refresh_products()
 
     @property
+    def full_spectrum_available(self) -> bool:
+        return self.dense_modes.manifest.get("full_spectrum_available", True)
+
+    @property
     def full_spectrum_ready(self) -> bool:
         return self.view_id in self._ready_spectra
 
@@ -323,6 +329,8 @@ class SpectrumComparisonController:
 
     def load_full_spectrum(self, label: str) -> None:
         """Explicit expensive operation; GUI invokes it on a background worker."""
+        if not self.full_spectrum_available:
+            raise ValueError("This SEA-RAFT source contains selected modal images only; no matching full spectrum is available")
         state = self._states[label]
         contract = self._spectrum_contract(state.flow, state.pixels_xy)
         cached = load_entry(self.cache_dir / "viewer_spectrum", contract)
@@ -479,7 +487,9 @@ class SpectrumComparisonController:
             f"**component:** {component}  \n"
             f"**Amplitude normalization:** `{self.amplitude_normalization}`"
             + ("" if identifiable else "  \n**Reconstruction unavailable:** zero projection energy.")
-            + ("" if self.full_spectrum_ready else "  \n**Full spectrum not loaded.** Selected-frequency modal images are available.")
+            + ("  \n**SEA-RAFT selected-frequency modal images.** Full spectrum is unavailable."
+               if not self.full_spectrum_available else
+               ("" if self.full_spectrum_ready else "  \n**Full spectrum not loaded.** Selected-frequency modal images are available."))
             + ("  \n" + self.spectrum_error if self.spectrum_error else "")
         )
 
@@ -574,8 +584,8 @@ class ModalSpectrumPanel:
         )
         self.frequency_range = server.gui.add_dropdown(
             "Frequency range",
-            options=("full spectrum", "selected modes"),
-            initial_value="full spectrum",
+            options=("full spectrum", "selected modes") if controller.full_spectrum_available else ("selected modes",),
+            initial_value="full spectrum" if controller.full_spectrum_available else "selected modes",
         )
         self.component = server.gui.add_dropdown(
             "Modal image component",
@@ -602,7 +612,8 @@ class ModalSpectrumPanel:
         solo = server.gui.add_button("Solo selected mode")
         enable_all = server.gui.add_button("Enable all modes")
         self.status = server.gui.add_markdown(controller.status)
-        self.load_spectrum = server.gui.add_button("Load full spectrum", visible=not controller.full_spectrum_ready)
+        self.load_spectrum = server.gui.add_button("Load full spectrum",
+            visible=controller.full_spectrum_available and not controller.full_spectrum_ready)
         server.gui.add_markdown(
             "Both spectra show **mean 2D motion amplitude** on shared axes. "
             "Reconstruction contains **trained frequencies only**, not a video FFT."
@@ -763,7 +774,7 @@ class ModalSpectrumPanel:
         finally:
             self._updating = False
         self.status.content = self.controller.status
-        self.load_spectrum.visible = not self.controller.full_spectrum_ready
+        self.load_spectrum.visible = self.controller.full_spectrum_available and not self.controller.full_spectrum_ready
         self.raw_plot.visible = self.controller.full_spectrum_ready
         self.raw_plot.data = _spectrum_plot_data(
             self.controller.raw_frequencies_hz,

@@ -129,7 +129,11 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
             or not np.allclose(arrays["mode_view_loss_scale"], np.maximum(expected_rms, expected_floor), rtol=1e-10, atol=1e-12)):
         raise ValueError("Neural observation normalization differs from fixed measurements")
     graph = GeometryGraph.from_dict({name[2:]: value for name, value in arrays.items() if name.startswith("g_")}, validate=True)
-    if config.graph_edge_filter == "none":
+    external_graph = manifest.get("geometry_graph", {}).get("external_graph")
+    if external_graph is not None:
+        if nm._arrays_identity(graph.as_dict()) != external_graph["arrays_identity"]:
+            raise ValueError("Neural geometry differs from its bound external graph")
+    elif config.graph_edge_filter == "none":
         from modal_gaussians.motion.neural.geometry_graph import EVIDENCE_SPATIAL_PRIOR, _mutual_knn
         expected_edges, _ = _mutual_knn(graph.points.astype(np.float64), nm._geometry_config(config))
         expected_weights = 1.0 / np.sqrt(graph.degree[expected_edges[:, 0]].astype(np.float64) * graph.degree[expected_edges[:, 1]])
@@ -181,6 +185,8 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
 
 
 def _check_persisted_sources(manifest: Mapping[str, Any], arrays: Mapping[str, np.ndarray]) -> None:
+    if "selected_modal_supervision" in manifest:
+        raise NotImplementedError("Forensic source validation is not available for selected-modal supervision; load with validate=False")
     source, scene, _, _, _, alignment, dense = nm._load_sources(
         scene_dir=manifest["static_scene"], topology_dir=manifest["topology"],
         measurements_dir=manifest["measurements"], graph_dir=manifest["observed_structure_graph"],
@@ -244,7 +250,7 @@ def load_neural_completed_modes(path: str | Path, *, validate: bool = False) -> 
     if manifest["version"] != version or manifest.get("completion_method") != method:
         raise ValueError("Unsupported neural artifact version/method/configuration combination")
     if validate:
-        if manifest.get("semantics") != nm._semantics(config) or manifest.get("quality_gate") != nm.QUALITY_GATE:
+        if manifest.get("semantics") != nm._semantics(config, manifest) or manifest.get("quality_gate") != nm.QUALITY_GATE:
             raise ValueError("Neural completed-mode semantics differ")
         if manifest.get("arrays_file") != nm.ARRAYS_FILENAME or manifest.get("networks_file") != nm.MODELS_FILENAME:
             raise ValueError("Neural artifact file names differ")

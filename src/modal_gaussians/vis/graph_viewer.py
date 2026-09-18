@@ -11,7 +11,58 @@ import torch
 from modal_gaussians.iteration_cache import identity, load_entry
 from modal_gaussians.motion.neural.geometry_graph import GeometryGraph
 from modal_gaussians.static import load_static_scene, cameras_from_scene_manifest, _load_gsplat_rasterization
-from modal_gaussians.vis.viewer import ModalViserViewer, ViewerCamera, _component_colors, _neural_graph_display
+from modal_gaussians.vis.viewer import ModalViserViewer, ViewerCamera, _component_colors, _stable_uniform_indices
+
+
+def _candidate_graph_display(graph, status=None):
+    """Keep pruned candidates visible in white, with retained component colors."""
+    edges = np.asarray(graph.candidate_edge_index)
+    if (edges.ndim != 2 or edges.shape[1] != 2 or not np.issubdtype(edges.dtype, np.integer)
+            or np.any(edges < 0) or np.any(edges >= len(graph.points))):
+        raise ValueError("Invalid candidate edge indices")
+    count = len(graph.points)
+    candidates = np.sort(edges, axis=1).astype(np.int64)
+    retained = np.sort(graph.edge_index, axis=1).astype(np.int64)
+    removed = ~np.isin(candidates[:, 0] * count + candidates[:, 1],
+                       retained[:, 0] * count + retained[:, 1])
+    colors = np.round(255 * _component_colors(graph.component_index[edges[:, 0]])).astype(np.uint8)
+    colors[removed] = 255
+    if status is not None:
+        status = np.asarray(status)
+        if (status.shape != (len(edges),) or status.dtype != np.uint8
+                or np.any(status > 2) or not np.array_equal(status != 0, removed)):
+            raise ValueError("Candidate status does not match retained graph edges")
+        colors[status == 2] = 90
+    return edges, colors, removed
+
+
+def _candidate_edge_subset(removed, maximum, show_retained=True, show_removed=True):
+    """Balance the display budget so rare removed edges remain visible."""
+    kept = np.flatnonzero(~removed) if show_retained else np.empty(0, dtype=np.int64)
+    cut = np.flatnonzero(removed) if show_removed else np.empty(0, dtype=np.int64)
+    maximum = max(int(maximum), 0)
+    cut_count = min(len(cut), (maximum + 1) // 2)
+    kept_count = min(len(kept), maximum - cut_count)
+    cut_count = min(len(cut), maximum - kept_count)
+    return np.sort(np.concatenate((kept[_stable_uniform_indices(len(kept), kept_count)],
+                                   cut[_stable_uniform_indices(len(cut), cut_count)])))
+
+
+def _similarity_edge_subset(status, maximum, show_retained, show_rejected, show_unsupported):
+    groups = [np.flatnonzero(status == value) for value, show in
+              enumerate((show_retained, show_rejected, show_unsupported)) if show]
+    groups = [group for group in groups if len(group)]
+    if not groups:
+        return np.empty(0, dtype=np.int64)
+    budget = max(int(maximum), 0)
+    selected = []
+    # Allocate small groups first, then share the remaining display budget.
+    groups.sort(key=len)
+    for index, group in enumerate(groups):
+        count = min(len(group), (budget + len(groups) - index - 1) // (len(groups) - index))
+        selected.append(group[_stable_uniform_indices(len(group), count)])
+        budget -= count
+    return np.sort(np.concatenate(selected))
 
 
 class GraphViewerData:
@@ -20,22 +71,39 @@ class GraphViewerData:
         self.scene = load_static_scene(scene_dir, self.device).eval()
         self.scene.requires_grad_(False)
         path = Path(graph_dir).expanduser().resolve(strict=True)
-        contract = json.loads((path / "manifest.json").read_text(encoding="utf-8")).get("contract", {})
-        if (contract.get("implementation") != "neural_geometry_cache_v1"
-                or contract.get("foreground") != self.scene.manifest["foreground_identity"]):
-            raise ValueError("Geometry cache does not belong to this scene's foreground")
-        if path.name != identity(contract):
-            raise ValueError("Geometry cache directory differs from its contract identity")
-        arrays = load_entry(path.parent, contract)
-        if arrays is None:
-            raise FileNotFoundError(f"Geometry cache is missing: {path}")
+        manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+        self.is_similarity_graph = manifest.get("format") == "modal_gaussians.modal_similarity_graph"
+        status = None
+        if manifest.get("format") in ("modal_gaussians.modal_gradient_graph", "modal_gaussians.modal_similarity_graph"):
+            if manifest.get("version") != 1 or manifest.get("graph_file") != "graph.npz":
+                raise ValueError("Unsupported modal graph artifact")
+            if manifest.get("foreground_identity") != self.scene.manifest["foreground_identity"]:
+                raise ValueError("Modal graph does not belong to this scene's foreground")
+            with np.load(path / "graph.npz", allow_pickle=False) as archive:
+                arrays = {name: archive[name] for name in archive.files}
+            if self.is_similarity_graph:
+                if manifest.get("evidence_file") != "edge_evidence.npz":
+                    raise ValueError("Unsupported modal-similarity evidence file")
+                with np.load(path / "edge_evidence.npz", allow_pickle=False) as archive:
+                    status = archive["candidate_status"]
+            self.graph_config = manifest["config"]
+        else:
+            contract = manifest.get("contract", {})
+            if (contract.get("implementation") != "neural_geometry_cache_v1"
+                    or contract.get("foreground") != self.scene.manifest["foreground_identity"]):
+                raise ValueError("Geometry cache does not belong to this scene's foreground")
+            if path.name != identity(contract):
+                raise ValueError("Geometry cache directory differs from its contract identity")
+            arrays = load_entry(path.parent, contract)
+            if arrays is None:
+                raise FileNotFoundError(f"Geometry cache is missing: {path}")
+            self.graph_config = contract["config"]
         self.graph = GeometryGraph.from_dict(arrays)
         means = self.scene.foreground.active()["means"].detach().cpu().numpy()
         if not np.array_equal(self.graph.points, means):
             raise ValueError("Geometry points differ from the scene's foreground order or positions")
-        self.graph_config = contract["config"]
-        self.graph_edge_gaussian_index, self.graph_edge_colors = _neural_graph_display(
-            {"g_" + name: value for name, value in arrays.items()}, len(means))
+        self.graph_edge_gaussian_index, self.graph_edge_colors, self.graph_edge_removed = _candidate_graph_display(self.graph, status)
+        self.graph_edge_status = status
         self.graph_edge_colors_by_mode = None
         self.point_colors = _component_colors(self.graph.component_index)
         cameras = cameras_from_scene_manifest(self.scene.manifest)
@@ -57,12 +125,25 @@ class GraphViserViewer(ModalViserViewer):
         gui = self.server.gui
         graph = self.data.graph
         config = self.data.graph_config
+        similarity = self.data.is_similarity_graph
+        description = "Removed candidate edges are white. The display budget samples both groups."
+        if similarity:
+            counts = np.bincount(self.data.graph_edge_status, minlength=3)
+            parameters = config["modal_similarity"]
+            thresholds = (f"Relative complex-motion distance: similar ≤ {parameters['similarity_threshold']:g}, "
+                f"different ≥ {parameters['difference_threshold']:g}. "
+                f"Maximum projected separation: {parameters['max_pixel_distance']:g} pixels.")
+            description = (f"Motion difference: {counts[1]:,} candidates (white); "
+                f"insufficient evidence: {counts[2]:,} candidates (gray). "
+                "Only trusted retained edges are shown initially.\n\n" + thresholds)
         gui.add_markdown(
             f"**Static geometry graph** — {len(graph.points):,} Gaussians, "
-            f"{len(graph.edge_index):,} edges, {len(graph.component_size):,} components.\n\n"
+            f"{len(graph.edge_index):,} retained edges, {int(self.data.graph_edge_removed.sum()):,} removed, "
+            f"{len(graph.component_size):,} components.\n\n"
             f"K = {config['graph_neighbors']}, radius = {config['graph_max_distance']:g} "
             f"(scene units), filter = {config['graph_edge_filter']}. "
-            "Colors show connected components, including isolated points.")
+            "Colors show retained connected components, including isolated points. "
+            + description)
         self.viewer_resolution = gui.add_slider(
             "Viewer Res", min=64, max=2048, step=1, initial_value=self._viewer_resolution)
         self.hide_render = gui.add_checkbox("Hide Gaussian render", False)
@@ -71,16 +152,49 @@ class GraphViserViewer(ModalViserViewer):
         self.show_points = gui.add_checkbox("Show Gaussian centers", True)
         self.point_size = gui.add_slider("Point size", min=0.0002, max=0.008, step=0.0001, initial_value=0.001)
         self.show_component_graph = gui.add_checkbox("Show component graph", True)
+        self.show_retained_edges = gui.add_checkbox("Show retained edges", True)
+        self.show_removed_edges = gui.add_checkbox(
+            "Show motion-difference edges" if similarity else "Show removed edges", not similarity)
+        self.show_unsupported_edges = None
+        if similarity:
+            self.show_unsupported_edges = gui.add_checkbox("Show unsupported edges", False)
+            self.show_unsupported_edges.on_update(self.request_render)
+        candidate_count = len(self.data.graph_edge_gaussian_index)
         self.component_graph_edge_count = gui.add_slider(
-            "Max visible graph edges", min=0, max=max(len(graph.edge_index), 1),
-            step=1, initial_value=min(20_000, len(graph.edge_index)))
+            "Max visible graph edges", min=0, max=max(candidate_count, 1),
+            step=1, initial_value=min(20_000, candidate_count))
         self.component_graph_line_width = gui.add_slider(
             "Graph line width", min=0.1, max=10.0, step=0.1, initial_value=1.0)
         for handle in (self.viewer_resolution, self.hide_render, self.hide_background,
                        self.show_points, self.point_size, self.show_component_graph,
+                       self.show_retained_edges, self.show_removed_edges,
                        self.component_graph_edge_count, self.component_graph_line_width):
             handle.on_update(self.request_render)
         self._build_camera_controls()
+
+    def _update_component_graph(self, means):
+        if getattr(self.data, "graph_edge_status", None) is not None:
+            selected = _similarity_edge_subset(self.data.graph_edge_status,
+                self.component_graph_edge_count.value, self.show_retained_edges.value,
+                self.show_removed_edges.value, self.show_unsupported_edges.value)
+        else:
+            selected = _candidate_edge_subset(self.data.graph_edge_removed,
+                self.component_graph_edge_count.value, self.show_retained_edges.value, self.show_removed_edges.value)
+        if not self.show_component_graph.value or not len(selected):
+            self._remove_component_graph()
+            return
+        edges = self.data.graph_edge_gaussian_index[selected]
+        points = means[torch.as_tensor(edges, device=means.device)].detach().cpu().numpy()
+        if self._component_graph_handle is None or not np.array_equal(selected, self._component_graph_edge_indices):
+            self._remove_component_graph()
+            self._component_graph_handle = self.server.scene.add_line_segments(
+                "/debug/component_graph", points=points,
+                colors=np.repeat(self.data.graph_edge_colors[selected, None, :], 2, axis=1),
+                thickness=float(self.component_graph_line_width.value), thickness_units="screen")
+            self._component_graph_edge_indices = selected
+        else:
+            self._component_graph_handle.points = points
+            self._component_graph_handle.thickness = float(self.component_graph_line_width.value)
 
     @torch.inference_mode()
     def _render(self, client):
@@ -98,7 +212,9 @@ class GraphViserViewer(ModalViserViewer):
             self._point_cloud.point_size = float(self.point_size.value)
         camera = self._render_camera(client)
         if self.hide_render.value:
-            return np.full((camera.height, camera.width, 3), 255, dtype=np.uint8)
+            dark = (self.show_component_graph.value and self.show_removed_edges.value
+                    and self.data.graph_edge_removed.any())
+            return np.full((camera.height, camera.width, 3), 32 if dark else 255, dtype=np.uint8)
         rendered = self.data.scene.render_deformed(
             camera, means, include_background=not self.hide_background.value)["rgb"]
         return rendered.clamp(0, 1).mul(255).round().byte().cpu().numpy()

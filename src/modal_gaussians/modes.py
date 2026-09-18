@@ -155,6 +155,9 @@ def load_complex_2d_modes(path: str | Path) -> Complex2DModesArtifact:
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Complex mode artifact is missing manifest.json: {root}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if isinstance(manifest, dict) and manifest.get("format") == "modal_gaussians.selected_complex_2d_modes":
+        from modal_gaussians.motion.neural.selected_modal import load_selected_modal_bundle
+        return load_selected_modal_bundle(root, manifest)
     if not isinstance(manifest, dict) or manifest.get("format") != MODES_FORMAT:
         raise ValueError(f"Unsupported complex mode artifact: {manifest_path}")
     if manifest.get("version") != MODES_VERSION:

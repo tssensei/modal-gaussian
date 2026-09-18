@@ -5,13 +5,17 @@ analysis. The first migrated vertical slice validates ordered image/mask
 sequences, optionally stabilizes them to a reference frame, computes dense
 reference-to-frame Farneback flow, and evaluates the per-pixel temporal FFT.
 
-The current user-selected neural motion baseline is
-`bush_neural_capacity_0744_001/features32`: width **256**, **32** local features,
-and **three** message-passing layers, using whole-component control fields and
-separate reliable propagation donors. The accepted preview contains **0.744 Hz**;
-deformation/rotation penalties remain 0.1/0.1. Use
-`configs/neural_component_field.json` for subsequent experiment overrides. New
-neural CLI runs without an explicit config also select this preset.
+The current user-selected neural motion baseline (2026-09-18) is
+`bush_neural_modal_similarity_0744_001/experiment`: **SEA-RAFT** modal-image
+supervision from three views and the **0.20 modal-similarity graph**, built from
+K=16 candidates within radius 0.08. The accepted preview contains **0.744 Hz**.
+Width **256**, **32** local features, **three** message-passing layers, control
+radius **0.015L**, deformation/rotation penalties **0.1/0.1**, and whole-component
+fields with separate donors remain unchanged. Use
+`configs/neural_component_field.json` for subsequent numeric overrides; new
+neural CLI runs without an explicit config also select these numeric defaults.
+The full baseline additionally requires SEA-RAFT prepared supervision and an
+explicit `--geometry-graph` pointing to the matching saved modal-similarity graph.
 See [BASELINE.md](BASELINE.md) for the exact result, frozen configuration and
 historical corn references.
 
@@ -1112,7 +1116,8 @@ motion from those donors. All learning-component edges participate in the
 structural loss. The neighbor residual penalty, per-point directional projection
 and observation post-refinement are disabled for this strategy. The two-control
 gate has synthetic development validation and completed bush/corn runs; the user
-selected the bush 32-feature result as the current baseline. Earlier v16
+subsequently selected the SEA-RAFT/modal-similarity Bush result as the current
+baseline, retaining the 32-feature network. Earlier v16
 experiments retain their original settings and remain reproducible.
 
 Work directories retain the original fixed observations, graph, renderer
@@ -1616,6 +1621,76 @@ binding, point order, schema and index checks remain; cache checksums are not
 recomputed at startup. The graph and Gaussian centers appear by default, colored by connected
 component. Camera navigation, Gaussian/background visibility, edge count, and
 line width remain available; motion and spectrum controls are absent.
+
+For a graph-only modal-gradient experiment, start from a geometry cache with
+`graph_edge_filter=none` and bind one or more SEA-RAFT selected-frequency outputs
+to prepared view labels:
+
+```bat
+modal-gaussians graph prune-modal-gradient --prepared outputs\bush_neural_dense_controls_001\prepared --geometry-graph outputs\_cache\geometry\GRAPH_KEY --view view1 outputs\bush1_sea_raft_0744_001 --view view2 outputs\bush2_sea_raft_0744_001 --view view3 outputs\bush3_sea_raft_0744_001 --frequency 0.744 --gradient-threshold 0.05 --output outputs\bush_graph_modal_gradient_0744_001
+```
+
+The score is the maximum joint complex U/V gradient along the projected 3D
+edge, normalized by each view's 99th-percentile modal amplitude. The threshold
+is in normalized amplitude per pixel, not a probability. Any eligible view
+above the threshold removes the edge. Cached depth/alpha only gate visibility
+and foreground occlusion; no depth-discontinuity cuts are applied. Unknown
+edges and retained weights remain unchanged. Static visibility does not resolve
+occlusion over the video or establish physical branch connectivity.
+
+Pass the output directory to the graph Viewer's `--geometry-graph`. It preserves
+all candidate edges for display: removed edges are white, retained edges use
+component colors. Separate visibility toggles and balanced subsampling expose
+both groups. `edge_evidence.npz` stores per-view scores and reason codes; the
+manifest records their meaning and inputs. This command does not rebuild
+controls, train modes, validate experiments, or start a Viewer.
+
+To build connections from positive local motion evidence instead, use the same
+unfiltered KNN candidate cache with `graph build-modal-similarity`:
+
+```bat
+modal-gaussians graph build-modal-similarity --prepared outputs\bush_neural_dense_controls_001\prepared --geometry-graph outputs\_cache\geometry\GRAPH_KEY --view view1 outputs\bush1_sea_raft_0744_001 --view view2 outputs\bush2_sea_raft_0744_001 --view view3 outputs\bush3_sea_raft_0744_001 --frequency 0.744 --similarity-threshold 0.20 --difference-threshold 0.30 --max-pixel-distance 32 --output outputs\bush_graph_modal_similarity_0744_002
+```
+
+Each visible endpoint uses a robust complex U/V median from its valid 3x3 pixel
+patch. The relative distance is `norm(m_i-m_j)/max(norm(m_i),norm(m_j),floor)`,
+where the signal floor is 2% of that view's p99 joint modal amplitude. A view
+supports a connection at distance <=0.15 when both endpoints have sufficient
+signal; distance >=0.30 supplies a conflict when at least one does. Both quiet,
+ambiguous scores, mixed patches, unavailable endpoints and projected separation
+over 32 pixels supply no evidence. Depth/alpha at endpoints approximate
+visibility; this does not compute individual splat contributions or temporal
+occlusion. The path between endpoints need not contain foreground pixels.
+
+Connect only candidates with support from at least one view and no conflict in
+any reliable view. There is no unknown-edge fallback or forced K-neighbor
+refill. Retained weights stay unchanged. The graph Viewer initially shows only
+retained connections; optional white edges indicate motion conflicts and gray
+edges insufficient evidence. These overlays are excluded from graph
+connectivity. This is a single-frequency graph; the accepted training recipe
+below uses similarity threshold **0.20**.
+
+To train on the accepted similarity graph with SEA-RAFT supervision, first
+derive a new observation preparation, then supply the saved graph explicitly:
+
+```bat
+modal-gaussians motion prepare-selected-modal --prepared outputs\bush_neural_dense_controls_001\prepared --view view1 outputs\bush1_sea_raft_0744_001 --view view2 outputs\bush2_sea_raft_0744_001 --view view3 outputs\bush3_sea_raft_0744_001 --frequency-hz 0.744 --output outputs\bush_neural_modal_similarity_0744_001\prepared
+modal-gaussians motion iterate-neural --prepared outputs\bush_neural_modal_similarity_0744_001\prepared --config outputs\bush_neural_modal_similarity_0744_001\config.json --geometry-graph outputs\bush_graph_modal_similarity_0744_002 --frequency-hz 0.744 --output outputs\bush_neural_modal_similarity_0744_001\experiment --stage preview
+```
+
+The preparation reuses static geometry and pixel sampling, samples the new
+SEA-RAFT complex fields, and recomputes view alignment and observation
+normalization. The inherited flow metadata supplies reference geometry and
+timing only; the old Farneback modal targets are not used. This selected-only
+source has no full spectrum, so the Viewer disables full-spectrum loading.
+Use the run's saved `config.json` to retain its accepted training parameters.
+
+`--geometry-graph` uses the saved retained edges exactly, rebuilding controls
+and interpolation from that graph without regenerating KNN or applying depth
+cuts. Existing component-field donor propagation is unchanged, so fragments
+can still inherit motion through that separate mechanism. `--stage preview`
+publishes a manual-oscillator preview without video-coordinate fitting,
+experiment validation, or starting Viser.
 
 Only when the user explicitly requests video-coordinate fitting and full
 evaluation, use the separately retained compatibility path below. A normal

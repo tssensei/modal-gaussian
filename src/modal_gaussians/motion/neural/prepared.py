@@ -39,6 +39,8 @@ class PreparedNeuralInputs:
     path: Path
     manifest: dict[str, Any]
     arrays: dict[str, np.ndarray]
+    external_geometry_graph: dict[str, np.ndarray] | None = None
+    external_geometry_contract: dict[str, Any] | None = None
 
     @property
     def source(self):
@@ -47,6 +49,29 @@ class PreparedNeuralInputs:
     @property
     def cache_dir(self):
         return Path(self.manifest["cache_dir"])
+
+    def attach_geometry_graph(self, path):
+        """Bind a saved experimental graph without rebuilding its candidates."""
+        from .geometry_graph import GeometryGraph
+        root = Path(path).expanduser().resolve(strict=True)
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        if (manifest.get("format") not in ("modal_gaussians.modal_similarity_graph", "modal_gaussians.modal_gradient_graph")
+                or manifest.get("version") != 1 or manifest.get("graph_file") != "graph.npz"
+                or manifest.get("foreground_identity") != self.source["foreground_identity"]
+                or manifest.get("static_scene_identity") != self.source["static_scene_identity"]):
+            raise ValueError("External geometry graph does not belong to this prepared scene")
+        with np.load(root / "graph.npz", allow_pickle=False) as archive:
+            arrays = {name: archive[name] for name in archive.files}
+        graph = GeometryGraph.from_dict(arrays)
+        if (not np.array_equal(graph.points, self.arrays["o_g_points"])
+                or not np.array_equal(graph.node_gaussian_index, np.arange(len(graph.points), dtype=np.int64))):
+            raise ValueError("External geometry graph Gaussian positions/order differ")
+        self.external_geometry_graph = arrays
+        self.external_geometry_contract = {
+            "path": str(root), "format": manifest["format"], "manifest_identity": identity(manifest),
+            "arrays_identity": nm._arrays_identity(arrays), "frequency_hz": manifest["frequency_hz"],
+            "config": manifest["config"],
+        }
 
     def flow(self, path: str | Path) -> FlowAnalysisArtifact:
         requested = Path(path).expanduser().resolve()
@@ -114,12 +139,15 @@ class PreparedNeuralInputs:
                 **{f"depth_{i}": value for i, value in enumerate(depths)},
                 **{f"alpha_{i}": value for i, value in enumerate(alphas)},
             })
-        graph_arrays = cached(self.cache_dir / "geometry", graph_contract, lambda: build_geometry_graph_arrays(
-            foreground_means=arrays["g_points"], Ks=np.stack([c.K.cpu().numpy() for c in cameras]),
-            radial_coefficients=np.array([c.radial_distortion for c in cameras]),
-            world_to_cameras=np.stack([c.world_to_camera.cpu().numpy() for c in cameras]),
-            rendered_depths=depths, rendered_alphas=alphas, endpoint_thresholds=endpoint,
-            depth_jump_thresholds=jump, config=settings).as_dict(), timer, "geometry_cache")
+        if self.external_geometry_graph is not None:
+            graph_arrays = self.external_geometry_graph
+        else:
+            graph_arrays = cached(self.cache_dir / "geometry", graph_contract, lambda: build_geometry_graph_arrays(
+                foreground_means=arrays["g_points"], Ks=np.stack([c.K.cpu().numpy() for c in cameras]),
+                radial_coefficients=np.array([c.radial_distortion for c in cameras]),
+                world_to_cameras=np.stack([c.world_to_camera.cpu().numpy() for c in cameras]),
+                rendered_depths=depths, rendered_alphas=alphas, endpoint_thresholds=endpoint,
+                depth_jump_thresholds=jump, config=settings).as_dict(), timer, "geometry_cache")
         graph = GeometryGraph.from_dict(graph_arrays)
         control_contract = {"implementation": "neural_controls_cache_v1", "graph": nm._arrays_identity(graph_arrays),
                             "code": geometry_revision,

@@ -70,13 +70,13 @@ def resolve_mode_slots(modes, frequencies_hz):
 
 def training_revision(strategy_config):
     """Cache only code used by this representation, including artifact replay."""
-    from . import artifacts
+    from . import artifacts, prepared
     return module_revision(nm, neural_field, geometry_graph, projection, static,
-        camera_geometry, artifacts, strategies, *strategies.implementation_modules(strategy_config))
+        camera_geometry, artifacts, prepared, strategies, *strategies.implementation_modules(strategy_config))
 
 
 def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", frequencies_hz=None,
-                   refine_observations=False, refinement_config_path=None):
+                   refine_observations=False, refinement_config_path=None, geometry_graph_dir=None):
     if stage not in ("modes", "preview", "full"):
         raise ValueError("Iteration stage must be modes, preview or full")
     refinement = None
@@ -90,6 +90,8 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
     timer = Timings()
     with timer.stage("prepared_load"):
         prepared = load_prepared(prepared_dir)
+        if geometry_graph_dir is not None:
+            prepared.attach_geometry_graph(geometry_graph_dir)
         overrides = json.loads(Path(config_path).read_text(encoding="utf-8")) if config_path else baseline_overrides()
         config = resolve_config(prepared.manifest["defaults"], overrides)
         settings = nm.NeuralModesConfig.from_dict(config["neural"])
@@ -99,6 +101,16 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
             raise ValueError("Observation refinement requires strategy=pointwise or guarded")
         prepared.validate_sources(prepared.source, settings)
         mode_slots = resolve_mode_slots(prepared.source["modes"], frequencies_hz)
+        if getattr(prepared, "external_geometry_contract", None) is not None:
+            external = prepared.external_geometry_contract
+            slots = range(len(prepared.source["modes"])) if mode_slots is None else mode_slots
+            if any(not np.isclose(prepared.source["modes"][slot]["frequency_hz"], external["frequency_hz"],
+                                  rtol=0, atol=1e-9) for slot in slots):
+                raise ValueError("External modal graph may only train its selected frequency")
+            if (settings.graph_neighbors != external["config"]["graph_neighbors"]
+                    or not np.isclose(settings.graph_max_distance, external["config"]["graph_max_distance"], rtol=0, atol=1e-12)
+                    or settings.graph_edge_filter != "none"):
+                raise ValueError("External graph requires matching candidate K/radius and graph_edge_filter=none")
     if root == prepared.path or root.is_relative_to(prepared.path):
         raise ValueError("Experiment must not overwrite prepared inputs")
     strategy_config = settings.training_fragment_config
@@ -106,6 +118,8 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
     contract = {"version": 2, "prepared": str(prepared.path),
                 "prepared_identity": prepared.manifest["prepared_identity"],
                 "config": config, "neural_revision": neural_revision}
+    if getattr(prepared, "external_geometry_contract", None) is not None:
+        contract["external_geometry_graph"] = prepared.external_geometry_contract
     if strategy_config is None:
         from modal_gaussians.motion.legacy.neural import fragment_propagation as fp
         contract["fragment_revision"] = module_revision(fp)
@@ -134,6 +148,8 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
 def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slots=None, refinement=None):
     source = prepared.source
     model_contract = {"prepared": prepared.manifest["prepared_identity"], "config": config["neural"], "code": neural_revision}
+    if getattr(prepared, "external_geometry_contract", None) is not None:
+        model_contract["external_geometry_graph"] = prepared.external_geometry_contract
     if mode_slots is not None:
         model_contract["source_mode_slots"] = mode_slots
     model_key = identity(model_contract)
