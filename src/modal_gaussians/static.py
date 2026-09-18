@@ -1351,12 +1351,17 @@ def load_static_scene(
         }
         if manifest["version"] in (2, 3):
             cameras = cameras_from_scene_manifest(manifest)
-            if not all(c.distortion_applied for c in cameras):
-                raise ValueError("Static v2 requires distortion-aware cameras")
+            projection = manifest["representation"].get("camera_projection")
+            manual_pinhole = (manifest["version"] == 3
+                and manifest.get("partition", {}).get("method") == "manual_subject_selection_v1"
+                and projection == "pinhole_K_only")
+            if manual_pinhole:
+                if any(c.distortion_applied for c in cameras):
+                    raise ValueError("Manual pinhole partition cannot change camera projection")
+            elif not all(c.distortion_applied for c in cameras) or projection != PROJECTION_CONVENTION:
+                raise ValueError("Static v2/v3 requires distortion-aware cameras outside manual pinhole partition")
             static_identity_payload["camera_identities"] = [c.to_manifest_record()["camera_identity"] for c in cameras]
-            static_identity_payload["projection_convention"] = PROJECTION_CONVENTION
-            if manifest["representation"].get("camera_projection") != PROJECTION_CONVENTION:
-                raise ValueError("Static scene representation has inconsistent camera projection")
+            static_identity_payload["projection_convention"] = projection
         if manifest["version"] == 3:
             from modal_gaussians.static_partition import validate_partition_bundle
 

@@ -32,12 +32,16 @@ class NeuralFieldConfig:
     deformation_weight: float = 1.0
     rotation_weight: float = 0.1
     rotation_length_fraction: float = 0.05
+    # Decode historical false settings; the rejected ablation is no longer executable.
+    exclude_weak_gaussian_rigidity: bool = False
 
     @property
     def edge_weight(self) -> float:
         return self.deformation_weight
 
     def validate(self) -> None:
+        if self.exclude_weak_gaussian_rigidity is not False:
+            raise ValueError("exclude_weak_gaussian_rigidity has been removed; only false is supported")
         for name in ("hidden_dim", "message_layers", "max_iterations",
                      "convergence_patience", "checkpoint_every"):
             value = getattr(self, name)
@@ -62,6 +66,8 @@ class NeuralFieldConfig:
         # Keep coordinate-only checkpoint contracts byte-compatible.
         if self.local_feature_dim == 0:
             result.pop("local_feature_dim")
+        if not self.exclude_weak_gaussian_rigidity:
+            result.pop("exclude_weak_gaussian_rigidity")
         return result
 
     @classmethod
@@ -358,12 +364,11 @@ def structural_losses(geometry: NeuralFieldGeometry, field: ComposedField, *,
     normalized_rotation = field.rotation * (length / amplitude)
     zero = normalized_field.real.sum() * 0.0
 
-    def valid_edges(edges: Tensor, weights: Tensor, support: Tensor) -> tuple[Tensor, Tensor]:
-        keep = support[edges[:, 0]] & support[edges[:, 1]] & (weights > 0)
-        return edges[keep], weights[keep]
-
-    edges, weights = valid_edges(geometry.gaussian_edges, geometry.gaussian_edge_weights,
-                                 geometry.gaussian_supported)
+    gaussian_keep = (geometry.gaussian_supported[geometry.gaussian_edges[:, 0]]
+                     & geometry.gaussian_supported[geometry.gaussian_edges[:, 1]]
+                     & (geometry.gaussian_edge_weights > 0))
+    edges = geometry.gaussian_edges[gaussian_keep]
+    weights = geometry.gaussian_edge_weights[gaussian_keep]
     edge_loss = zero
     if len(edges):
         left, right = edges[:, 0], edges[:, 1]

@@ -40,8 +40,11 @@ The control count is first measured on size-eligible components using the fixed
 graph-distance coverage radius. Components with fewer than
 `min_learning_controls=2` controls are then removed from the network's control
 domain in their entirety. No artificial extra control is added to make a tiny
-component qualify. The graph-distance sampling radius and interpolation kernel
-are unchanged. Controls of wholly unobserved components are inactive per frequency;
+component qualify. The original geometric graph distance determines sampling
+and interpolation support. In the current soft-graph recipe, a separate
+propagation cost only attenuates existing interpolation weights before row
+normalization; it does not add controls or remove support. Controls of wholly
+unobserved components are inactive per frequency;
 the saved ordering is stable when selecting a subset of frequencies. Restoring
 previously rejected learning components can increase the actual control count;
 the configured budget is still enforced.
@@ -62,15 +65,23 @@ from weak or inconsistent observations.
 
 The current baseline override uses width 256, local features 32, three message layers,
 control radius 0.015L, maximum 32768 controls and deformation/rotation weights
-0.1/0.1. On 2026-09-07, the user selected
-`outputs/bush_neural_capacity_0744_001/features32` at 0.744 Hz after visual
-comparison. Only local feature dimension changed from the preceding 16-feature
-reference; the combined six-layer experiment is not the selected baseline.
-See [BASELINE.md](../BASELINE.md) for the frozen configuration. Other settings
-inherit from the preparation. Use a **new** experiment:
+**0.03/0**. On 2026-09-18 the user visually accepted
+`outputs/corn_neural_soft_rigidity003_rotation0_0225_001/experiment` at **0.225 Hz**,
+following the matching Bush **0.744 Hz** result at
+`outputs/bush_neural_soft_rigidity003_rotation0_0744_001/experiment`.
+Both retain all K=16/radius-0.08 candidates, weighting motion-conflicting or
+unsupported edges at 0.05 times their original weight instead of deleting them.
+Control sampling stays geometric; propagation costs only attenuate interpolation,
+and donor rules are unchanged.
+Local rotations and Viewer ellipsoid rotation remain active. Corn uses the
+saved manual subject selection; other datasets and frequencies are outside
+this visual acceptance. Historical experiments retain their original settings.
+See [BASELINE.md](../BASELINE.md) for both frozen configurations and the matching
+prepared inputs/graphs. Other settings inherit from the preparation. Use a
+**new** experiment and supply the matching soft graph:
 
 ```text
-modal-gaussians motion iterate-neural --prepared <prepared> --config configs/neural_component_field.json --output <new-experiment> --frequency-hz 0.744 --stage preview
+modal-gaussians motion iterate-neural --prepared <prepared> --config configs/neural_component_field.json --geometry-graph <matching-soft-graph> --output <new-experiment> --frequency-hz <frequency> --stage preview
 ```
 
 `--stage preview` prepares the manual Viser preview without modal-coordinate
@@ -105,9 +116,9 @@ and representative v8/v14 loading are also checked. The subsequent two-control
 learning gate has targeted synthetic coverage for component-wide rejection,
 network input removal, retained two-control fields and old v16 identities.
 Subsequent bush and corn training runs used this two-control gate. The current
-user-selected bush baseline uses 32 local features; earlier experiments retain
-their original configurations. Visual acceptance of this result is not a claim
-of validation across other datasets or frequencies.
+user-selected Corn/Bush baseline uses 32 local features; earlier experiments retain
+their original configurations. Visual acceptance of Corn 0.225 Hz and Bush
+0.744 Hz is not a claim of validation across other datasets or frequencies.
 
 Core implementation: `motion/neural/component_field.py`; tensor assembly:
 `motion/neural/neural_modes.py::_field_geometry`. The neural network and loss

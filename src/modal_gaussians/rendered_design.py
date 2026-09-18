@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from modal_gaussians.motion.common.projection import (
     RenderedDesignConfig, projection_jacobian as _projection_jacobian,
-    candidate_pixels as _candidate_pixels, sample_feature_render as _sample_feature_render,
+    candidate_observation_pixels as _candidate_observation_pixels,
+    render_motion_features, uses_visible_subject, sample_feature_render as _sample_feature_render,
 )
 
 from dataclasses import dataclass
@@ -75,6 +76,19 @@ DISTORTED_DESIGN_CONVENTION = {
     "projection": "simple_radial_pixel_jacobian_at_static_gaussian_mean",
     "rasterization": "full_foreground_gsplat_with_simple_radial_image_warp_v1",
 }
+
+
+def _visible_subject_convention(convention: Mapping[str, Any]) -> dict[str, Any]:
+    """Record manual-selection overrides without changing legacy config values."""
+
+    return {
+        **convention,
+        "rasterization": convention["rasterization"].replace("foreground", "scene"),
+        "normalization": "divide_by_visible_subject_mass",
+        "background_gaussians": "included_as_zero_features_with_depth_ordered_occlusion",
+        "sampling_mask_source": "visible_subject_alpha",
+        "sampling_mask_erosion_iterations": 0,
+    }
 
 
 @dataclass(frozen=True)
@@ -262,7 +276,7 @@ def load_rendered_modal_design(path: str | Path, *, validate: bool = False) -> R
             samples = {name: archive[name] for name in archive.files}
         return RenderedModalDesignArtifact(root, manifest, design, samples)
     expected_convention = DISTORTED_DESIGN_CONVENTION if manifest["version"] == 2 else DESIGN_CONVENTION
-    if manifest.get("convention") != expected_convention:
+    if manifest.get("convention") not in (expected_convention, _visible_subject_convention(expected_convention)):
         raise ValueError("Rendered-design convention is unsupported")
     if manifest.get("quality_gate") != {
         "required": True,
@@ -528,12 +542,10 @@ def build_rendered_modal_design_artifact(
     dummy = torch.zeros((foreground_count, 1), device=device, dtype=torch.float32)
     with torch.no_grad():
         for camera, flow, record in zip(cameras, flows, view_records):
-            _, alpha_tensor = scene.render_features(
-                camera, dummy, composition="foreground"
-            )
+            _, alpha_tensor = render_motion_features(scene, camera, dummy)
             alpha_image = alpha_tensor.detach().cpu().float().numpy()
-            pixels, sampled_alpha = _candidate_pixels(
-                flow.arrays.mask_union, alpha_image, settings
+            pixels, sampled_alpha = _candidate_observation_pixels(
+                scene, flow.arrays.mask_union, alpha_image, settings
             )
             K = camera.K.detach().cpu().numpy().astype(np.float64)
             w2c = (
@@ -661,6 +673,9 @@ def build_rendered_modal_design_artifact(
             "arrays_identity": _arrays_identity(samples),
             "sha256": _sha256_file(samples_path),
         }
+        convention = dict(DISTORTED_DESIGN_CONVENTION if any(c.distortion_applied for c in cameras) else DESIGN_CONVENTION)
+        if uses_visible_subject(scene):
+            convention = _visible_subject_convention(convention)
         manifest = {
             "format": RENDERED_DESIGN_FORMAT,
             "version": 2 if any(c.distortion_applied for c in cameras) else RENDERED_DESIGN_VERSION,
@@ -680,7 +695,7 @@ def build_rendered_modal_design_artifact(
             "modes": mode_records,
             "views": view_records,
             "settings": settings.to_dict(),
-            "convention": dict(DISTORTED_DESIGN_CONVENTION if any(c.distortion_applied for c in cameras) else DESIGN_CONVENTION),
+            "convention": convention,
             "quality_gate": {
                 "required": True,
                 "status": "rendered_design_candidate_unapproved",

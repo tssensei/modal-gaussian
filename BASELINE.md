@@ -1,61 +1,76 @@
 # Current neural motion baseline
 
-On **2026-09-18**, the user visually accepted the **Bush 0.744 Hz SEA-RAFT +
-modal-similarity graph** result as the new baseline. This replaces the earlier
-Farneback/features32 result as the starting point for future experiments.
+On **2026-09-18**, the user accepted the **Corn 0.225 Hz** result below as the
+new baseline, following visual acceptance of the matching **Bush 0.744 Hz**
+recipe. Both use SEA-RAFT modal images, soft graph weights with fixed control
+sampling, **Gaussian rigidity 0.03**, and **control-rotation loss 0**.
+The earlier hard-cut Bush result is retained as a historical comparison.
 
-## Accepted Bush result
+## Accepted Corn and Bush results
 
-- Experiment: `outputs/bush_neural_modal_similarity_0744_001/experiment`.
-- Manual preview: `outputs/bush_neural_modal_similarity_0744_001/experiment/preview`.
-- Prepared SEA-RAFT supervision: `outputs/bush_neural_modal_similarity_0744_001/prepared`.
-- Accepted graph: `outputs/bush_graph_modal_similarity_0744_002`.
-- Frozen configuration: [config.json](outputs/bush_neural_modal_similarity_0744_001/config.json).
-- Resolved source/configuration contract: [iteration.json](outputs/bush_neural_modal_similarity_0744_001/experiment/iteration.json).
-- Completed modes: v16, `neural_component_field_with_stable_donors`.
-- Immutable trained modes: `outputs/_cache/trained_modes/0628e6cfefb69e82eacf5973ec0ee345d537f6d98745ae0e985e278af90a087c`.
-- Completed-modes identity: `2be1f71b1b35410deca8713e37581a9d91ceef59571d4b9fb98b99eb81fba517`.
-- Preview identity: `c5ef66b709c373669f855a5b1dac57f0db4e9688835b1fa31262ddbcbd524170`.
-- Frequency: **0.744 Hz**, selected-bundle slot **0**, original candidate index **1**.
-- All three views participate. Training completed at **645 steps**, with **1,382 controls**.
+| | Corn | Bush |
+| --- | --- | --- |
+| Frequency | **0.225 Hz** | **0.744 Hz** |
+| Experiment | `outputs/corn_neural_soft_rigidity003_rotation0_0225_001/experiment` | `outputs/bush_neural_soft_rigidity003_rotation0_0744_001/experiment` |
+| Manual preview | `outputs/corn_neural_soft_rigidity003_rotation0_0225_001/experiment/preview` | `outputs/bush_neural_soft_rigidity003_rotation0_0744_001/experiment/preview` |
+| Prepared supervision | `outputs/corn_subject_selection_001/prepared` | `outputs/bush_neural_modal_similarity_0744_001/prepared` |
+| Soft graph | `outputs/corn_subject_selection_001/graph_modal_soft_002` | `outputs/bush_neural_soft_fixed_controls_0744_001/graph` |
+| Frozen configuration | [Corn config](outputs/corn_neural_soft_rigidity003_rotation0_0225_001/config.json) | [Bush config](outputs/bush_neural_soft_rigidity003_rotation0_0744_001/config.json) |
+| Resolved contract | [Corn iteration](outputs/corn_neural_soft_rigidity003_rotation0_0225_001/experiment/iteration.json) | [Bush iteration](outputs/bush_neural_soft_rigidity003_rotation0_0744_001/experiment/iteration.json) |
+
+Both are v16 `neural_component_field_with_stable_donors` results. Corn retains
+the saved manual subject selection in `outputs/corn_subject_selection_001/static_scene`
+and its visible-subject supervision; do not substitute the older fine-mask
+preparation. Corn uses two views and Bush uses three. Their frozen normalization,
+view alignment and reference geometry remain scene-specific.
 
 ## Default experiment recipe
 
 Use SEA-RAFT reference-to-frame flow and selected-frequency exact DFT modal
-images for both graph construction and training. The accepted sources are
+images for both graph construction and training. The Bush sources are
 `outputs/bush1_sea_raft_0744_001`, `outputs/bush2_sea_raft_0744_001`, and
-`outputs/bush3_sea_raft_0744_001`. Recompute complex view alignment and target
+`outputs/bush3_sea_raft_0744_001`; Corn uses `outputs/corn1_sea_raft_0225_001`
+and `outputs/corn2_sea_raft_0225_001`. When preparing new inputs, compute complex view alignment and target
 normalization through `motion prepare-selected-modal`; inherited Farneback flow
 metadata supplies reference geometry/timing only. No full spectrum is required.
 
 Start with unfiltered mutual-KNN candidates, **K=16**, maximum radius **0.08**
-in scene units. Apply `graph build-modal-similarity` with similarity threshold
+in scene units. Apply `graph build-modal-similarity --soft-weights` with similarity threshold
 **0.20**, conflict threshold **0.30**, amplitude floor fraction **0.02**, and
 maximum projected endpoint distance **32 pixels**. Other settings remain:
 amplitude percentile 99, patch radius 1, patch relative dispersion maximum 0.30,
-and alpha minimum 0.05. Require support from at least one reliable view and no
-reliable conflicting view; unknown evidence does not create a connection.
-Visibility uses depth/alpha, but there is no preliminary depth-discontinuity cut.
-The accepted graph contains **770,364 retained edges**.
+and alpha minimum 0.05. **Retain every candidate edge**. Edges supported by at
+least one reliable view and without a reliable conflict keep their original
+weight; edges the hard filter would reject, including unknown edges, receive
+**0.05 times** that weight. New graph builds use soft weights;
+historical hard-cut graphs remain readable.
+Depth/alpha gate visibility, with no preliminary depth-discontinuity cut.
 
 Pass the saved graph explicitly with `motion iterate-neural --geometry-graph`;
 the neural config uses `graph_edge_filter=none` to avoid another filter.
-Controls and interpolation follow the retained graph. Merely using the new
+Control sampling, coverage, owners and support within `2h` use the **original
+geometric shortest-path distance**, keeping the original control layout.
+Propagation costs `edge_length / edge_factor` only attenuate existing Wendland
+interpolation weights by geometric distance divided by propagation distance,
+followed by per-Gaussian normalization. They do not drive control sampling or
+create extra controls. Merely using the new
 K/radius defaults without `--geometry-graph` does **not** reproduce this baseline.
 Graphs remain frequency-specific; use matching inputs/graphs for other scenes
-or frequencies rather than reusing this Bush graph.
+or frequencies rather than reusing either accepted graph.
 
 Keep width **256**, local features **32**, **3** message layers, control radius
-**0.015L**, maximum 32,768 controls, and deformation/rotation weights **0.1/0.1**.
+**0.015L**, maximum 32,768 controls, and new-run deformation/rotation weights **0.03/0**.
 Keep learning rate 0.001, maximum 2,000 steps, patience 50, relative tolerance
 1e-6, seed 1729, and the existing `component_field` donor rules. The reusable
 numeric preset is [neural_component_field.json](configs/neural_component_field.json).
-Donor propagation is unchanged: about 105,214 of 231,761 Gaussians receive
-propagated motion, and this separate mechanism can still cross graph boundaries.
-Ellipsoid rotation remains enabled by default in the manual Viewer.
+Donor propagation is unchanged. Local rotation in the displacement field and
+Viewer ellipsoid rotation remain active; only the control-rotation loss is off.
+Explicit configurations take priority. Custom partial `--config` files inherit
+omitted fields from their prepared snapshot: include `"deformation_weight": 0.03`
+and `"rotation_weight": 0` when reusing older preparations, or use the current preset.
 
-This acceptance records the user's visual judgment of Bush at 0.744 Hz; it does
-not claim this recipe has been evaluated on Corn or other frequencies. No
+This acceptance records the user's visual judgment of **Corn at 0.225 Hz and
+Bush at 0.744 Hz**; it does not establish performance on other frequencies or scenes. No
 experiment validation or modal-coordinate fitting was run. Keep the accepted
 artifacts and their ancestors immutable. This document records the later user
 approval; original `preview_candidate_unapproved`/execution-status fields retain
@@ -64,8 +79,33 @@ their publication-time values.
 Launch from the repository in Anaconda Prompt:
 
 ```bat
-modal-gaussians viewer --preview "outputs\bush_neural_modal_similarity_0744_001\experiment\preview" --work-dir "outputs\bush_neural_modal_similarity_0744_001\work\viewer" --host 127.0.0.1 --port 8094
+modal-gaussians viewer --preview "outputs\corn_neural_soft_rigidity003_rotation0_0225_001\experiment\preview" --work-dir "outputs\corn_neural_soft_rigidity003_rotation0_0225_001\work\viewer" --host 127.0.0.1 --port 8108
+modal-gaussians viewer --preview "outputs\bush_neural_soft_rigidity003_rotation0_0744_001\experiment\preview" --work-dir "outputs\bush_neural_soft_rigidity003_rotation0_0744_001\work\viewer" --host 127.0.0.1 --port 8107
 ```
+
+## Historical Bush hard-cut baseline (2026-09-18)
+
+The earlier SEA-RAFT/modal-similarity result was visually accepted before the
+soft-weight experiments. Preserve it with its original **0.1/0.1**
+deformation/rotation loss weights:
+
+- Experiment: `outputs/bush_neural_modal_similarity_0744_001/experiment`.
+- Manual preview: `outputs/bush_neural_modal_similarity_0744_001/experiment/preview`.
+- Prepared inputs: `outputs/bush_neural_modal_similarity_0744_001/prepared` (also reused above).
+- Hard-cut graph: `outputs/bush_graph_modal_similarity_0744_002`.
+- Frozen configuration: [config.json](outputs/bush_neural_modal_similarity_0744_001/config.json).
+- Resolved contract: [iteration.json](outputs/bush_neural_modal_similarity_0744_001/experiment/iteration.json).
+- Immutable trained modes: `outputs/_cache/trained_modes/0628e6cfefb69e82eacf5973ec0ee345d537f6d98745ae0e985e278af90a087c`.
+- Completed-modes identity: `2be1f71b1b35410deca8713e37581a9d91ceef59571d4b9fb98b99eb81fba517`.
+- Preview identity: `c5ef66b709c373669f855a5b1dac57f0db4e9688835b1fa31262ddbcbd524170`.
+- Frequency 0.744 Hz, selected-bundle slot 0, original candidate index 1; all three views participated.
+- 770,364 retained edges, 1,382 controls, 645 training steps; 105,214 of 231,761 Gaussians received donor motion.
+
+This recipe kept only candidates with reliable motion-similarity support and
+no reliable conflict, deleting unknown edges as well. Its thresholds were
+0.20/0.30 with the same K=16, radius 0.08, 32-pixel gate and 256/32/3 network.
+Controls and interpolation followed the pruned graph. Its saved artifacts remain
+available for comparison; new graph construction uses the soft-weight recipe above.
 
 ## Historical Bush features32 baseline (2026-09-07)
 
@@ -127,8 +167,8 @@ for new experiments.
 The current v16 implementation uses **whole-component fields with separate
 propagation donors**. Fixed pointwise propagation is composed into the final
 Gaussian field before full modal-image supervision; there is no observation
-post-refinement. The selected bush result has completed training and manual
-preview preparation.
+post-refinement. The selected Corn and Bush results have completed training and
+manual preview preparation.
 
 ## Historical corn neural baseline: accepted result and scope
 

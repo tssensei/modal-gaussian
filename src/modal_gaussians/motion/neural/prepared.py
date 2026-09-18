@@ -66,12 +66,28 @@ class PreparedNeuralInputs:
         if (not np.array_equal(graph.points, self.arrays["o_g_points"])
                 or not np.array_equal(graph.node_gaussian_index, np.arange(len(graph.points), dtype=np.int64))):
             raise ValueError("External geometry graph Gaussian positions/order differ")
+        # Old saved soft graphs already carry the exact attenuation factors.
+        # Upgrade only new training inputs; never mutate the saved graph or modes.
+        soft = manifest["config"].get("modal_similarity", {}).get("soft_weights", False)
+        if soft and graph.edge_propagation_length is None:
+            if (manifest.get("evidence_file") != "edge_evidence.npz"
+                    or not np.array_equal(graph.edge_index, graph.candidate_edge_index)):
+                raise ValueError("Soft propagation requires all candidate edges and saved edge evidence")
+            with np.load(root / "edge_evidence.npz", allow_pickle=False) as archive:
+                factors = np.asarray(archive["candidate_edge_factor"], dtype=np.float64)
+            if (factors.shape != graph.edge_length.shape or not np.isfinite(factors).all()
+                    or np.any(factors <= 0) or np.any(factors > 1)):
+                raise ValueError("Soft propagation factors must be finite [E] in (0,1]")
+            arrays["edge_propagation_length"] = graph.edge_length / factors
+            graph = GeometryGraph.from_dict(arrays)
         self.external_geometry_graph = arrays
         self.external_geometry_contract = {
             "path": str(root), "format": manifest["format"], "manifest_identity": identity(manifest),
             "arrays_identity": nm._arrays_identity(arrays), "frequency_hz": manifest["frequency_hz"],
             "config": manifest["config"],
         }
+        if graph.edge_propagation_length is not None:
+            self.external_geometry_contract["propagation"] = "saved_or_derived_edge_length_over_modal_factor"
 
     def flow(self, path: str | Path) -> FlowAnalysisArtifact:
         requested = Path(path).expanduser().resolve()

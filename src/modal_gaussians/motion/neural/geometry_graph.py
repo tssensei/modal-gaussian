@@ -93,16 +93,29 @@ class GeometryGraph:
     component_size: np.ndarray
     candidate_edge_index: np.ndarray
     candidate_view_evidence: np.ndarray
+    edge_propagation_length: np.ndarray | None = None
 
     def as_dict(self) -> dict[str, np.ndarray]:
-        return {field.name: np.ascontiguousarray(getattr(self, field.name)) for field in fields(self)}
+        return {field.name: np.ascontiguousarray(getattr(self, field.name)) for field in fields(self)
+                if getattr(self, field.name) is not None}
+
+    def propagation_lengths(self) -> np.ndarray:
+        """Optional motion propagation cost, separate from material edge lengths."""
+        if self.edge_propagation_length is None:
+            return self.edge_length
+        lengths = np.asarray(self.edge_propagation_length, dtype=np.float64)
+        if (lengths.shape != self.edge_length.shape or not np.isfinite(lengths).all()
+                or np.any(lengths <= 0) or np.any(lengths < self.edge_length)):
+            raise ValueError("Propagation lengths must be finite [E] and at least the positive geometric lengths")
+        return lengths
 
     @classmethod
     def from_dict(cls, arrays: Mapping[str, Any], *, validate: bool = False) -> GeometryGraph:
         names = {field.name for field in fields(cls)}
-        if set(arrays) != names:
+        if set(arrays) not in (names, names - {"edge_propagation_length"}):
             raise ValueError("Geometry graph array inventory does not match its schema")
-        graph = cls(**{name: np.asarray(arrays[name]) for name in names})
+        graph = cls(**{name: np.asarray(value) for name, value in arrays.items()})
+        graph.propagation_lengths()
         if validate:
             _validate_geometry_arrays(graph)
         elif (graph.points.ndim != 2 or graph.points.shape[1] != 3
@@ -489,6 +502,8 @@ def build_control_graph(
 ) -> ControlGraph:
     """Graph-distance FPS, all-support Wendland CSR, and Voronoi adjacency.
 
+    Sampling and support always use geometric distance. Optional propagation
+    costs attenuate interpolation weights without creating extra controls.
     Every component is seeded by its smallest Gaussian index.  FPS then selects
     the global farthest node, breaking distance ties by Gaussian index.  A hard
     control budget never silently discards components or relaxes coverage.
@@ -513,25 +528,29 @@ def build_control_graph(
         raise ValueError("Control source component labels disagree with its edges")
     if len(sizes) > settings.max_controls:
         raise ValueError(f"Control budget {settings.max_controls} cannot cover {len(sizes)} disconnected components (including isolated nodes)")
-    adjacency = coo_matrix((np.concatenate((lengths, lengths)),
-                            (np.concatenate((edges[:, 0], edges[:, 1])),
-                             np.concatenate((edges[:, 1], edges[:, 0])))), shape=(len(points), len(points))).tocsr()
     # Disconnected vertices cannot affect a shortest path. Group once, then
     # solve inside each component instead of allocating a G-vector per seed.
     grouped_nodes = np.argsort(component, kind="stable")
     offsets = np.concatenate(([0], np.cumsum(sizes)))
     local_index = np.empty(len(points), dtype=np.int64)
     local_index[grouped_nodes] = np.arange(len(points)) - np.repeat(offsets[:-1], sizes)
-    grouped_adjacency = adjacency[grouped_nodes][:, grouped_nodes].tocsr()
-    grouped_adjacency.sort_indices()
-    component_adjacency: list[csr_matrix] = []
-    for start, stop in zip(offsets[:-1], offsets[1:]):
-        first, last = grouped_adjacency.indptr[start], grouped_adjacency.indptr[stop]
-        component_adjacency.append(csr_matrix((
-            grouped_adjacency.data[first:last],
-            grouped_adjacency.indices[first:last] - start,
-            grouped_adjacency.indptr[start:stop + 1] - first,
-        ), shape=(stop - start, stop - start)))
+    def component_adjacencies(costs):
+        adjacency = coo_matrix((np.concatenate((costs, costs)),
+            (np.concatenate((edges[:, 0], edges[:, 1])),
+             np.concatenate((edges[:, 1], edges[:, 0])))), shape=(len(points), len(points))).tocsr()
+        grouped = adjacency[grouped_nodes][:, grouped_nodes].tocsr()
+        grouped.sort_indices()
+        result = []
+        for start, stop in zip(offsets[:-1], offsets[1:]):
+            first, last = grouped.indptr[start], grouped.indptr[stop]
+            result.append(csr_matrix((grouped.data[first:last], grouped.indices[first:last] - start,
+                grouped.indptr[start:stop + 1] - first), shape=(stop - start, stop - start)))
+        return result
+
+    material_adjacency = component_adjacencies(lengths)
+    propagation_lengths = graph.propagation_lengths()
+    component_adjacency = (material_adjacency if np.array_equal(propagation_lengths, lengths)
+                           else component_adjacencies(propagation_lengths))
     nearest = np.full(len(points), np.inf, dtype=np.float64)
     owners = np.full(len(points), -1, dtype=np.int64)
     control_nodes: list[int] = []
@@ -546,7 +565,7 @@ def build_control_graph(
         slot = len(control_nodes)
         group = int(component[node])
         members = grouped_nodes[offsets[group]:offsets[group + 1]]
-        distances = np.asarray(dijkstra(component_adjacency[group], directed=False,
+        distances = np.asarray(dijkstra(material_adjacency[group], directed=False,
                                        indices=int(local_index[node])), dtype=np.float64)
         prior_slots = np.asarray(component_controls[group], dtype=np.int64)
         control_distances.append((prior_slots,
@@ -566,6 +585,14 @@ def build_control_graph(
         rows = members[local_rows]
         ratio = distances[local_rows] / (2 * h)
         weights = (1 - ratio) ** 4 * (4 * ratio + 1)
+        if component_adjacency is not material_adjacency:
+            propagation = dijkstra(component_adjacency[group], directed=False,
+                                   indices=int(local_index[node]))[local_rows]
+            # Soft attenuation keeps the original support positive and covered.
+            # Self-influence is unchanged; row normalization preserves rigid fields.
+            attenuation = np.divide(distances[local_rows], propagation,
+                                    out=np.ones_like(propagation), where=propagation > 0)
+            weights *= attenuation
         support_rows.append(rows)
         support_columns.append(np.full(len(rows), slot, dtype=np.int64))
         support_values.append(weights)

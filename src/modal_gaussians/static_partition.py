@@ -1,9 +1,8 @@
-"""Post-training mask classification using full-scene visibility contributions.
+"""Lossless foreground partitioning from saved selection or mask visibility.
 
-No Gaussian is deleted or optimized. Only confidently supported subject points
-enter the derived scene's foreground; background AND uncertain points remain
-static. Evidence uses fixed-geometry feature gradients, including depth-ordered
-transmittance and the same distortion warp as RGB rendering.
+Manual selection uses stored full-scene indices. Automatic classification uses
+depth-ordered mask contributions; its background and uncertain points stay static.
+Neither path deletes or optimizes Gaussian parameters.
 """
 from __future__ import annotations
 
@@ -34,6 +33,7 @@ REASONS = {"0": "resolved", "1": "insufficient_visibility",
            "2": "mixed_mask_evidence", "3": "conflicting_views"}
 LEGACY_METHOD = "full_scene_visible_mask_contribution_v1"
 METHOD = "full_scene_visible_mask_contribution_v2"
+MANUAL_METHOD = "manual_subject_selection_v1"
 
 
 @dataclass(frozen=True)
@@ -264,6 +264,37 @@ def export_repartitioned_scene(scene: ForegroundBackgroundScene, output_dir: str
         raise ValueError(f"Repartition cannot form valid Gaussian sets: {_partition_counts(labels)}")
     if len(labels) != scene.count or camera_groups != group_camera_views(cameras, config):
         raise ValueError("Partition source count or camera groups disagree")
+    return _publish_partition(scene, output, labels, arrays, {
+        "method": METHOD, "config": asdict(config), "labels": LABELS, "reasons": REASONS,
+        "mask_sha256": [c.mask_sha256 for c in cameras], "camera_groups": camera_groups,
+        "motion_label": SUBJECT, "stationary_labels": [UNCERTAIN, BACKGROUND],
+    }, source_path, {
+        "uncertain_reasons": {name: int(np.count_nonzero(reasons == int(code)))
+                              for code, name in REASONS.items() if code != "0"},
+        "camera_group_count": len(camera_groups),
+    })
+
+
+def _publish_partition(scene, output_dir, labels, arrays, partition_fields, source_path, summary_fields):
+    """Publish a lossless full-scene reorder, without loading or validating it again."""
+    output = Path(output_dir).expanduser().resolve()
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(output)
+    subject = np.flatnonzero(labels == SUBJECT)
+    stationary = np.flatnonzero(labels != SUBJECT)
+    if len(labels) != scene.count or len(subject) < 2 or len(stationary) < 2:
+        raise ValueError("Selection requires at least two subject and two background Gaussians")
+    cameras = cameras_from_scene_manifest(scene.manifest)
+    manual = partition_fields["method"] == MANUAL_METHOD
+    projection = scene.manifest["representation"].get("camera_projection", "pinhole_K_only")
+    if manual:
+        if ((projection == "pinhole_K_only" and any(c.distortion_applied for c in cameras))
+                or (projection == PROJECTION_CONVENTION and not all(c.distortion_applied for c in cameras))
+                or projection not in ("pinhole_K_only", PROJECTION_CONVENTION)):
+            raise ValueError("Manual selection must preserve the source camera projection")
+        partition_fields = {**partition_fields, "camera_projection": projection}
+    elif scene.manifest["version"] not in (2, 3) or not all(c.distortion_applied for c in cameras):
+        raise ValueError("Partition requires a distortion-aware v2 or v3 static scene")
     order = np.concatenate((subject, stationary)).astype(np.int64)
     arrays = {**arrays, "new_to_source_index": order}
     source_tensors = scene.tensor_dictionary()
@@ -277,7 +308,7 @@ def export_repartitioned_scene(scene: ForegroundBackgroundScene, output_dir: str
     try:
         np.savez_compressed(temporary / "partition.npz", **arrays)
         partition = {
-            "method": METHOD, "config": asdict(config), "labels": LABELS, "reasons": REASONS,
+            **partition_fields,
             "source_static_version": scene.manifest["version"],
             "source_partition_identity": scene.manifest.get("partition_identity"),
             "source_static_scene_identity": scene.manifest["static_scene_identity"],
@@ -287,10 +318,9 @@ def export_repartitioned_scene(scene: ForegroundBackgroundScene, output_dir: str
             "source_foreground_count": scene.foreground.count,
             "source_background_count": scene.background.count,
             "camera_identities": [c.to_manifest_record()["camera_identity"] for c in cameras],
-            "mask_sha256": [c.mask_sha256 for c in cameras], "camera_groups": camera_groups,
-            "counts": _partition_counts(labels), "evidence_file": "partition.npz",
-            "evidence_sha256": _sha256_file(temporary / "partition.npz"),
-            "motion_label": SUBJECT, "stationary_labels": [UNCERTAIN, BACKGROUND],
+            "counts": _partition_counts(labels),
+            ("mapping_file" if manual else "evidence_file"): "partition.npz",
+            ("mapping_sha256" if manual else "evidence_sha256"): _sha256_file(temporary / "partition.npz"),
         }
         partition_identity = _sha256_json(partition)
         torch.save(tensors, temporary / "tensors.pt")
@@ -301,17 +331,21 @@ def export_repartitioned_scene(scene: ForegroundBackgroundScene, output_dir: str
                         background_identity=tensor_dictionary_identity(tensors, "background."),
                         tensors_sha256=_sha256_file(temporary / "tensors.pt"),
                         counts={"foreground": len(subject), "background": len(stationary)})
+        if manual:
+            manifest["representation"]["camera_projection"] = projection
         manifest["representation"].update(
             foreground_local_index_domain=[0, len(subject)], background_local_index_domain=[0, len(stationary)],
             combined_foreground_index_domain=[0, len(subject)],
             combined_background_index_domain=[len(subject), len(labels)],
-            background_role="static_background_and_uncertain", foreground_role="confident_motion_subject")
+            background_role="static_unselected" if manual else "static_background_and_uncertain",
+            foreground_role="manual_motion_subject" if manual else "confident_motion_subject")
         identity_payload = {
             "dataset_identity": manifest["dataset"]["dataset_identity"],
             "foreground_identity": manifest["foreground_identity"],
             "background_identity": manifest["background_identity"], "normalization": manifest["scene_normalization"],
             "representation": "vanilla_3dgs_direct_rgb", "camera_identities": partition["camera_identities"],
-            "projection_convention": PROJECTION_CONVENTION, "partition_identity": partition_identity,
+            "projection_convention": projection if manual else PROJECTION_CONVENTION,
+            "partition_identity": partition_identity,
         }
         manifest["static_scene_identity"] = _sha256_json(identity_payload)
         (temporary / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -321,9 +355,7 @@ def export_repartitioned_scene(scene: ForegroundBackgroundScene, output_dir: str
                 old: _partition_counts(labels[lo:hi]) for old, lo, hi in (
                     ("old_foreground", 0, scene.foreground.count),
                     ("old_background", scene.foreground.count, scene.count))},
-            "uncertain_reasons": {name: int(np.count_nonzero(reasons == int(code)))
-                                  for code, name in REASONS.items() if code != "0"},
-            "camera_count": len(cameras), "camera_group_count": len(camera_groups),
+            **summary_fields, "camera_count": len(cameras),
             "static_scene_identity": manifest["static_scene_identity"], "partition_identity": partition_identity,
             "gaussian_parameters_changed": False, "uncertain_in_motion_subject": False,
             "downstream_artifacts_require_rebuild": True,
@@ -334,8 +366,9 @@ def export_repartitioned_scene(scene: ForegroundBackgroundScene, output_dir: str
         summary["subject_quantile_01_99_diagonal"] = float(np.linalg.norm(
             np.quantile(subject_points, .99, axis=0) - np.quantile(subject_points, .01, axis=0)))
         (temporary / "partition-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-        load_static_scene(temporary)
-        os.replace(temporary, output)
+        if output.exists() or output.is_symlink():
+            raise FileExistsError(output)
+        os.rename(temporary, output)
     except BaseException:
         # Verify the resolved target before recursive cleanup on Windows.
         if temporary.resolve().parent != output.parent.resolve() or not temporary.name.startswith(f".{output.name}.tmp-"):
@@ -346,11 +379,36 @@ def export_repartitioned_scene(scene: ForegroundBackgroundScene, output_dir: str
     return output
 
 
+def apply_subject_selection(*, scene_dir: str | Path, selection_path: str | Path,
+                            output_dir: str | Path, command: Sequence[str] = ()) -> Path:
+    """Apply saved global indices as the motion subject; no rendering or mask reads."""
+    from modal_gaussians.subject_selection import read_subject_selection
+
+    output = Path(output_dir).expanduser().resolve()
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(output)
+    source = Path(scene_dir).expanduser().resolve(strict=True)
+    selection = Path(selection_path).expanduser().resolve(strict=True)
+    scene = load_static_scene(source)
+    selection_manifest, indices, box = read_subject_selection(selection, scene)
+    labels = np.full(scene.count, BACKGROUND, np.uint8)
+    labels[indices] = SUBJECT
+    arrays = dict(selected_indices=indices, box_position=box[0], box_wxyz=box[1], box_dimensions=box[2])
+    return _publish_partition(scene, output, labels, arrays, {
+        "method": MANUAL_METHOD, "selection_manifest": selection_manifest,
+        "selection_source_path": str(selection), "selection_sha256": _sha256_file(selection),
+        "index_order": "foreground_then_background", "command": list(command),
+    }, str(source), {"selection_source_path": str(selection), "mask_evidence_used": False})
+
+
 def validate_partition_bundle(path: Path, manifest: dict[str, Any], tensors: dict[str, torch.Tensor]) -> None:
     """Validate evidence, decisions and a lossless mapping back to source tensors."""
     partition = manifest.get("partition", {})
-    if partition.get("method") not in (METHOD, LEGACY_METHOD) or _sha256_json(partition) != manifest.get("partition_identity"):
+    if partition.get("method") not in (METHOD, LEGACY_METHOD, MANUAL_METHOD) or _sha256_json(partition) != manifest.get("partition_identity"):
         raise ValueError("Static partition identity mismatch")
+    if partition["method"] == MANUAL_METHOD:
+        _validate_manual_partition(path, manifest, tensors)
+        return
     if (partition.get("labels") != LABELS or partition.get("reasons") != REASONS
             or partition.get("motion_label") != SUBJECT or partition.get("stationary_labels") != [UNCERTAIN, BACKGROUND]
             or partition.get("evidence_file") != "partition.npz"):
@@ -372,19 +430,7 @@ def validate_partition_bundle(path: Path, manifest: dict[str, Any], tensors: dic
             or partition["camera_groups"] != group_camera_views(cameras, config)
             or partition["source_dataset_identity"] != manifest["dataset"]["dataset_identity"]):
         raise ValueError("Partition camera/mask source mismatch")
-    source_identity_payload = {
-        "dataset_identity": partition["source_dataset_identity"],
-        "foreground_identity": partition["source_foreground_identity"],
-        "background_identity": partition["source_background_identity"],
-        "normalization": manifest["scene_normalization"], "representation": "vanilla_3dgs_direct_rgb",
-        "camera_identities": partition["camera_identities"], "projection_convention": PROJECTION_CONVENTION,
-    }
-    if partition.get("source_static_version") == 3:
-        source_identity_payload["partition_identity"] = partition["source_partition_identity"]
-    elif partition.get("source_static_version") != 2 or partition.get("source_partition_identity") is not None:
-        raise ValueError("Unsupported partition source version")
-    if _sha256_json(source_identity_payload) != partition["source_static_scene_identity"]:
-        raise ValueError("Partition source scene identity mismatch")
+    _validate_partition_source(manifest, partition)
     evidence_path = path / "partition.npz"
     if _sha256_file(evidence_path) != partition["evidence_sha256"]:
         raise ValueError("Partition evidence checksum mismatch")
@@ -412,9 +458,35 @@ def validate_partition_bundle(path: Path, manifest: dict[str, Any], tensors: dic
             or partition["counts"] != _partition_counts(labels)):
         raise ValueError("Partition decisions disagree with evidence")
     order = np.concatenate((np.flatnonzero(labels == SUBJECT), np.flatnonzero(labels != SUBJECT)))
-    if arrays["new_to_source_index"].dtype != np.int64 or not np.array_equal(order, arrays["new_to_source_index"]):
+    _validate_partition_mapping(manifest, tensors, partition, order,
+                                arrays["new_to_source_index"], int(np.count_nonzero(labels == SUBJECT)))
+
+
+def _validate_partition_source(manifest, partition):
+    source_identity_payload = {
+        "dataset_identity": partition["source_dataset_identity"],
+        "foreground_identity": partition["source_foreground_identity"],
+        "background_identity": partition["source_background_identity"],
+        "normalization": manifest["scene_normalization"], "representation": "vanilla_3dgs_direct_rgb",
+    }
+    source_version = partition.get("source_static_version")
+    if source_version in (2, 3):
+        source_identity_payload.update(camera_identities=partition["camera_identities"],
+            projection_convention=partition.get("camera_projection", PROJECTION_CONVENTION))
+    if source_version == 3:
+        source_identity_payload["partition_identity"] = partition["source_partition_identity"]
+    elif source_version not in (1, 2) or partition.get("source_partition_identity") is not None:
+        raise ValueError("Unsupported partition source version")
+    if source_version == 1 and partition["method"] != MANUAL_METHOD:
+        raise ValueError("Only manual selection supports legacy static v1 sources")
+    if _sha256_json(source_identity_payload) != partition["source_static_scene_identity"]:
+        raise ValueError("Partition source scene identity mismatch")
+
+
+def _validate_partition_mapping(manifest, tensors, partition, order, recorded_order, fg_count):
+    count = partition["source_foreground_count"] + partition["source_background_count"]
+    if recorded_order.dtype != np.int64 or not np.array_equal(order, recorded_order):
         raise ValueError("Partition index mapping mismatch")
-    fg_count = int(np.count_nonzero(labels == SUBJECT))
     if manifest["counts"] != {"foreground": fg_count, "background": count - fg_count}:
         raise ValueError("Partition scene counts mismatch")
     reconstructed = {}
@@ -429,6 +501,49 @@ def validate_partition_bundle(path: Path, manifest: dict[str, Any], tensors: dic
     for part in ("foreground", "background"):
         if tensor_dictionary_identity(reconstructed, part + ".") != partition[f"source_{part}_identity"]:
             raise ValueError("Partition changed source Gaussian parameters")
+
+
+def _validate_manual_partition(path, manifest, tensors):
+    from modal_gaussians.subject_selection import _box_values
+
+    partition = manifest["partition"]
+    cameras = cameras_from_scene_manifest(manifest)
+    if (partition.get("mapping_file") != "partition.npz"
+            or partition.get("index_order") != "foreground_then_background"
+            or partition.get("camera_projection") != manifest["representation"].get("camera_projection")
+            or partition["camera_identities"] != [c.to_manifest_record()["camera_identity"] for c in cameras]
+            or partition["source_dataset_identity"] != manifest["dataset"]["dataset_identity"]):
+        raise ValueError("Manual partition source contract mismatch")
+    _validate_partition_source(manifest, partition)
+    mapping = path / "partition.npz"
+    if _sha256_file(mapping) != partition["mapping_sha256"]:
+        raise ValueError("Manual partition mapping checksum mismatch")
+    with np.load(mapping, allow_pickle=False) as archive:
+        if set(archive.files) != {"selected_indices", "new_to_source_index", "box_position", "box_wxyz", "box_dimensions"}:
+            raise ValueError("Manual partition mapping schema mismatch")
+        indices = archive["selected_indices"]
+        count = partition["source_foreground_count"] + partition["source_background_count"]
+        if (indices.dtype != np.int64 or indices.ndim != 1 or len(indices) < 2 or len(indices) > count - 2
+                or np.any(indices < 0) or np.any(indices >= count) or np.any(indices[1:] <= indices[:-1])):
+            raise ValueError("Invalid manual partition indices")
+        saved = partition["selection_manifest"]
+        if (saved.get("format") != "modal_gaussians.subject_selection" or saved.get("version") != 1
+                or saved.get("index_order") != "foreground_then_background"
+                or saved.get("selection_rule") != "gaussian_center_in_oriented_box"
+                or saved.get("selected_count") != len(indices)
+                or saved.get("source_counts") != {"foreground": partition["source_foreground_count"],
+                                                  "background": partition["source_background_count"]}
+                or any(saved.get(key) != partition["source_" + key] for key in
+                       ("static_scene_identity", "foreground_identity", "background_identity"))):
+            raise ValueError("Manual partition selection source mismatch")
+        _box_values(archive["box_position"], archive["box_wxyz"], archive["box_dimensions"])
+        labels = np.full(count, BACKGROUND, np.uint8)
+        labels[indices] = SUBJECT
+        if partition["counts"] != _partition_counts(labels):
+            raise ValueError("Manual partition counts mismatch")
+        order = np.concatenate((indices, np.flatnonzero(labels != SUBJECT)))
+        _validate_partition_mapping(manifest, tensors, partition, order,
+                                    archive["new_to_source_index"], len(indices))
 
 
 def repartition_static_scene(*, scene_dir: str | Path, output_dir: str | Path,

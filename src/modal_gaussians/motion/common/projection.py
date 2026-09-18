@@ -1,7 +1,7 @@
 """Shared frozen-camera projection and foreground feature-sampling policy."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Any
 import cv2
@@ -119,6 +119,61 @@ def candidate_pixels(
     return pixels, alpha_value[y, x].astype(np.float32)
 
 
+def uses_visible_subject(scene: ForegroundBackgroundScene) -> bool:
+    """Manual 3D selections use visibility, without inherited image masks."""
+
+    return (getattr(scene, "manifest", None) or {}).get("partition", {}).get(
+        "method"
+    ) == "manual_subject_selection_v1"
+
+
+def render_motion_features(
+    scene: ForegroundBackgroundScene, camera: Camera, features: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return premultiplied subject features and their matching visible mass."""
+
+    if not uses_visible_subject(scene):
+        return scene.render_features(camera, features, composition="foreground")
+    if features.ndim != 2 or features.shape[0] != scene.foreground.count or features.shape[1] < 1:
+        raise ValueError("Motion features must have shape [foreground_gaussians, channels]")
+    subject_features = torch.cat((features, features.new_ones((len(features), 1))), dim=-1)
+    all_features = torch.cat((subject_features, features.new_zeros(
+        (scene.background.count, subject_features.shape[1])
+    )), dim=0)
+    image, _ = scene.render_features(camera, all_features, composition="all")
+    # The renderer's alpha includes background; the extra channel counts only
+    # foreground contributions after all foreground/background occlusion.
+    return image[..., :-1], image[..., -1]
+
+
+def render_observation_geometry(
+    scene: ForegroundBackgroundScene, camera: Camera,
+) -> dict[str, torch.Tensor]:
+    """Render visible subject mass and subject-conditional camera-space depth."""
+
+    if not uses_visible_subject(scene):
+        return scene.render(camera, composition="foreground", outputs=("alpha", "expected_depth"))
+    means = scene.foreground.active()["means"]
+    w2c = camera.world_to_camera.to(device=means.device, dtype=means.dtype)
+    z = means @ w2c[2, :3] + w2c[2, 3]
+    image, alpha = render_motion_features(scene, camera, z[:, None])
+    depth = torch.where(alpha > 1e-8, image[..., 0] / alpha.clamp_min(1e-8),
+                        torch.zeros_like(alpha))
+    return {"alpha": alpha, "expected_depth": depth}
+
+
+def candidate_observation_pixels(
+    scene: ForegroundBackgroundScene, mask: np.ndarray, alpha: np.ndarray,
+    config: RenderedDesignConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Manual selections retain the alpha/stride gate without mask erosion."""
+
+    if uses_visible_subject(scene):
+        return candidate_pixels(np.ones_like(alpha, dtype=bool), alpha,
+                                replace(config, mask_erosion_iterations=0))
+    return candidate_pixels(mask, alpha, config)
+
+
 def sample_feature_render(
     scene: ForegroundBackgroundScene,
     camera: Camera,
@@ -128,9 +183,7 @@ def sample_feature_render(
 ) -> np.ndarray:
     """Render all foreground contributors, sample pixels, and alpha-normalize."""
 
-    image, alpha = scene.render_features(
-        camera, features, composition="foreground"
-    )
+    image, alpha = render_motion_features(scene, camera, features)
     x = torch.as_tensor(pixels[:, 0], device=image.device, dtype=torch.long)
     y = torch.as_tensor(pixels[:, 1], device=image.device, dtype=torch.long)
     rendered_alpha = alpha[y, x].detach().cpu().float().numpy()

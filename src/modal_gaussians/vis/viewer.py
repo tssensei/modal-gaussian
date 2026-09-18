@@ -17,6 +17,7 @@ import viser.transforms as vtf
 
 from modal_gaussians.result import ModalResultArtifact, load_modal_result
 from modal_gaussians.motion.common.mode_mapping import resolve_source_mode_slots
+from modal_gaussians.motion.common.projection import projection_jacobian
 from modal_gaussians.motion.rigid.rigid import load_rigid_modes
 from modal_gaussians.static import (
     Camera,
@@ -30,6 +31,7 @@ from modal_gaussians.vis.render_panel import populate_render_tab
 from modal_gaussians.vis.spectrum import (
     ModalSpectrumPanel,
     SpectrumComparisonController,
+    _hsv_rgb,
 )
 
 
@@ -512,6 +514,16 @@ class ModalViewerData:
             _component_colors(self.result.completed_modes.arrays["g_component_index"][self.control_point_gaussian_index])
             if len(self.control_point_gaussian_index) else np.empty((0, 3), dtype=np.float32)
         )
+        self.control_displacement = self.result.completed_modes.control_displacement
+        self.control_positions = np.asarray(self.result.completed_modes.arrays.get(
+            "c_positions", np.empty((0, 3), dtype=np.float32)))
+        if self.control_displacement is not None:
+            expected = (len(self.frequencies_hz), len(self.control_point_gaussian_index), 3)
+            if (self.control_displacement.dtype != np.complex64
+                    or self.control_displacement.shape != expected
+                    or self.control_positions.shape != expected[1:]
+                    or not np.isfinite(self.control_displacement).all()):
+                raise ValueError("Viewer control displacement must be finite complex64 [K,C,3]")
         self._load_graph_display()
         self.spectrum = SpectrumComparisonController(self.result, prepared=prepared)
 
@@ -687,6 +699,34 @@ class ModalViewerData:
             2.0 * torch.pi
         )
         return _hsv_to_rgb(hue, value)
+
+    def control_phase_colors(self, mode_index: int, component_index: int,
+                             normalization: str, camera: Camera | None = None) -> np.ndarray:
+        """Project raw control translations at rest, before Gaussian interpolation.
+
+        An orbit camera uses the artifact's phase and control-amplitude p99.
+        Without a camera, use the Spectrum reference's alpha and brightness.
+        Neither path depends on oscillator time, gain or deformed positions.
+        """
+        if self.control_displacement is None:
+            raise ValueError("This artifact has no runtime control displacement")
+        if not 0 <= mode_index < len(self.control_displacement) or component_index not in (0, 1):
+            raise ValueError("Control modal mode/component is out of range")
+        alpha, magnitude_hi = 1.0 + 0.0j, None
+        if camera is None:
+            label, alpha, identifiable, magnitude_hi = self.spectrum.current_modal_phase_display_context(
+                mode_index, component_index, normalization)
+            if not identifiable:
+                return np.zeros((len(self.control_positions), 3), dtype=np.float32)
+            camera = self.camera_by_label[label].camera
+        jacobian, projectable = projection_jacobian(
+            self.control_positions, camera.K.detach().cpu().numpy(),
+            camera.world_to_camera.detach().cpu().numpy(), camera.radial_distortion)
+        projected = alpha * np.einsum(
+            "cj,cj->c", jacobian[:, component_index], self.control_displacement[mode_index])
+        if magnitude_hi is None:
+            magnitude_hi = float(np.percentile(np.abs(projected[projectable]), 99)) if projectable.any() else 1.0
+        return _hsv_rgb(projected, magnitude_hi)
 
     def observation_colors(self, mode_index: int) -> Tensor:
         """Apply the old one/two/three-plus calibrated-view color legend."""
@@ -1145,10 +1185,28 @@ class ModalViserViewer:
                                            step=0.0001, initial_value=0.002)
                 if control_count else None
             )
+            has_control_modes = self.data.control_displacement is not None
+            self.control_color_mode = (
+                self.server.gui.add_dropdown(
+                    "Control point color", options=("geometry component", "modal shape"),
+                    initial_value="modal shape" if has_control_modes else "geometry component",
+                    disabled=not has_control_modes)
+                if control_count else None
+            )
+            self.control_projection = (
+                self.server.gui.add_dropdown(
+                    "Control projection", options=("current camera", "spectrum view"),
+                    initial_value="current camera", disabled=not has_control_modes)
+                if control_count else None
+            )
             if control_count:
                 self.server.gui.add_markdown(
-                    f"**Control points:** {control_count:,}. All controls are shown, colored by geometry component. "
-                    "Use **Canonical** to inspect their static distribution."
+                    f"**Control points:** {control_count:,}. Modal shape shows learned control translations "
+                    "before interpolation. Select frequency and **U/V** in Spectrum. Hue = phase; brightness = amplitude. "
+                    "**Current camera** follows the orbit view, using basis phase and control-amplitude p99. "
+                    "**Spectrum view** shares the input modal image's phase and brightness scale. "
+                    "Colors describe the mode, independent of playback time/gain. "
+                    "Use **Canonical** for static positions. All controls are shown, including hidden ones."
                 )
             self.hide_render = self.server.gui.add_checkbox(
                 "Hide Gaussian render", False
@@ -1218,6 +1276,8 @@ class ModalViserViewer:
         debug_handles = (
             self.show_controls_only,
             self.control_point_size,
+            self.control_color_mode,
+            self.control_projection,
             self.hide_render,
             self.hide_background,
             self.show_support,
@@ -1254,16 +1314,24 @@ class ModalViserViewer:
             self._control_point_cloud.remove()
             self._control_point_cloud = None
 
-    def _update_control_cloud(self, means: Tensor) -> None:
+    def _update_control_cloud(self, means: Tensor, camera: Camera) -> None:
         indices = torch.as_tensor(self.data.control_point_gaussian_index, device=means.device)
         points = means[indices].detach().cpu().numpy()
+        colors = self.data.control_point_colors
+        if self.control_color_mode.value == "modal shape":
+            colors = self.data.control_phase_colors(
+                self.data.frequency_order[int(self.phase_mode.value)],
+                0 if self.phase_component.value == "u" else 1,
+                str(self.phase_normalization.value),
+                camera if self.control_projection.value == "current camera" else None)
         if self._control_point_cloud is None:
             self._control_point_cloud = self.server.scene.add_point_cloud(
-                "/debug/control_points", points=points, colors=self.data.control_point_colors,
+                "/debug/control_points", points=points, colors=colors,
                 point_size=float(self.control_point_size.value),
             )
         else:
             self._control_point_cloud.points = points
+            self._control_point_cloud.colors = colors
             self._control_point_cloud.point_size = float(self.control_point_size.value)
 
     def _remove_support_cloud(self) -> None:
@@ -1519,16 +1587,16 @@ class ModalViserViewer:
 
         q, scale = self._current_coordinate()
         means = self.data.deformed_means(q, scale)
+        camera = self._render_camera(client)
         only_controls = self._controls_only_enabled()
         if only_controls:
             self._remove_support_cloud()
             self._remove_component_graph()
-            self._update_control_cloud(means)
+            self._update_control_cloud(means, camera)
         else:
             self._remove_control_cloud()
             self._update_support_cloud(means)
             self._update_component_graph(means)
-        camera = self._render_camera(client)
         if only_controls or bool(self.hide_render.value):
             return np.full((camera.height, camera.width, 3), 255, dtype=np.uint8)
         colors = self._current_foreground_colors()

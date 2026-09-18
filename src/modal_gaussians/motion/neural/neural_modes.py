@@ -61,6 +61,9 @@ class NeuralModesConfig:
     deformation_weight: float = 1.0
     rotation_weight: float = 0.1
     rotation_length_fraction: float = 0.05
+    # Keep historical false configuration keys without retaining the failed ablations.
+    exclude_weak_gaussian_rigidity: bool = False
+    zero_weak_graph_weights: bool = False
     learning_rate: float = 0.001
     max_iterations: int = 2000
     gradient_clip: float = 1.0
@@ -73,6 +76,9 @@ class NeuralModesConfig:
     training_fragment_config: dict[str, Any] | None = None
 
     def validate(self) -> None:
+        for name in ("exclude_weak_gaussian_rigidity", "zero_weak_graph_weights"):
+            if getattr(self, name) is not False:
+                raise ValueError(f"{name} has been removed; only false is supported")
         if self.training_fragment_config is not None:
             from modal_gaussians.motion.neural.strategies import config_class
             config_class(self.training_fragment_config).from_dict(self.training_fragment_config)
@@ -114,13 +120,19 @@ class NeuralModesConfig:
             result.pop("training_fragment_config")
         if self.local_feature_dim == 0:
             result.pop("local_feature_dim")
+        if not self.exclude_weak_gaussian_rigidity:
+            result.pop("exclude_weak_gaussian_rigidity")
+        if not self.zero_weak_graph_weights:
+            result.pop("zero_weak_graph_weights")
         return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "NeuralModesConfig":
         result = cls(**dict(value))
         result.validate()
-        if result.to_dict() != dict(value):
+        canonical = {key: item for key, item in value.items()
+                     if key not in ("exclude_weak_gaussian_rigidity", "zero_weak_graph_weights")}
+        if result.to_dict() != canonical:
             raise ValueError("Neural configuration is not fully resolved")
         return result
 
@@ -131,6 +143,7 @@ class NeuralModesArtifact:
     manifest: dict[str, Any]
     arrays: dict[str, np.ndarray]
     rotation: np.ndarray | None = None
+    control_displacement: np.ndarray | None = None
 
 
 def _canonical(value: Any) -> bytes:
@@ -303,7 +316,9 @@ class FrozenModalProjector:
         self.alpha = foreground_alpha.detach()
 
     def sample_features(self, features: torch.Tensor) -> torch.Tensor:
-        image, _ = self.scene.render_features(self.camera, features, composition="foreground")
+        from modal_gaussians.motion.common.projection import render_motion_features
+
+        image, _ = render_motion_features(self.scene, self.camera, features)
         return image[self.y, self.x] / self.alpha[:, None]
 
     def __call__(self, phi: torch.Tensor) -> torch.Tensor:
@@ -433,6 +448,9 @@ def _semantics(config: NeuralModesConfig, source: Mapping[str, Any] | None = Non
     if selected_modal:
         result.pop("rigid_source_use")
         result["alignment_source"] = "selected_modal_alignment"
+        if source["selected_modal_supervision"].get("observation_region") == "visible_subject":
+            result["observation"] = "dense_modal_image_full_scene_occluded_foreground_features_divided_by_visible_subject_mass"
+            result["observation_sampling"] = "visible_subject_alpha_and_stride_grid_no_image_mask_no_erosion"
     if config.local_feature_dim:
         result["control_features"] = {
             "dimension": config.local_feature_dim,
@@ -500,12 +518,14 @@ def _prepare_observation_arrays(scene: Any, source: Mapping[str, Any], dense: An
                                 alphas: np.ndarray, identifiable: np.ndarray,
                                 frozen_arrays: Mapping[str, np.ndarray] | None = None,
                                 flow_loader: Any = None,
+                                observation_renders: Mapping[str, Mapping[str, torch.Tensor]] | None = None,
                                 ) -> tuple[dict[str, np.ndarray], list[FrozenModalProjector], list[Any], list[np.ndarray], list[np.ndarray]]:
     from modal_gaussians.flow.artifact import load_flow_analysis_artifact, flow_artifact_identity
     from modal_gaussians.motion.common.projection import (
         RenderedDesignConfig,
-        candidate_pixels,
+        candidate_observation_pixels,
         projection_jacobian,
+        render_observation_geometry,
     )
     from modal_gaussians.static import cameras_from_scene_manifest
 
@@ -531,11 +551,12 @@ def _prepare_observation_arrays(scene: Any, source: Mapping[str, Any], dense: An
         if list(flow.arrays.mask_union.shape) != [camera.height, camera.width]:
             raise ValueError("Neural flow mask shape differs from camera")
         with torch.no_grad():
-            render = scene.render(camera, composition="foreground", outputs=("alpha", "expected_depth"))
+            render = (render_observation_geometry(scene, camera) if observation_renders is None
+                      else observation_renders[view["label"]])
         alpha_image = render["alpha"].cpu().numpy().astype(np.float32)
         depth_image = render["expected_depth"].cpu().numpy().astype(np.float32)
         if frozen_arrays is None:
-            pixels, confidence = candidate_pixels(flow.arrays.mask_union, alpha_image, sampling)
+            pixels, confidence = candidate_observation_pixels(scene, flow.arrays.mask_union, alpha_image, sampling)
         else:
             lo, hi = frozen_arrays["view_sample_offsets"][view["index"]:view["index"] + 2]
             pixels = frozen_arrays["sample_pixels_xy"][lo:hi]
@@ -709,7 +730,8 @@ def _publish_artifact(destination: Path, source: Mapping[str, Any], arrays: Mapp
                       model_states: Sequence[Mapping[str, Any]], config: NeuralModesConfig,
                       runtime: Mapping[str, Any], run_identity: str, graph_metadata: Mapping[str, Any],
                       optimization: Sequence[Mapping[str, Any]], command: Sequence[str],
-                      *, rotation: np.ndarray | None = None) -> NeuralModesArtifact:
+                      *, rotation: np.ndarray | None = None,
+                      control_displacement: np.ndarray | None = None) -> NeuralModesArtifact:
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"Neural output already exists: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -754,7 +776,7 @@ def _publish_artifact(destination: Path, source: Mapping[str, Any], arrays: Mapp
         if temporary.exists() and temporary.parent == destination.parent.resolve() and temporary.name.startswith(f".{destination.name}."):
             shutil.rmtree(temporary)
         raise
-    return NeuralModesArtifact(destination, manifest, dict(arrays), rotation)
+    return NeuralModesArtifact(destination, manifest, dict(arrays), rotation, control_displacement)
 
 
 def _prepare_mode_selection(work: Path, source: Mapping[str, Any], fixed: Mapping[str, np.ndarray],
@@ -855,7 +877,7 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
     arrays["phi"] = np.zeros((count, len(arrays["g_points"]), 3), dtype=np.complex64)
     arrays["sample_prediction"] = np.zeros_like(arrays["sample_target"])
     model_states, optimization = [], []
-    rotations = []
+    rotations, control_displacements = [], []
     for mode, payload in enumerate(payloads):
         state = payload["best_model_state"]
         # Bake on the same CPU backend used by strict loading. CUDA scatter and
@@ -866,6 +888,7 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
                                config=_field_config(settings, slots[mode]))
         field = evaluated[0].to(device)
         rotations.append(evaluated[1].detach().cpu().numpy())
+        control_displacements.append(evaluated[2].detach().cpu().numpy())
         arrays["phi"][mode] = field.detach().cpu().numpy().astype(np.complex64)
         with torch.no_grad():
             for view, projector in enumerate(projectors):
@@ -877,7 +900,8 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
         optimization.append({**payload["summary"], "mode_slot": mode, "source_mode_slot": slots[mode]})
     return _publish_artifact(destination, subset_source, arrays, model_states, settings, runtime,
                              run_identity, parent_contract["geometry_graph"], optimization, command,
-                             rotation=np.stack(rotations) if (settings.training_fragment_config or {}).get("strategy") == "component_field" else None)
+                             rotation=np.stack(rotations) if (settings.training_fragment_config or {}).get("strategy") == "component_field" else None,
+                             control_displacement=np.stack(control_displacements) if (settings.training_fragment_config or {}).get("strategy") == "component_field" else None)
 
 
 def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Path,
@@ -1001,6 +1025,9 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         "interpolation": "all_graph_distance_supports_within_2h_normalized_wendland_c2",
         "control_edge_length": "original_geometry_graph_shortest_path",
     }
+    if graph.edge_propagation_length is not None:
+        geometry_metadata["control_sampling_distance"] = "original_geometry_graph_shortest_path"
+        geometry_metadata["interpolation_attenuation"] = "geometric_distance_over_propagation_distance_then_row_normalize"
     if getattr(prepared_inputs, "external_geometry_contract", None) is not None:
         geometry_metadata.update(policy="saved_modal_graph_with_rebuilt_controls",
                                  external_graph=prepared_inputs.external_geometry_contract)
@@ -1031,7 +1058,7 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
     arrays["phi"] = np.zeros((mode_count, len(graph.points), 3), dtype=np.complex64)
     arrays["sample_prediction"] = np.zeros((mode_count, sample_count, 2), dtype=np.complex64)
     model_states, optimization = [], []
-    rotations = []
+    rotations, control_displacements = [], []
     for mode in selected_slots:
         checkpoint = work / f"mode_{mode:03d}.pt"
         payload = None
@@ -1085,6 +1112,7 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
                                config=field_config)
         field = evaluated[0].to(device)
         rotations.append(evaluated[1].detach().cpu().numpy())
+        control_displacements.append(evaluated[2].detach().cpu().numpy())
         arrays["phi"][mode] = field.detach().cpu().numpy().astype(np.complex64)
         with torch.no_grad():
             for view, projector in enumerate(projectors):
@@ -1105,7 +1133,8 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
                         for local, (slot, payload) in enumerate(zip(selected_slots, payloads))]
     return _publish_artifact(destination, source, arrays, model_states, settings, runtime, run_identity,
                              geometry_metadata, optimization, command,
-                             rotation=np.stack(rotations) if (settings.training_fragment_config or {}).get("strategy") == "component_field" else None)
+                             rotation=np.stack(rotations) if (settings.training_fragment_config or {}).get("strategy") == "component_field" else None,
+                             control_displacement=np.stack(control_displacements) if (settings.training_fragment_config or {}).get("strategy") == "component_field" else None)
 
 
 __all__ = ["NeuralModesConfig", "NeuralModesArtifact", "FrozenModalProjector", "support_roles",

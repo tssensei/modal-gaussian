@@ -5,19 +5,28 @@ analysis. The first migrated vertical slice validates ordered image/mask
 sequences, optionally stabilizes them to a reference frame, computes dense
 reference-to-frame Farneback flow, and evaluates the per-pixel temporal FFT.
 
-The current user-selected neural motion baseline (2026-09-18) is
-`bush_neural_modal_similarity_0744_001/experiment`: **SEA-RAFT** modal-image
-supervision from three views and the **0.20 modal-similarity graph**, built from
-K=16 candidates within radius 0.08. The accepted preview contains **0.744 Hz**.
+The current user-selected neural motion baseline (2026-09-18) covers
+**Corn 0.225 Hz** at `outputs/corn_neural_soft_rigidity003_rotation0_0225_001/experiment`
+and **Bush 0.744 Hz** at `outputs/bush_neural_soft_rigidity003_rotation0_0744_001/experiment`.
+Both use **SEA-RAFT** modal-image supervision and soft modal-similarity weights:
+all K=16 candidates within radius 0.08 remain in the graph, with rejected edges
+weighted at **0.05 times their original weight**. Control sampling uses original geometric distances;
+soft propagation only attenuates existing interpolation weights.
 Width **256**, **32** local features, **three** message-passing layers, control
-radius **0.015L**, deformation/rotation penalties **0.1/0.1**, and whole-component
-fields with separate donors remain unchanged. Use
+radius **0.015L**, and whole-component fields with separate donors remain unchanged.
+New-run deformation/rotation penalties are **0.03/0**. Local rotations in the
+motion field and Viewer ellipsoid rotation remain enabled. Corn retains its
+manual subject selection; acceptance covers these two scene/frequency pairs,
+not other frequencies. Saved experiments keep their original settings. Use
 `configs/neural_component_field.json` for subsequent numeric overrides; new
 neural CLI runs without an explicit config also select these numeric defaults.
+Custom partial configs inherit omitted fields from their prepared snapshot;
+include `"deformation_weight": 0.03` and `"rotation_weight": 0` explicitly when
+using an older preparation. Both zero-weight ablation switches remain false.
 The full baseline additionally requires SEA-RAFT prepared supervision and an
-explicit `--geometry-graph` pointing to the matching saved modal-similarity graph.
-See [BASELINE.md](BASELINE.md) for the exact result, frozen configuration and
-historical corn references.
+explicit `--geometry-graph` pointing to the matching saved soft graph.
+See [BASELINE.md](BASELINE.md) for both accepted previews, source/configuration
+paths and historical hard-cut Bush and Corn references.
 
 ## Code organization
 
@@ -1116,8 +1125,9 @@ motion from those donors. All learning-component edges participate in the
 structural loss. The neighbor residual penalty, per-point directional projection
 and observation post-refinement are disabled for this strategy. The two-control
 gate has synthetic development validation and completed bush/corn runs; the user
-subsequently selected the SEA-RAFT/modal-similarity Bush result as the current
-baseline, retaining the 32-feature network. Earlier v16
+subsequently selected the SEA-RAFT soft-graph Corn 0.225 Hz and Bush 0.744 Hz
+results with deformation/rotation weights 0.03/0 as the current baseline,
+retaining the 32-feature network. Earlier v16
 experiments retain their original settings and remain reproducible.
 
 Work directories retain the original fixed observations, graph, renderer
@@ -1460,6 +1470,22 @@ Rendering → Time → Cameras → Gaussian color → Modal playback → Debug p
 (only when there is more than one mode) and the loaded artifact's role legend:
 three basis roles for versions 3-7, or the accepted legacy roles for
 version 1/2. `Hide background` appears only when background Gaussians exist.
+
+For v16 previews, **Debug points → Show control points only** defaults to
+**Control point color = modal shape**. Select the frequency and U/V component
+in Spectrum. Hue shows phase and brightness shows amplitude of the learned
+control translation before Gaussian interpolation. **Control projection =
+current camera** follows the orbit camera, using the basis phase and the 99th
+percentile control amplitude for that component. Choose **spectrum view** to
+use the exact reference camera, complex view alpha and brightness scale of the
+input modal image. Colors are evaluated at static control positions and do not
+depend on oscillator time, gain or motion scale. **Canonical** also fixes the
+displayed positions; all controls, including hidden ones, are shown. Geometry
+component colors remain available. Existing v16 artifacts recover control modes
+from the same loading-time network evaluation used for ellipsoid rotation;
+no retraining or new artifact format is required. Older artifacts retain
+geometry component colors.
+
 The dark theme, yellow accent, medium control width, and default Viewer Res
 of 2048 also match the old Viewer. Explicit `--viewer-res` settings still take
 precedence, so an existing run configured with 1024 keeps that resolution.
@@ -1613,7 +1639,7 @@ networks, or modal results, load the static scene and its geometry cache entry:
 modal-gaussians viewer --scene outputs\static_scene --geometry-graph outputs\_cache\geometry\GRAPH_KEY --work-dir outputs\graph_viewer --host 127.0.0.1 --port 8087
 ```
 
-`--scene` and `--geometry-graph` must be supplied together, instead of `--preview`
+For graph inspection, `--scene` and `--geometry-graph` must be supplied together, instead of `--preview`
 or `--result`. `GRAPH_KEY` is the geometry cache directory whose manifest binds
 the scene's foreground identity and desired graph configuration. This entry
 reads the saved graph; it does not rebuild connectivity. Basic scene/graph
@@ -1622,71 +1648,149 @@ recomputed at startup. The graph and Gaussian centers appear by default, colored
 component. Camera navigation, Gaussian/background visibility, edge count, and
 line width remain available; motion and spectrum controls are absent.
 
-For a graph-only modal-gradient experiment, start from a geometry cache with
-`graph_edge_filter=none` and bind one or more SEA-RAFT selected-frequency outputs
-to prepared view labels:
+To select a subject from the complete static scene, including Gaussians currently
+classified as background, use the independent 3D box viewer:
 
 ```bat
-modal-gaussians graph prune-modal-gradient --prepared outputs\bush_neural_dense_controls_001\prepared --geometry-graph outputs\_cache\geometry\GRAPH_KEY --view view1 outputs\bush1_sea_raft_0744_001 --view view2 outputs\bush2_sea_raft_0744_001 --view view3 outputs\bush3_sea_raft_0744_001 --frequency 0.744 --gradient-threshold 0.05 --output outputs\bush_graph_modal_gradient_0744_001
+modal-gaussians viewer --select-subject --scene outputs\corn_static_20fps_001\static_scene --work-dir outputs\corn_subject_selection_001\work\viewer --host 127.0.0.1 --port 8096 --viewer-res 1280
 ```
 
-The score is the maximum joint complex U/V gradient along the projected 3D
-edge, normalized by each view's 99th-percentile modal amplitude. The threshold
-is in normalized amplitude per pixel, not a probability. Any eligible view
-above the threshold removes the edge. Cached depth/alpha only gate visibility
-and foreground occlusion; no depth-discontinuity cuts are applied. Unknown
-edges and retained weights remain unchanged. Static visibility does not resolve
-occlusion over the video or establish physical branch connectivity.
+Drag or rotate the box, adjust its dimensions in the GUI, and inspect the
+highlighted Gaussian centers from multiple views before saving. The initial box
+uses the old foreground bounds only as an adjustable starting point. Saving
+writes a new `subject-selection-<timestamp>.npz` in the work directory, preserving
+the original full-scene order (foreground then background), box pose and size,
+and scene identity. Resume it by adding `--selection PATH_TO_SAVED_NPZ` to the
+same command. This needs no masks, graph, frequencies, or trained modes and does
+not modify the original scene, graph, or modes. The selection identifies centers
+inside the box; it does not recover geometry absent from the static scene.
 
-Pass the output directory to the graph Viewer's `--geometry-graph`. It preserves
-all candidate edges for display: removed edges are white, retained edges use
-component colors. Separate visibility toggles and balanced subsampling expose
-both groups. `edge_evidence.npz` stores per-view scores and reason codes; the
-manifest records their meaning and inputs. This command does not rebuild
-controls, train modes, validate experiments, or start a Viewer.
-
-To build connections from positive local motion evidence instead, use the same
-unfiltered KNN candidate cache with `graph build-modal-similarity`:
+Apply a saved selection to a **new** static scene, then rebuild selected-modal
+observations for that scene. For the saved Corn selection:
 
 ```bat
-modal-gaussians graph build-modal-similarity --prepared outputs\bush_neural_dense_controls_001\prepared --geometry-graph outputs\_cache\geometry\GRAPH_KEY --view view1 outputs\bush1_sea_raft_0744_001 --view view2 outputs\bush2_sea_raft_0744_001 --view view3 outputs\bush3_sea_raft_0744_001 --frequency 0.744 --similarity-threshold 0.20 --difference-threshold 0.30 --max-pixel-distance 32 --output outputs\bush_graph_modal_similarity_0744_002
+modal-gaussians static apply-selection --scene outputs\corn_static_20fps_001\static_scene --selection outputs\corn_subject_selection_001\work\viewer\subject-selection-20260918-141553-ix354nk4.npz --output outputs\corn_subject_selection_001\static_scene
+
+modal-gaussians motion prepare-selected-modal --prepared outputs\corn_neural_modal_similarity_0225_001\prepared --scene outputs\corn_subject_selection_001\static_scene --view view1 outputs\corn1_sea_raft_0225_001 --view view2 outputs\corn2_sea_raft_0225_001 --frequency-hz 0.225 --output outputs\corn_subject_selection_001\prepared
+```
+
+`apply-selection` preserves every Gaussian parameter, applies the saved indices
+in foreground-then-background source order, and saves the new-to-source mapping.
+It preserves the source camera projection, including legacy v1 pinhole scenes,
+and does not retrain or overwrite the original static scene. The preparation's
+`--scene` option requires an applied manual selection of the parent's scene (or
+that same manually selected scene). It rebuilds topology, cross-view complex
+alignment, sample coordinates, contributions and normalization. It reuses the
+parent's camera/timing metadata and reference RGB, plus the saved full-image
+SEA-RAFT modal fields; no optical flow or FFT is recomputed.
+
+For these manual scenes, supervision samples use the selected subject's visible
+rendered contribution, with **all background Gaussians participating in depth
+ordering**. Old fine masks and their erosion no longer gate the samples. The
+training projector and reconstructed modal images use the same visible-subject
+normalization. Modal-image graph builders also use the newly prepared subject
+visibility instead of opening the old reference masks. Existing scenes retain
+their previous sampling behavior.
+
+In the Spectrum panel, manual selections default to **Original image region:
+Selected box**. This displays the saved dense modal field at every pixel in the
+3D box's projection, including background pixels and gaps between leaves. Switch
+to **Model support** to compare only the original supervision samples. The
+reconstructed image still colors its actual model-support samples; elsewhere it
+shows the reference RGB, not an invented zero-motion prediction. Both images keep
+the same brightness scale computed from model-support samples. This display-only
+change works with existing previews after restarting the Viewer.
+
+Preparation does not train a mode. When ready for the Corn comparison, use the
+unfiltered KNN recipe (K=16, radius=0.08) and the existing neural parameters:
+
+```bat
+modal-gaussians motion iterate-neural --prepared outputs\corn_subject_selection_001\prepared --config configs\neural_component_field.json --frequency-hz 0.225 --output outputs\corn_subject_selection_001\experiment --stage preview
+```
+
+Omit `--geometry-graph` for this comparison: the new foreground gets its own
+KNN graph, controls and interpolation. The old graph and trained mode cannot be
+reused with different foreground indexing. These commands do not run experiment
+validation or start Viser automatically.
+
+To assign the current baseline's soft weights from local motion evidence, use
+the unfiltered KNN candidate cache with `graph build-modal-similarity`:
+
+```bat
+modal-gaussians graph build-modal-similarity --prepared outputs\bush_neural_modal_similarity_0744_001\prepared --geometry-graph outputs\_cache\geometry\GRAPH_KEY --view view1 outputs\bush1_sea_raft_0744_001 --view view2 outputs\bush2_sea_raft_0744_001 --view view3 outputs\bush3_sea_raft_0744_001 --frequency 0.744 --similarity-threshold 0.20 --difference-threshold 0.30 --max-pixel-distance 32 --soft-weights --minimum-edge-factor 0.05 --output outputs\bush_graph_modal_soft_trial_001
 ```
 
 Each visible endpoint uses a robust complex U/V median from its valid 3x3 pixel
 patch. The relative distance is `norm(m_i-m_j)/max(norm(m_i),norm(m_j),floor)`,
 where the signal floor is 2% of that view's p99 joint modal amplitude. A view
-supports a connection at distance <=0.15 when both endpoints have sufficient
+supports a connection at distance <=0.20 when both endpoints have sufficient
 signal; distance >=0.30 supplies a conflict when at least one does. Both quiet,
 ambiguous scores, mixed patches, unavailable endpoints and projected separation
 over 32 pixels supply no evidence. Depth/alpha at endpoints approximate
 visibility; this does not compute individual splat contributions or temporal
 occlusion. The path between endpoints need not contain foreground pixels.
 
-Connect only candidates with support from at least one view and no conflict in
-any reliable view. There is no unknown-edge fallback or forced K-neighbor
-refill. Retained weights stay unchanged. The graph Viewer initially shows only
-retained connections; optional white edges indicate motion conflicts and gray
-edges insufficient evidence. These overlays are excluded from graph
-connectivity. This is a single-frequency graph; the accepted training recipe
-below uses similarity threshold **0.20**.
+The current CLI defaults to `--soft-weights --minimum-edge-factor 0.05`.
+Every original KNN edge, length and connected component is retained. Apply the
+same motion-evidence decision: supported edges without conflict keep their
+original weight; every edge the hard filter would remove gets its weight
+multiplied by `minimum_edge_factor` (default 0.05). This includes both conflicting
+edges and edges with insufficient evidence. The default similarity/conflict
+thresholds remain 0.20/0.30; they do not define a continuous attenuation curve.
+Diagnostic hard-cut decisions are saved separately from the all-retained graph.
 
-To train on the accepted similarity graph with SEA-RAFT supervision, first
-derive a new observation preparation, then supply the saved graph explicitly:
+New graph construction uses this soft-weight recipe. The historical accepted
+hard-cut result remains recorded in [BASELINE.md](BASELINE.md), and saved graph
+artifacts remain readable for comparison.
+
+Pass this graph through the existing training `--geometry-graph` argument.
+Gaussian rigidity and GNN relative neighbor weights consume the modified
+weights; control rotation regularization also uses them when enabled, but its
+current baseline coefficient is zero. Control sampling, coverage, owners and
+the Wendland support within `2h` always use the original geometric graph distance;
+soft weights do not increase the control count. A separate propagation distance
+uses `edge_propagation_length = edge_length / candidate_edge_factor`. For each
+existing control-to-Gaussian support, multiply the original Wendland weight by
+`geometric_shortest_distance / propagation_shortest_distance` (1 at the control
+itself), then normalize each Gaussian row. Thus weak paths reduce relative
+influence while keeping every original support positive and covered. If all
+supports are attenuated equally, normalization cancels that common factor;
+this does not introduce independent motion where no separate controls exist.
+Gaussian rigidity still uses actual geometric displacements, and control
+rotation regularization still uses geometric shortest-path lengths, not propagation
+costs. The existing loss/message normalization stays unchanged, so loss attenuation
+is relative rather than an absolute force. Donor propagation is unchanged.
+The accepted deformation/rotation coefficients are **0.03/0**.
+
+New soft graphs save the propagation lengths separately. When an older soft graph
+is passed to `motion iterate-neural --geometry-graph`, training derives them from
+its saved `candidate_edge_factor`, rebuilds controls/interpolation under a new cache
+identity, and preserves the source graph. Already trained previews keep their saved
+interpolation; a new training output is required to see the change. Graphs without
+soft factors or propagation lengths keep their original geometric behavior.
+This method cannot guarantee tear-free motion. In the graph Viewer,
+**Show downweighted edges** displays gray lines, darker for greater reductions;
+unchanged edges retain component colors. Neither graph publication nor training
+starts Viser or runs experiment validation.
+
+To repeat the accepted Corn or Bush recipe, reuse its prepared SEA-RAFT
+supervision and saved soft graph with a **new** experiment directory:
 
 ```bat
-modal-gaussians motion prepare-selected-modal --prepared outputs\bush_neural_dense_controls_001\prepared --view view1 outputs\bush1_sea_raft_0744_001 --view view2 outputs\bush2_sea_raft_0744_001 --view view3 outputs\bush3_sea_raft_0744_001 --frequency-hz 0.744 --output outputs\bush_neural_modal_similarity_0744_001\prepared
-modal-gaussians motion iterate-neural --prepared outputs\bush_neural_modal_similarity_0744_001\prepared --config outputs\bush_neural_modal_similarity_0744_001\config.json --geometry-graph outputs\bush_graph_modal_similarity_0744_002 --frequency-hz 0.744 --output outputs\bush_neural_modal_similarity_0744_001\experiment --stage preview
+modal-gaussians motion iterate-neural --prepared outputs\corn_subject_selection_001\prepared --config configs\neural_component_field.json --geometry-graph outputs\corn_subject_selection_001\graph_modal_soft_002 --frequency-hz 0.225 --output outputs\corn_soft_baseline_trial_001\experiment --stage preview
+modal-gaussians motion iterate-neural --prepared outputs\bush_neural_modal_similarity_0744_001\prepared --config configs\neural_component_field.json --geometry-graph outputs\bush_neural_soft_fixed_controls_0744_001\graph --frequency-hz 0.744 --output outputs\bush_soft_baseline_trial_001\experiment --stage preview
 ```
 
-The preparation reuses static geometry and pixel sampling, samples the new
-SEA-RAFT complex fields, and recomputes view alignment and observation
-normalization. The inherited flow metadata supplies reference geometry and
-timing only; the old Farneback modal targets are not used. This selected-only
-source has no full spectrum, so the Viewer disables full-spectrum loading.
-Use the run's saved `config.json` to retain its accepted training parameters.
+These preparations already contain the SEA-RAFT complex fields, recomputed
+view alignment and observation normalization. Corn also retains its saved
+manual subject selection and visible-subject observation policy. The inherited
+flow metadata supplies reference geometry and timing only; old Farneback modal
+targets are not used. These selected-only sources have no full spectrum, so
+the Viewer disables full-spectrum loading. For exact historical reproduction,
+use that run's frozen `config.json`, not a later default preset.
 
-`--geometry-graph` uses the saved retained edges exactly, rebuilding controls
-and interpolation from that graph without regenerating KNN or applying depth
+`--geometry-graph` uses the saved edges and weights exactly, reusing matching
+control/interpolation caches or building them without regenerating KNN or applying depth
 cuts. Existing component-field donor propagation is unchanged, so fragments
 can still inherit motion through that separate mechanism. `--stage preview`
 publishes a manual-oscillator preview without video-coordinate fitting,

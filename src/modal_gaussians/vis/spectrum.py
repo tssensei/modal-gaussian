@@ -48,6 +48,7 @@ class SpectrumViewState:
     alphas: np.ndarray
     alpha_identifiable: np.ndarray
     frequency_limits: tuple[float, float]
+    selection_pixels_xy: np.ndarray | None = None
 
 
 def _hsv_rgb(values: np.ndarray, magnitude_hi: float) -> np.ndarray:
@@ -150,6 +151,24 @@ def _completed_dense_modes(completed: Any) -> Complex2DModesArtifact:
     return dense
 
 
+def _selected_box_pixels(result: Any) -> dict[str, np.ndarray]:
+    """Project the saved selection, independently of masks and Gaussian coverage."""
+    manifest = getattr(getattr(result, "scene", None), "manifest", None) or {}
+    partition = manifest.get("partition", {})
+    if partition.get("method") != "manual_subject_selection_v1":
+        return {}
+    from modal_gaussians.static import cameras_from_scene_manifest
+    from modal_gaussians.subject_selection import projected_box_pixels
+
+    if partition.get("mapping_file") != "partition.npz":
+        raise ValueError("Unsupported manual selection mapping file")
+    scene_path = result.manifest.get("scene") or result.completed_modes.manifest["static_scene"]
+    with np.load(Path(scene_path) / "partition.npz", allow_pickle=False) as archive:
+        box = tuple(archive[name] for name in ("box_position", "box_wxyz", "box_dimensions"))
+    return {camera.label: projected_box_pixels(camera, *box)
+            for camera in cameras_from_scene_manifest(manifest) if camera.role == "reference"}
+
+
 class SpectrumComparisonController:
     """Compare bound dense flow spectra with rendered 3D modal projections."""
 
@@ -175,6 +194,8 @@ class SpectrumComparisonController:
         self.component_index = 0
         self.reconstructed_index = 0
         self.amplitude_normalization = "per mode"
+        self._selection_pixels = _selected_box_pixels(result)
+        self.original_image_region = "Selected box" if self._selection_pixels else "Model support"
 
         flow_sources = ([r["path"] for r in prepared.manifest["flows"]] if prepared is not None
                         else result.coordinates.manifest.get("flow_artifacts"))
@@ -302,6 +323,7 @@ class SpectrumComparisonController:
             alphas=alphas,
             alpha_identifiable=identifiable,
             frequency_limits=limits,
+            selection_pixels_xy=getattr(self, "_selection_pixels", {}).get(label),
         )
 
     def select_view(self, label: str) -> None:
@@ -380,6 +402,14 @@ class SpectrumComparisonController:
         self.amplitude_normalization = normalization
         self._refresh_products()
 
+    def select_original_image_region(self, region: str) -> None:
+        """Expand only the input display; retain the shared fitting/statistics domain."""
+        if region not in ("Model support", "Selected box") or (
+                region == "Selected box" and self.state.selection_pixels_xy is None):
+            raise ValueError(f"Unavailable modal image region: {region!r}")
+        self.original_image_region = region
+        self._refresh_products()
+
     def _selected_modes(self) -> tuple[np.ndarray, np.ndarray]:
         """Return exact raw and rendered reconstructed modes at panel pixels."""
 
@@ -437,17 +467,19 @@ class SpectrumComparisonController:
         self._global_magnitude_cache[key] = maximum
         return maximum
 
-    def _modal_image(self, values: np.ndarray, magnitude_hi: float) -> np.ndarray:
+    def _modal_image(self, values: np.ndarray, magnitude_hi: float, *,
+                     pixels_xy: np.ndarray | None = None, radius: int = 1) -> np.ndarray:
         """Overlay phase-HSV samples on the bound reference RGB image."""
 
         base = self.state.reference_rgb.astype(np.float32) / 255.0
         output = 0.35 * base
         colors = _hsv_rgb(values, magnitude_hi)
-        x = self.state.pixels_xy[:, 0]
-        y = self.state.pixels_xy[:, 1]
+        pixels = self.state.pixels_xy if pixels_xy is None else pixels_xy
+        x = pixels[:, 0]
+        y = pixels[:, 1]
         height, width = output.shape[:2]
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
                 xx = np.clip(x + dx, 0, width - 1)
                 yy = np.clip(y + dy, 0, height - 1)
                 output[yy, xx] = colors
@@ -471,7 +503,16 @@ class SpectrumComparisonController:
         else:
             magnitude_hi = self._entire_spectrum_magnitude_hi()
         self.modal_image_magnitude_hi = magnitude_hi
-        self.raw_modal_image = self._modal_image(raw_values, magnitude_hi)
+        selection = self.state.selection_pixels_xy
+        show_selection = self.original_image_region == "Selected box" and selection is not None
+        if show_selection:
+            # Read the saved dense selected-frequency field, never the old flow/mask.
+            values = self.dense_modes.view_modes[self.state.index][
+                self._source_mode_slots[self.reconstructed_index],
+                selection[:, 1], selection[:, 0], self.component_index]
+            self.raw_modal_image = self._modal_image(values, magnitude_hi, pixels_xy=selection, radius=0)
+        else:
+            self.raw_modal_image = self._modal_image(raw_values, magnitude_hi)
         self.reconstructed_modal_image = self._modal_image(
             reconstructed_values, magnitude_hi
         )
@@ -486,6 +527,10 @@ class SpectrumComparisonController:
             f"{self.state.raw_frequencies_hz[raw_index]:.6f} Hz &nbsp; "
             f"**component:** {component}  \n"
             f"**Amplitude normalization:** `{self.amplitude_normalization}`"
+            + (f"  \n**Original image:** all {len(selection)} pixels in the projected selection, including background."
+               " **Reconstruction:** model support only; elsewhere is reference RGB, not zero motion."
+               " Brightness and spectra still use model-support pixels."
+               if show_selection else "")
             + ("" if identifiable else "  \n**Reconstruction unavailable:** zero projection energy.")
             + ("  \n**SEA-RAFT selected-frequency modal images.** Full spectrum is unavailable."
                if not self.full_spectrum_available else
@@ -597,6 +642,12 @@ class ModalSpectrumPanel:
             options=("per mode", "entire spectrum") if controller.full_spectrum_ready else ("per mode",),
             initial_value=controller.amplitude_normalization,
         )
+        self.original_region = server.gui.add_dropdown(
+            "Original image region",
+            options=("Selected box", "Model support") if controller._selection_pixels else ("Model support",),
+            initial_value=controller.original_image_region,
+            visible=bool(controller._selection_pixels),
+        )
         self.mode = server.gui.add_slider(
             "Selected mode",
             min=0,
@@ -700,6 +751,12 @@ class ModalSpectrumPanel:
             if not self._updating:
                 on_normalization_selected(str(self.normalization.value))
 
+        @self.original_region.on_update
+        def _(_) -> None:
+            if not self._updating:
+                controller.select_original_image_region(str(self.original_region.value))
+                self._refresh()
+
         @self.mode.on_update
         def _(_) -> None:
             if not self._updating:
@@ -771,6 +828,7 @@ class ModalSpectrumPanel:
             self.view.value = self.controller.view_id
             self.component.value = "U" if self.controller.component_index == 0 else "V"
             self.normalization.value = self.controller.amplitude_normalization
+            self.original_region.value = self.controller.original_image_region
         finally:
             self._updating = False
         self.status.content = self.controller.status

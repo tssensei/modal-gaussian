@@ -25,6 +25,7 @@ class CompletedModesArtifact:
     manifest: dict[str, Any]
     arrays: dict[str, np.ndarray]
     rotation: np.ndarray | None = None
+    control_displacement: np.ndarray | None = None
 
 
 def load_completed_modes(path: str | Path) -> CompletedModesArtifact:
@@ -65,6 +66,7 @@ def load_completed_modes(path: str | Path) -> CompletedModesArtifact:
             manifest=neural_artifact.manifest,
             arrays=neural_artifact.arrays,
             rotation=neural_artifact.rotation,
+            control_displacement=neural_artifact.control_displacement,
         )
     if version in (5, 7):
         if manifest.get("completion_method") != "fixed_observation_green_basis_refinement":

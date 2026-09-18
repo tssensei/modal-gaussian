@@ -14,6 +14,8 @@ def host_subgraph(graph: GeometryGraph, host_indices: np.ndarray) -> GeometryGra
     return replace(graph, points=graph.points[host_indices],
                    node_gaussian_index=np.arange(len(host_indices), dtype=np.int64),
                    edge_index=edges, edge_length=graph.edge_length[keep],
+                   edge_propagation_length=(None if graph.edge_propagation_length is None
+                                            else graph.edge_propagation_length[keep]),
                    edge_weight=graph.edge_weight[keep], edge_evidence_kind=graph.edge_evidence_kind[keep],
                    edge_view_evidence=graph.edge_view_evidence[keep],
                    node_visible_view_mask=graph.node_visible_view_mask[host_indices],

@@ -184,6 +184,11 @@ def build_parser() -> argparse.ArgumentParser:
     repartition.add_argument("--class-fraction", type=_positive_float, default=0.8)
     repartition.add_argument("--view-angle-degrees", type=_positive_float, default=10.0)
     repartition.add_argument("--view-position-fraction", type=_positive_float, default=0.05)
+    apply_selection = static_commands.add_parser(
+        "apply-selection", help="Publish a new static foreground/background split from a saved 3D selection")
+    apply_selection.add_argument("--scene", required=True, type=Path)
+    apply_selection.add_argument("--selection", required=True, type=Path)
+    apply_selection.add_argument("--output", required=True, type=Path)
     topology_parser = command_parsers.add_parser(
         "topology", help="Pixel-to-foreground-Gaussian observation topology"
     )
@@ -290,17 +295,8 @@ def build_parser() -> argparse.ArgumentParser:
     graph_build.add_argument("--min-shared-views", type=_positive_int, default=1)
     graph_build.add_argument("--min-component-nodes", type=_positive_int, default=4)
     graph_build.add_argument("--min-component-edges", type=_positive_int, default=3)
-    gradient_prune = graph_commands.add_parser(
-        "prune-modal-gradient", help="Prune a full KNN cache using visible modal-image gradients")
-    gradient_prune.add_argument("--prepared", required=True, type=Path)
-    gradient_prune.add_argument("--geometry-graph", required=True, type=Path)
-    gradient_prune.add_argument("--view", required=True, action="append", nargs=2,
-                                metavar=("LABEL", "MODAL_IMAGE_DIR"))
-    gradient_prune.add_argument("--frequency", required=True, type=_positive_float)
-    gradient_prune.add_argument("--gradient-threshold", type=_positive_float, default=0.05)
-    gradient_prune.add_argument("--output", required=True, type=Path)
     similarity_graph = graph_commands.add_parser(
-        "build-modal-similarity", help="Connect KNN candidates only with reliable local modal similarity")
+        "build-modal-similarity", help="Assign soft weights to KNN candidates using local modal similarity")
     for name in ("prepared", "geometry-graph", "output"):
         similarity_graph.add_argument(f"--{name}", required=True, type=Path)
     similarity_graph.add_argument("--view", required=True, action="append", nargs=2,
@@ -309,6 +305,10 @@ def build_parser() -> argparse.ArgumentParser:
     for name, default in (("similarity-threshold", 0.20), ("difference-threshold", 0.30),
                           ("amplitude-floor-fraction", 0.02), ("max-pixel-distance", 32.0)):
         similarity_graph.add_argument(f"--{name}", type=_positive_float, default=default)
+    similarity_graph.add_argument("--soft-weights", action="store_true", default=True,
+                                  help="Keep every candidate edge (always enabled)")
+    similarity_graph.add_argument("--minimum-edge-factor", type=_positive_float, default=0.05,
+                                  help="Weight fraction for hard-rejected edges with --soft-weights (retained edges stay unchanged)")
     rigid_parser = command_parsers.add_parser(
         "rigid",
         help="Bounded-complex view synchronization and rigid modal solve",
@@ -352,8 +352,10 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_neural.add_argument("--cache-dir", type=Path, default=Path("outputs/_cache"))
     prepare_neural.add_argument("--output", type=Path, required=True)
     prepare_selected = motion_commands.add_parser(
-        "prepare-selected-modal", help="Reuse prepared geometry with selected SEA-RAFT modal supervision")
+        "prepare-selected-modal", help="Prepare selected SEA-RAFT modes, optionally rebuilding a manually selected subject")
     prepare_selected.add_argument("--prepared", type=Path, required=True)
+    prepare_selected.add_argument("--scene", type=Path,
+                                  help="Applied manual-subject scene; rebuild observations without old fine masks")
     prepare_selected.add_argument("--view", required=True, action="append", nargs=2,
                                   metavar=("LABEL", "MODAL_IMAGE_DIR"))
     prepare_selected.add_argument("--frequency-hz", type=_positive_float, required=True)
@@ -636,14 +638,18 @@ def build_parser() -> argparse.ArgumentParser:
     result_materialize.add_argument("--coordinates", required=True, type=Path)
     result_materialize.add_argument("--output", required=True, type=Path)
     viewer = command_parsers.add_parser(
-        "viewer", help="Inspect modal results or a static scene and geometry graph in Viser"
+        "viewer", help="Inspect modal results, geometry graphs, or select a 3D subject in Viser"
     )
     viewer_input = viewer.add_mutually_exclusive_group(required=True)
     viewer_input.add_argument("--result", type=Path)
     viewer_input.add_argument("--preview", type=Path)
     viewer_input.add_argument("--scene", type=Path, help="Inspect static geometry without modal results")
     viewer.add_argument("--geometry-graph", type=Path,
-                        help="Geometry cache entry directory (required with --scene)")
+                        help="Geometry cache entry directory (required with --scene unless --select-subject)")
+    viewer.add_argument("--select-subject", action="store_true",
+                        help="Select full-scene Gaussian centers with a movable 3D box (requires --scene)")
+    viewer.add_argument("--selection", type=Path,
+                        help="Resume a saved subject selection (requires --select-subject)")
     viewer.add_argument("--work-dir", required=True, type=Path)
     viewer.add_argument("--host", default="0.0.0.0")
     viewer.add_argument("--port", type=_positive_int, default=8080)
@@ -772,6 +778,14 @@ def _dispatch(
             print(f"repartitioned static scene: {output.resolve()}")
             print(f"classification summary: {(output / 'partition-summary.json').resolve()}")
             return 0
+        if args.command == "static" and args.static_command == "apply-selection":
+            from modal_gaussians.static_partition import apply_subject_selection
+
+            output = apply_subject_selection(scene_dir=args.scene, selection_path=args.selection,
+                output_dir=args.output, command=[parser.prog, *arguments])
+            print(f"selected subject static scene: {output.resolve()}")
+            print("Gaussian parameters preserved; rebuild observations and graph for this foreground")
+            return 0
         if args.command == "static" and args.static_command == "render":
             from modal_gaussians.static_training import render_static_bundle
 
@@ -885,21 +899,9 @@ def _dispatch(
                 f"{artifact.manifest['gaussian_measurements_identity']}"
             )
             return 0
-        if args.command == "graph" and args.graph_command == "prune-modal-gradient":
-            from modal_gaussians.motion.neural.modal_gradient import ModalGradientConfig
-            from modal_gaussians.motion.neural.modal_gradient_artifact import build_modal_gradient_graph_artifact
-
-            manifest = build_modal_gradient_graph_artifact(
-                prepared_dir=args.prepared, geometry_graph_dir=args.geometry_graph,
-                views=args.view, frequency_hz=args.frequency, output_dir=args.output,
-                config=ModalGradientConfig(gradient_threshold=args.gradient_threshold),
-                command=[parser.prog, *arguments])
-            print(f"Modal-gradient graph: {args.output.resolve()}")
-            print(json.dumps(manifest["summary"], indent=2))
-            return 0
         if args.command == "graph" and args.graph_command == "build-modal-similarity":
             from modal_gaussians.motion.neural.modal_similarity import ModalSimilarityConfig
-            from modal_gaussians.motion.neural.modal_gradient_artifact import build_modal_similarity_graph_artifact
+            from modal_gaussians.motion.neural.modal_similarity_artifact import build_modal_similarity_graph_artifact
 
             manifest = build_modal_similarity_graph_artifact(
                 prepared_dir=args.prepared, geometry_graph_dir=args.geometry_graph,
@@ -907,7 +909,8 @@ def _dispatch(
                 config=ModalSimilarityConfig(similarity_threshold=args.similarity_threshold,
                     difference_threshold=args.difference_threshold,
                     amplitude_floor_fraction=args.amplitude_floor_fraction,
-                    max_pixel_distance=args.max_pixel_distance),
+                    max_pixel_distance=args.max_pixel_distance, soft_weights=args.soft_weights,
+                    minimum_edge_factor=args.minimum_edge_factor),
                 command=[parser.prog, *arguments])
             print(f"Modal-similarity graph: {args.output.resolve()}")
             print(json.dumps(manifest["summary"], indent=2))
@@ -1003,7 +1006,7 @@ def _dispatch(
         if args.command == "motion" and args.motion_command == "prepare-selected-modal":
             from modal_gaussians.motion.neural.selected_modal import prepare_selected_modal
             artifact = prepare_selected_modal(prepared_dir=args.prepared, views=args.view,
-                frequency_hz=args.frequency_hz, output_dir=args.output)
+                frequency_hz=args.frequency_hz, output_dir=args.output, scene_dir=args.scene)
             print(f"Selected-modal prepared: {artifact.path}")
             print(f"prepared_identity: {artifact.manifest['prepared_identity']}")
             return 0
@@ -1382,6 +1385,21 @@ def _dispatch(
             print(f"identity: {artifact.manifest['modal_result_identity']}")
             return 0
         if args.command == "viewer":
+            if args.selection is not None and not args.select_subject:
+                parser.error("--selection requires --select-subject")
+            if args.select_subject:
+                if args.scene is None:
+                    parser.error("--select-subject requires --scene instead of --preview or --result")
+                if args.geometry_graph is not None:
+                    parser.error("--select-subject cannot be combined with --geometry-graph")
+                from modal_gaussians.vis.subject_selection_viewer import run_subject_selection_viewer
+
+                run_subject_selection_viewer(
+                    scene_dir=args.scene, work_dir=args.work_dir, selection_path=args.selection,
+                    host=str(args.host), port=int(args.port),
+                    viewer_resolution=int(args.viewer_res),
+                )
+                return 0
             if (args.scene is None) != (args.geometry_graph is None):
                 parser.error("--scene and --geometry-graph must be supplied together")
             if args.scene is not None:

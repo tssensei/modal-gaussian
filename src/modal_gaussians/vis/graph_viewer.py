@@ -48,6 +48,17 @@ def _candidate_edge_subset(removed, maximum, show_retained=True, show_removed=Tr
                                    cut[_stable_uniform_indices(len(cut), cut_count)])))
 
 
+def _soft_weight_colors(colors, factors):
+    factors = np.asarray(factors)
+    if (factors.shape != (len(colors),) or not np.isfinite(factors).all()
+            or np.any(factors <= 0) or np.any(factors > 1)):
+        raise ValueError("Soft edge factors must be finite in (0,1]")
+    result = colors.copy()
+    weak = factors < 1
+    result[weak] = np.rint(255 * (.15 + .70 * factors[weak, None])).astype(np.uint8)
+    return result
+
+
 def _similarity_edge_subset(status, maximum, show_retained, show_rejected, show_unsupported):
     groups = [np.flatnonzero(status == value) for value, show in
               enumerate((show_retained, show_rejected, show_unsupported)) if show]
@@ -73,6 +84,8 @@ class GraphViewerData:
         path = Path(graph_dir).expanduser().resolve(strict=True)
         manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
         self.is_similarity_graph = manifest.get("format") == "modal_gaussians.modal_similarity_graph"
+        self.is_soft_graph = self.is_similarity_graph and manifest["config"]["modal_similarity"].get("soft_weights", False)
+        self.graph_edge_factor = None
         status = None
         if manifest.get("format") in ("modal_gaussians.modal_gradient_graph", "modal_gaussians.modal_similarity_graph"):
             if manifest.get("version") != 1 or manifest.get("graph_file") != "graph.npz":
@@ -86,6 +99,8 @@ class GraphViewerData:
                     raise ValueError("Unsupported modal-similarity evidence file")
                 with np.load(path / "edge_evidence.npz", allow_pickle=False) as archive:
                     status = archive["candidate_status"]
+                    if self.is_soft_graph:
+                        self.graph_edge_factor = archive["candidate_edge_factor"]
             self.graph_config = manifest["config"]
         else:
             contract = manifest.get("contract", {})
@@ -103,6 +118,8 @@ class GraphViewerData:
         if not np.array_equal(self.graph.points, means):
             raise ValueError("Geometry points differ from the scene's foreground order or positions")
         self.graph_edge_gaussian_index, self.graph_edge_colors, self.graph_edge_removed = _candidate_graph_display(self.graph, status)
+        if self.is_soft_graph:
+            self.graph_edge_colors = _soft_weight_colors(self.graph_edge_colors, self.graph_edge_factor)
         self.graph_edge_status = status
         self.graph_edge_colors_by_mode = None
         self.point_colors = _component_colors(self.graph.component_index)
@@ -126,8 +143,15 @@ class GraphViserViewer(ModalViserViewer):
         graph = self.data.graph
         config = self.data.graph_config
         similarity = self.data.is_similarity_graph
+        soft = self.data.is_soft_graph
         description = "Removed candidate edges are white. The display budget samples both groups."
-        if similarity:
+        if soft:
+            factor = self.data.graph_edge_factor
+            description = (f"All candidate connections remain. {(factor < 1).sum():,} downweighted edges "
+                "are gray; darker means a smaller fraction of the original weight. "
+                "Unchanged edges keep component colors. Edges without reliable support are also downweighted. "
+                "Control placement and coverage use geometric paths; soft weights attenuate interpolation.")
+        elif similarity:
             counts = np.bincount(self.data.graph_edge_status, minlength=3)
             parameters = config["modal_similarity"]
             thresholds = (f"Relative complex-motion distance: similar ≤ {parameters['similarity_threshold']:g}, "
@@ -152,11 +176,12 @@ class GraphViserViewer(ModalViserViewer):
         self.show_points = gui.add_checkbox("Show Gaussian centers", True)
         self.point_size = gui.add_slider("Point size", min=0.0002, max=0.008, step=0.0001, initial_value=0.001)
         self.show_component_graph = gui.add_checkbox("Show component graph", True)
-        self.show_retained_edges = gui.add_checkbox("Show retained edges", True)
+        self.show_retained_edges = gui.add_checkbox("Show unchanged edges" if soft else "Show retained edges", True)
         self.show_removed_edges = gui.add_checkbox(
-            "Show motion-difference edges" if similarity else "Show removed edges", not similarity)
+            "Show downweighted edges" if soft else "Show motion-difference edges" if similarity else "Show removed edges",
+            soft or not similarity)
         self.show_unsupported_edges = None
-        if similarity:
+        if similarity and not soft:
             self.show_unsupported_edges = gui.add_checkbox("Show unsupported edges", False)
             self.show_unsupported_edges.on_update(self.request_render)
         candidate_count = len(self.data.graph_edge_gaussian_index)
@@ -173,7 +198,10 @@ class GraphViserViewer(ModalViserViewer):
         self._build_camera_controls()
 
     def _update_component_graph(self, means):
-        if getattr(self.data, "graph_edge_status", None) is not None:
+        if self.data.is_soft_graph:
+            selected = _candidate_edge_subset(self.data.graph_edge_factor < 1,
+                self.component_graph_edge_count.value, self.show_retained_edges.value, self.show_removed_edges.value)
+        elif getattr(self.data, "graph_edge_status", None) is not None:
             selected = _similarity_edge_subset(self.data.graph_edge_status,
                 self.component_graph_edge_count.value, self.show_retained_edges.value,
                 self.show_removed_edges.value, self.show_unsupported_edges.value)

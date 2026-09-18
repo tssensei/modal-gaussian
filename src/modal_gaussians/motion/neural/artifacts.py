@@ -22,7 +22,8 @@ def _validate_arrays(arrays: Mapping[str, np.ndarray], manifest: Mapping[str, An
         "measurement_rms_floor", "amplitude_scale", "scene_scale", "contribution_mass",
         "contribution_threshold", "sample_projection_sensitivity",
     }
-    required.update("g_" + f.name for f in fields(GeometryGraph))
+    required.update("g_" + f.name for f in fields(GeometryGraph)
+                    if f.name != "edge_propagation_length" or "g_edge_propagation_length" in arrays)
     required.update("c_" + f.name for f in fields(ControlGraph))
     if training_fill:
         from modal_gaussians.motion.neural.strategies import array_names
@@ -302,6 +303,8 @@ def load_neural_completed_modes(path: str | Path, *, validate: bool = False) -> 
         raise ValueError("Neural network/mode count differs from phi")
     # Derived at load time; the historical disk schema and identities stay unchanged.
     rotation = np.empty_like(arrays["phi"]) if manifest["version"] == 16 else None
+    control_displacement = (np.empty((len(arrays["phi"]), len(arrays["c_positions"]), 3), dtype=np.complex64)
+                            if manifest["version"] == 16 else None)
     for mode, state in enumerate(networks["model_states"]):
         evaluated = evaluate_model(state, nm._field_geometry(arrays, mode), length_scale=float(arrays["scene_scale"]),
                                    amplitude_scale=float(arrays["amplitude_scale"][mode]), config=nm._field_config(config, int(slots[mode])))
@@ -310,5 +313,6 @@ def load_neural_completed_modes(path: str | Path, *, validate: bool = False) -> 
             raise ValueError(f"Neural baked phi differs from network for mode {mode}")
         if rotation is not None:
             rotation[mode] = evaluated[1].detach().cpu().numpy()
-    return nm.NeuralModesArtifact(root, manifest, arrays, rotation)
+            control_displacement[mode] = evaluated[2].detach().cpu().numpy()
+    return nm.NeuralModesArtifact(root, manifest, arrays, rotation, control_displacement)
 

@@ -1,4 +1,4 @@
-"""Build trusted KNN connections from visible endpoint modal similarity."""
+"""Weight KNN connections using visible endpoint modal similarity."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from modal_gaussians.motion.common.geometry_ops import (
     bilinear_sample_float64 as _bilinear, pixel_valid as _pixel_valid,
 )
 from modal_gaussians.progress import Progress
-from .geometry_graph import GeometryGraph, _components
+from .geometry_graph import GeometryGraph
 
 
 REASONS = {
@@ -34,8 +34,14 @@ class ModalSimilarityConfig:
     patch_radius: int = 1
     patch_relative_dispersion_max: float = 0.30
     alpha_minimum: float = 0.05
+    soft_weights: bool = True
+    minimum_edge_factor: float = 0.05
 
     def validate(self) -> None:
+        if self.soft_weights is not True:
+            raise ValueError("New modal-similarity graphs require soft weights")
+        if not math.isfinite(self.minimum_edge_factor) or not 0 < self.minimum_edge_factor <= 1:
+            raise ValueError("minimum_edge_factor must be finite in (0,1]")
         for name in ("similarity_threshold", "difference_threshold", "amplitude_floor_fraction",
                      "max_pixel_distance", "patch_relative_dispersion_max"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
@@ -93,11 +99,12 @@ def build_modal_similarity_graph(
     masks: Sequence[np.ndarray], radial_coefficients: np.ndarray | None = None,
     config: ModalSimilarityConfig | None = None,
 ) -> tuple[GeometryGraph, dict[str, np.ndarray], dict]:
-    """Keep a candidate only with similar-motion evidence and no reliable conflict.
+    """Keep full weight only with similar-motion evidence and no reliable conflict.
 
     Compare robust complex U/V endpoint patches independently in each view.
     No coverage or gradient is sampled along the virtual edge between them.
-    Unknown observations never establish a connection or veto positive evidence.
+    Retain the source topology and attenuate exactly the edges rejected by the
+    original hard-cut decision, including edges with insufficient evidence.
     """
     settings = config or ModalSimilarityConfig()
     settings.validate()
@@ -193,25 +200,36 @@ def build_modal_similarity_graph(
     supported, conflicted = np.any(evidence == 1, axis=1), np.any(evidence == -1, axis=1)
     keep = supported & ~conflicted
     status = np.where(conflicted, 1, np.where(keep, 0, 2)).astype(np.uint8)
-    degree, components, sizes = _components(len(points), edges[keep])
-    result = replace(
-        graph, edge_index=edges[keep], edge_length=graph.edge_length[keep], edge_weight=graph.edge_weight[keep],
-        edge_view_evidence=evidence[keep], edge_evidence_kind=np.ones(keep.sum(), dtype=np.int8),
-        node_visible_view_mask=visibility, degree=degree, component_index=components,
-        component_size=sizes, candidate_view_evidence=evidence,
-    )
-    diagnostics = {"candidate_scores": scores, "candidate_reason": reasons, "candidate_status": status,
-                   "candidate_removed": ~keep, "view_amplitude_scale": scales}
+    factor = np.where(keep, 1., settings.minimum_edge_factor)
+    # Keep spatial-prior evidence and every indexing/topology array intact.
+    # Modal evidence lives in diagnostics; it never vetoes connectivity.
+    result = replace(graph, edge_weight=graph.edge_weight * factor,
+                     edge_propagation_length=graph.edge_length / factor)
+    diagnostics = {
+        "candidate_scores": scores, "candidate_reason": reasons,
+        "candidate_hard_status": status, "candidate_modal_evidence": evidence,
+        "candidate_edge_factor": factor, "candidate_status": np.zeros(len(edges), dtype=np.uint8),
+        "candidate_removed": np.zeros(len(edges), dtype=bool), "view_amplitude_scale": scales,
+    }
     summary = {
-        "config": asdict(settings), "fusion": "any_support_without_conflict",
+        "config": asdict(settings), "fusion": "hard_rejection_soft_weight",
         "score": "norm(mi-mj)/max(norm(mi),norm(mj),amplitude_floor)",
         "visibility": "projected_center_depth_alpha_proxy", "candidate_edges": len(edges),
-        "retained_edges": int(keep.sum()), "removed_edges": int((~keep).sum()),
-        "difference_rejected_edges": int(conflicted.sum()), "unsupported_edges": int((status == 2).sum()),
+        "retained_edges": len(edges), "removed_edges": 0,
+        "difference_rejected_edges": 0, "unsupported_edges": 0,
+        "motion_difference_edges": int(conflicted.sum()),
+        "unsupported_evidence_edges": int((status == 2).sum()),
         "all_unknown_edges": int((~supported & ~conflicted).sum()),
         "supported_but_conflicted_edges": int((supported & conflicted).sum()),
-        "components": len(sizes), "largest_component_nodes": int(sizes.max()),
-        "singleton_components": int((sizes == 1).sum()), "connected_nodes": int((degree > 0).sum()),
+        "components": len(graph.component_size), "largest_component_nodes": int(graph.component_size.max()),
+        "singleton_components": int((graph.component_size == 1).sum()),
+        "connected_nodes": int((graph.degree > 0).sum()),
+        "downweighted_edges": int((factor < 1).sum()),
+        "edge_factor_min": float(factor.min()) if len(factor) else 1.,
+        "edge_factor_mean": float(factor.mean()) if len(factor) else 1.,
+        "weight_rule": "base_weight * (1 if hard_retained else minimum_edge_factor)",
+        "propagation_rule": "edge_length / candidate_edge_factor",
+        "unknown_policy": "attenuate_if_no_support_without_conflict",
         "reason_codes": REASONS, "status_codes": STATUSES, "views": view_summaries,
     }
     return result, diagnostics, summary
