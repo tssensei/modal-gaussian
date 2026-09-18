@@ -75,6 +75,21 @@ def _hsv_rgb(values: np.ndarray, magnitude_hi: float) -> np.ndarray:
     return rgb
 
 
+def modal_image_overlay(reference_rgb: np.ndarray, pixels_xy: np.ndarray,
+                        values: np.ndarray, magnitude_hi: float) -> np.ndarray:
+    """Overlay phase-HSV samples with the same fixed pixel footprint in every view."""
+    output = 0.35 * (reference_rgb.astype(np.float32) / 255.0)
+    colors = _hsv_rgb(values, magnitude_hi)
+    x, y = pixels_xy[:, 0], pixels_xy[:, 1]
+    height, width = output.shape[:2]
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            xx = np.clip(x + dx, 0, width - 1)
+            yy = np.clip(y + dy, 0, height - 1)
+            output[yy, xx] = colors
+    return np.clip(np.rint(255.0 * output), 0.0, 255.0).astype(np.uint8)
+
+
 def _read_reference_rgb(flow: FlowAnalysisArtifact) -> np.ndarray:
     """Load the exact reference RGB named by a flow artifact."""
 
@@ -431,19 +446,7 @@ class SpectrumComparisonController:
 
     def _modal_image(self, values: np.ndarray, magnitude_hi: float) -> np.ndarray:
         """Overlay phase-HSV samples on the bound reference RGB image."""
-
-        base = self.state.reference_rgb.astype(np.float32) / 255.0
-        output = 0.35 * base
-        colors = _hsv_rgb(values, magnitude_hi)
-        x = self.state.pixels_xy[:, 0]
-        y = self.state.pixels_xy[:, 1]
-        height, width = output.shape[:2]
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                xx = np.clip(x + dx, 0, width - 1)
-                yy = np.clip(y + dy, 0, height - 1)
-                output[yy, xx] = colors
-        return np.clip(np.rint(255.0 * output), 0.0, 255.0).astype(np.uint8)
+        return modal_image_overlay(self.state.reference_rgb, self.state.pixels_xy, values, magnitude_hi)
 
     def _refresh_products(self) -> None:
         """Refresh selected modal images, brightness, and status text."""

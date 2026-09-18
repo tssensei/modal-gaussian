@@ -17,6 +17,9 @@ import viser.transforms as vtf
 
 from modal_gaussians.result import ModalResultArtifact, load_modal_result
 from modal_gaussians.motion.common.mode_mapping import resolve_source_mode_slots
+from modal_gaussians.motion.common.rotations import (
+    rotate_gaussian_quaternions as _rotate_gaussian_quaternions,
+)
 from modal_gaussians.motion.rigid.rigid import load_rigid_modes
 from modal_gaussians.static import (
     Camera,
@@ -63,19 +66,6 @@ SUPPORT_COLORS = np.asarray(
     ),
     dtype=np.float32,
 )
-
-
-def _rotate_gaussian_quaternions(base: Tensor, rotation_vectors: Tensor) -> Tensor:
-    """Left-compose world rotation vectors with static wxyz orientations."""
-    angles = torch.linalg.vector_norm(rotation_vectors, dim=-1, keepdim=True)
-    scalar = torch.cos(angles / 2)
-    vector = 0.5 * torch.sinc(angles / (2 * math.pi)) * rotation_vectors
-    real, imaginary = base[:, :1], base[:, 1:]
-    rotated = torch.cat((scalar * real - (vector * imaginary).sum(dim=-1, keepdim=True),
-                         scalar * imaginary + real * vector
-                         + torch.linalg.cross(vector, imaginary, dim=-1)), dim=-1)
-    rotated = torch.nn.functional.normalize(rotated, dim=-1)
-    return torch.where(angles == 0, base, rotated)
 
 
 def _stable_uniform_indices(count: int, maximum: int) -> np.ndarray:

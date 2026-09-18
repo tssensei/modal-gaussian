@@ -344,6 +344,13 @@ def build_parser() -> argparse.ArgumentParser:
     iterate_neural.add_argument("--output", type=Path, required=True)
     iterate_neural.add_argument("--stage", choices=("modes", "preview", "full"), default="modes",
                                 help="Stop after final 3D modes by default; preview adds display data, full explicitly fits video coordinates")
+    refine_rgb = motion_commands.add_parser("refine-rgb", help="Fit video coefficients, then alternate shared mode-shape and coefficient refinement")
+    refine_rgb.add_argument("--prepared", required=True, type=Path)
+    refine_rgb.add_argument("--modes", required=True, action="append", type=Path,
+                            help="Initial v16 completed modes or an iteration directory; repeat to combine frequencies")
+    refine_rgb.add_argument("--config", type=Path, help="Optional flat RGBRefinementConfig JSON")
+    refine_rgb.add_argument("--output", required=True, type=Path)
+    refine_rgb.add_argument("--resume", action="store_true", help="Resume from the last completed coefficient/shape block")
     for name in ("scene", "topology", "measurements", "graph", "alignment-from", "work-dir", "output"):
         fit_neural.add_argument(f"--{name}", required=True, type=Path)
     for name, default in (
@@ -613,6 +620,8 @@ def build_parser() -> argparse.ArgumentParser:
     viewer_input = viewer.add_mutually_exclusive_group(required=True)
     viewer_input.add_argument("--result", type=Path)
     viewer_input.add_argument("--preview", type=Path)
+    viewer_input.add_argument("--rgb-refinement", type=Path,
+                              help="Compare RGB-refined mode shapes using their fitted video responses")
     viewer_input.add_argument("--scene", type=Path, help="Inspect static geometry without modal results")
     viewer.add_argument("--geometry-graph", type=Path,
                         help="Geometry cache entry directory (required with --scene)")
@@ -945,6 +954,13 @@ def _dispatch(
             print(f"prepared: {artifact.path}")
             print(f"prepared_identity: {artifact.manifest['prepared_identity']}")
             return 0
+        if args.command == "motion" and args.motion_command == "refine-rgb":
+            from modal_gaussians.motion.neural.rgb_refinement import refine_rgb_modes
+            root = refine_rgb_modes(prepared_dir=args.prepared, initial_modes=args.modes,
+                                    output_dir=args.output, config_path=args.config, resume=args.resume)
+            print(f"RGB-refined modes and video responses: {root}")
+            return 0
+
         if args.command == "motion" and args.motion_command == "iterate-neural":
             from modal_gaussians.motion.neural.iteration import iterate_neural
             root = iterate_neural(prepared_dir=args.prepared, config_path=args.config,
@@ -1321,6 +1337,13 @@ def _dispatch(
         if args.command == "viewer":
             if (args.scene is None) != (args.geometry_graph is None):
                 parser.error("--scene and --geometry-graph must be supplied together")
+            if args.rgb_refinement is not None:
+                from modal_gaussians.vis.rgb_refinement_viewer import run_rgb_refinement_viewer
+
+                run_rgb_refinement_viewer(refinement_dir=args.rgb_refinement,
+                    work_dir=args.work_dir, host=str(args.host), port=int(args.port),
+                    viewer_resolution=int(args.viewer_res))
+                return 0
             if args.scene is not None:
                 from modal_gaussians.vis.graph_viewer import run_graph_viewer
 

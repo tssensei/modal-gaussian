@@ -1709,3 +1709,97 @@ checkpoints; preview/full manual deformations and modal-image displays matched
 byte for byte. These are iteration measurements, not a GPU kernel speedup or
 visual-quality approval. Detailed local records are in
 `outputs/bush_iteration_benchmark_001/benchmark-report.md` and its JSON companion.
+
+### Experimental RGB mode refinement
+
+`motion refine-rgb` starts from existing v16 modes and the original RGB videos.
+It first fixes the spatial modes and fits each video's complex time coefficients,
+then alternates shared shape-residual and coefficient updates. All static
+Gaussian parameters and the original neural models remain frozen. Initial
+rotation fields continue to animate ellipsoids with the same coefficients.
+
+```bat
+modal-gaussians motion refine-rgb --prepared outputs\bush_neural_dense_controls_001\prepared --modes outputs\bush_neural_depth_r0p08_k16_first_001\experiment --modes outputs\bush_neural_depth_r0p08_k16_0744_001\experiment --output outputs\bush_rgb_mode_refinement_001\experiment
+```
+
+Repeat `--modes` to combine separately trained frequencies; source slot order is
+preserved and duplicate/incompatible inputs are rejected. Stabilized videos use
+their saved stabilized RGB/masks and exclude invalid borders. Frames are decoded
+on demand; no optical-flow arrays, validation stages or servers are run.
+
+The optional flat `--config` JSON accepts `RGBRefinementConfig` fields. Defaults
+are 200 coefficient-only steps, then four rounds of 50 shape steps and 50
+coefficient steps, with learning rates 0.001 and 0.01 respectively. RGB keeps its
+original resolution (`max_width: 0`); set a positive maximum width to explicitly
+downsample. Input-mask foreground weight is 1 and background weight is 0.05.
+`envelope_bandwidth_hz` defaults to 0.05: complex DCT envelopes
+multiply fixed positive-frequency carriers. Bands must not overlap, contain DC,
+or reach a video's Nyquist frequency. Short videos may support only a constant
+envelope. Time is `frame_index / fps`; reference-frame displacement is not forced
+to zero. Accepted alpha values initialize the constant envelope using the
+inverse Hann-DFT scale; previously excluded views start at zero and still receive
+RGB supervision. Videos currently have independent time coefficients.
+
+Spatial residuals are shared across all frames/views, scaled by each initial
+mode's RMS and complex-orthogonal to that mode to fix its amplitude/phase gauge.
+A weak residual penalty stabilizes fitting; it is not a guarantee against
+Gaussian scattering. Temporal-difference loss, modal-image anchoring, explicit
+trajectory bounds and physics are not included in this first two-stage
+implementation.
+
+The independent output contains `motion.pt` (initial/refined modes, residuals,
+fixed rotation fields, envelope weights and per-frame complex coefficients),
+source metadata, loss history and block-boundary checkpoints. The existing
+completed-mode artifacts and previews are not overwritten. Resume an interrupted
+run with the same arguments plus `--resume`; changed input/config/code is rejected.
+`load_rgb_refinement` loads the saved tensors without replaying optimization.
+
+For longer fits, set `early_stopping_patience` above zero (default 0 disables
+monitoring). After warmup and each complete shape/coefficient round, the same
+training objective is measured on fixed, temporally stratified training frames
+from every view. These frames remain eligible for gradient updates; there is no
+held-out validation split. `early_stopping_frames_per_view` defaults to 16,
+`early_stopping_min_rounds` to 5, and `early_stopping_relative_delta` to 0.0001.
+The patience counter resets when cumulative improvement over the last significant
+improvement exceeds that relative threshold. The absolute lowest monitored
+objective is tracked separately and its model is published, including warmup if
+later shape updates never improve it. Reaching the step cap is reported separately
+from early stopping; a fixed training-subset plateau does not establish full-video
+or visual convergence.
+
+`optimization.json` records the selected frame indices, per-view objectives,
+spatial residual size, actual step counts, selected round, stop reason, and
+separate optimization/monitoring times. Checkpoints retain the latest training
+model, Adam/RNG states and stopping history; the best model is restored only for
+publication, so interrupted runs continue from a consistent training state.
+
+Inspect the saved response manually:
+
+```bat
+modal-gaussians viewer --rgb-refinement outputs\bush_rgb_mode_refinement_001\experiment --work-dir outputs\bush_rgb_mode_refinement_001\work\viewer --host 127.0.0.1 --port 8099
+```
+
+The RGB Viewer defaults to `manual oscillator`, with the full Viewer's per-mode
+enable/gain/phase controls and motion scale 0.04. Its time is Timestep / FPS,
+matching the existing oscillator. Select `RGB-fitted playback` to use each
+video's learned coefficients, with a separate playback scale defaulting to 1;
+there FPS changes playback speed only. Drive switches retain both scales,
+gain/phase, frame and camera. Pause and switch between initial and refined
+shapes to compare spatial changes with the same selected drive and fixed
+rotation fields. This isolates shape refinement, not the complete
+pre-refinement time response. The Viewer loads saved tensors and the static
+scene, without replaying the GNN or loading optical flow.
+
+The floating **Modal image comparison** panel adds input / initial reconstruction /
+refined reconstruction columns. Click **Load modal image comparison**, then select
+the reference view, frequency and U/V component. It reuses the prepared input
+modal samples and the training projector at frozen canonical geometry. One
+complex display alignment is fitted from the initial projection (U and V jointly)
+and applied unchanged to both reconstructions; all three columns share a brightness
+scale. It does not refit alignment for the refined shape. Originally excluded
+modal-supervision views remain visible and are labelled in the panel.
+
+These are linear projections of spatial displacement modes, independent of manual
+gain, time coefficients and ellipsoid rotation; they are not an FFT of the RGB
+playback. Projections are computed on demand and cached in memory per view/mode.
+No GNN replay, full spectrum, optical-flow loading or artifact rewriting is needed.
