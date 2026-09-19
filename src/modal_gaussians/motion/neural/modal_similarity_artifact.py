@@ -29,7 +29,8 @@ def _modal_view(path, flow, view, frequency, *, read_mask=True):
     root = Path(path).expanduser().resolve(strict=True)
     manifest = _manifest(root)
     frozen = flow["manifest"]
-    if (manifest.get("format") != "modal_gaussians.sea_raft_selected_frequency_experiment"
+    if (manifest.get("format") not in ("modal_gaussians.sea_raft_selected_frequency_experiment",
+                                       "modal_gaussians.spectrum_selected_frequency")
             or manifest.get("version") != 1 or manifest.get("status") != "complete"
             or manifest.get("transform") != TRANSFORM_CONVENTION
             or manifest.get("flow_direction") != "reference_to_frame"
@@ -44,6 +45,22 @@ def _modal_view(path, flow, view, frequency, *, read_mask=True):
             or Path(manifest["stabilization_source"]).resolve() != Path(flow["path"]).resolve()
             or Path(manifest["images"]).resolve() != Path(frozen["inputs"]["sequence"]["image_directory"]).resolve()):
         raise ValueError(f"Modal image differs from prepared frequency/reference coordinates: {view['label']}")
+    if manifest["format"] == "modal_gaussians.spectrum_selected_frequency":
+        spectrum = manifest.get("spectrum_source")
+        if not isinstance(spectrum, dict):
+            raise ValueError("Spectrum selection requires its cache source")
+        length, index = spectrum.get("fft_length"), spectrum.get("bin_index")
+        step, cache_id, cache_path = (spectrum.get("frequency_step_hz"),
+                                     spectrum.get("identity"), spectrum.get("path"))
+        if (type(length) is not int or length < max(3, len(manifest["frames"]))
+                or type(index) is not int or not 0 < index <= length // 2
+                or type(step) not in (int, float) or not math.isfinite(step) or step <= 0
+                or not math.isclose(step, float(manifest["fps_hz"]) / length, rel_tol=0, abs_tol=1e-12)
+                or not math.isclose(float(manifest["frequency_hz"]), index * step, rel_tol=0, abs_tol=1e-9)
+                or not isinstance(cache_id, str) or len(cache_id) != 64
+                or any(c not in "0123456789abcdef" for c in cache_id)
+                or not isinstance(cache_path, str) or not Path(cache_path).is_absolute()):
+            raise ValueError("Spectrum selection cache/grid contract is invalid")
     stabilized = frozen.get("stabilized_sequence")
     if stabilized is not None:
         sequence = Path(flow["path"]) / stabilized["path"]

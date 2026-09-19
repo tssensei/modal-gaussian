@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Modal Gaussians · Spectrum</title>
+  <style>
+    :root { --bg:#f3efe5; --panel:#fffaf0; --ink:#1f2a30; --muted:#657177; --accent:#145f74; --line:#d7d0c2; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui,sans-serif; }
+    main { max-width:1700px; padding:24px; margin:auto; }
+    header { display:flex; align-items:baseline; justify-content:space-between; gap:20px; }
+    h1 { margin:0 0 6px; font:600 30px Georgia,serif; }
+    h2 { font-size:16px; margin:0 0 12px; }
+    p { margin:0 0 15px; color:var(--muted); }
+    .layout { display:grid; grid-template-columns:minmax(420px,1.05fr) minmax(420px,1fr); gap:20px; align-items:start; }
+    .panel { background:var(--panel); padding:20px; border:1px solid var(--line); border-radius:14px; }
+    .stack { display:grid; gap:18px; }
+    .controls { display:flex; gap:10px; align-items:end; flex-wrap:wrap; margin-bottom:14px; }
+    label { display:grid; gap:4px; font-size:13px; color:var(--muted); }
+    select,input,button { font:inherit; border:1px solid var(--line); border-radius:7px; padding:8px 11px; background:#fffdf8; color:var(--ink); }
+    button { cursor:pointer; }
+    button.primary { background:var(--accent); color:white; border-color:var(--accent); }
+    button:disabled { opacity:.45; cursor:default; }
+    button:focus-visible,input:focus-visible,select:focus-visible,canvas:focus-visible { outline:3px solid #d28722; outline-offset:2px; }
+    #frequency { width:135px; }
+    #spectrum { display:block; width:100%; height:430px; background:#fffdf8; border-radius:8px; touch-action:none; }
+    .current { margin:12px 0; font-size:20px; font-weight:600; color:var(--accent); }
+    .hint { font-size:12px; color:var(--muted); }
+    #status { min-height:40px; margin:12px 0 0; white-space:pre-wrap; overflow-wrap:anywhere; }
+    #status.error { color:#a32520; }
+    #selected { list-style:none; margin:0 0 12px; padding:0; max-height:220px; overflow:auto; }
+    #selected li { display:flex; align-items:center; gap:8px; padding:4px 0; }
+    #selected li button:first-child { flex:1; text-align:left; }
+    .previews { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    figure { margin:0; min-width:0; }
+    figure img { width:100%; aspect-ratio:16/9; object-fit:contain; display:block; background:#202324; border-radius:7px; cursor:crosshair; }
+    figcaption { padding:7px 0; font-size:13px; }
+    #pixel { margin:8px 0 0; white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.6 ui-monospace,monospace; }
+    #scale { margin-top:12px; }
+    @media(max-width:1000px) { .layout { grid-template-columns:1fr; } header { display:block; } }
+    @media(max-width:500px) { main { padding:12px; } .panel { padding:12px; } .previews { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <header><div><h1>Modal spectrum explorer</h1><p>Shared frequency grid · cached complex U/V · manual selection</p></div><p id="grid"></p></header>
+  <div class="layout">
+    <div class="stack">
+      <section class="panel" aria-labelledby="spectrum-title">
+        <h2 id="spectrum-title">Frequency spectrum</h2>
+        <div class="controls">
+          <label>View<select id="view" aria-label="Reference view"></select></label>
+          <label>Region<select id="region"><option value="selected_box">Selected box (includes background)</option><option value="full_frame">Full frame</option></select></label>
+          <button id="reset">Full range</button>
+        </div>
+        <canvas id="spectrum" tabindex="0" aria-label="Frequency spectrum. Click a plotted sample to select it. Use previous and next buttons or arrow keys for precise bin selection."></canvas>
+        <p class="hint" id="hover">Click a plotted sample. Blank space does not select a frequency. Scroll to zoom.</p>
+        <div class="current" id="current">Loading…</div>
+        <div class="controls">
+          <button id="previous" aria-label="Previous frequency bin">← Previous</button>
+          <button id="next" aria-label="Next frequency bin">Next →</button>
+          <label>Frequency (Hz)<input id="frequency" type="number" min="0" step="any"></label>
+          <button id="choose">Select exact bin</button>
+          <button id="add" class="primary">Add to selection</button>
+        </div>
+        <p class="hint">No peak search or automatic frequency snapping. Frequencies must belong to the cached grid. DC (0 Hz) is viewable but cannot be exported for training.</p>
+        <p id="status" role="status" aria-live="polite"></p>
+      </section>
+      <section class="panel">
+        <h2>Selected frequencies · shared by all views</h2>
+        <ul id="selected"></ul>
+        <div class="controls"><button id="save" disabled>Save selection</button><button id="export" class="primary" disabled>Export modal images</button></div>
+        <p class="hint">Save writes a new selection file. Export also copies the selected complex slices for every view; it does not calculate FFT or DFT again.</p>
+      </section>
+    </div>
+    <section class="panel" aria-labelledby="images-title">
+      <h2 id="images-title">Current frequency</h2>
+      <div class="previews">
+        <figure><img id="reference" alt="Reference RGB frame"><figcaption>Reference RGB</figcaption></figure>
+        <figure><img id="amplitude" alt="Joint U V amplitude"><figcaption>Joint amplitude · brightness</figcaption></figure>
+        <figure><img id="u" alt="Horizontal modal displacement: phase and amplitude"><figcaption>U · hue = phase, brightness = amplitude</figcaption></figure>
+        <figure><img id="v" alt="Vertical modal displacement: phase and amplitude"><figcaption>V · hue = phase, brightness = amplitude</figcaption></figure>
+      </div>
+      <p id="scale" class="hint">U and V share a 99th-percentile display scale within the selected region.</p>
+      <p class="hint">Click any image to inspect the original complex coefficients at that pixel. Dimmed pixels are outside the display region, not removed from the cache.</p>
+      <pre id="pixel" aria-live="polite">No pixel selected.</pre>
+    </section>
+  </div>
+</main>
+<script>
+// Keep selection arithmetic independent of the DOM for the small Node check.
+function exactFrequencyBin(frequencies, value) {
+  if (!Number.isFinite(value)) return -1;
+  return frequencies.findIndex(frequency => Math.abs(frequency - value) <= 1e-9);
+}
+function hitSpectrumPoint(points, x, y, radius = 5) {
+  let result = -1, distance = radius * radius;
+  for (const point of points) {
+    const d = (point.x - x) ** 2 + (point.y - y) ** 2;
+    if (d <= distance) { result = point.bin; distance = d; }
+  }
+  return result;
+}
+if (typeof module !== 'undefined') module.exports = {exactFrequencyBin, hitSpectrumPoint};
+if (typeof document !== 'undefined') (async function () {
+  const ids = ['view','region','reset','spectrum','hover','current','frequency','choose','previous','next','add','selected','save','export','status','grid','reference','amplitude','u','v','scale','pixel'];
+  const el = Object.fromEntries(ids.map(id => [id, document.getElementById(id)]));
+  const ctx = el.spectrum.getContext('2d');
+  const state = {frequencies:[], views:[], bin:0, curve:[], points:[], selected:new Set(), xMin:0, xMax:1, request:0, ready:false};
+  let controller = null;
+  function status(message, error = false) { el.status.textContent = message; el.status.classList.toggle('error', error); }
+  async function api(url, body, signal) {
+    const response = await fetch(url, body === undefined ? {signal} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+    return data;
+  }
+  function updateSelection() {
+    el.selected.replaceChildren();
+    for (const bin of [...state.selected].sort((a,b) => a-b)) {
+      const row = document.createElement('li'), select = document.createElement('button'), remove = document.createElement('button');
+      select.textContent = `${state.frequencies[bin].toFixed(6)} Hz · bin ${bin}`;
+      select.onclick = () => selectBin(bin);
+      remove.textContent = 'Remove'; remove.setAttribute('aria-label', `Remove ${state.frequencies[bin]} Hz`);
+      remove.onclick = () => { state.selected.delete(bin); updateSelection(); };
+      row.append(select, remove); el.selected.append(row);
+    }
+    if (!state.selected.size) { const row = document.createElement('li'); row.textContent = 'No frequencies selected.'; el.selected.append(row); }
+    el.save.disabled = el.export.disabled = !state.selected.size;
+    draw();
+  }
+  function updateCurrent() {
+    const f = state.frequencies[state.bin];
+    el.current.textContent = `${f.toFixed(6)} Hz · bin ${state.bin}`;
+    el.frequency.value = f.toFixed(6);
+    el.previous.disabled = state.bin === 0;
+    el.next.disabled = state.bin === state.frequencies.length - 1;
+    el.add.disabled = state.bin === 0;
+    draw();
+  }
+  function selectBin(bin) {
+    if (!Number.isInteger(bin) || bin < 0 || bin >= state.frequencies.length) return;
+    state.bin = bin; updateCurrent(); refresh();
+  }
+  function draw() {
+    const width = el.spectrum.clientWidth, height = el.spectrum.clientHeight, dpr = window.devicePixelRatio || 1;
+    el.spectrum.width = Math.round(width * dpr); el.spectrum.height = Math.round(height * dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,width,height);
+    const left=66, right=18, top=20, bottom=45, plotW=width-left-right, plotH=height-top-bottom;
+    const x = f => left + (f-state.xMin)/(state.xMax-state.xMin)*plotW;
+    let max=0;
+    state.curve.forEach((value, bin) => { if (state.frequencies[bin]>=state.xMin && state.frequencies[bin]<=state.xMax) max=Math.max(max,value); });
+    max = max > 0 ? max*1.08 : 1;
+    const y = value => height-bottom-value/max*plotH;
+    ctx.font='11px system-ui'; ctx.textAlign='right'; ctx.fillStyle='#657177';
+    for (let i=0; i<=4; i++) {
+      const value=max*i/4, yy=y(value); ctx.strokeStyle='#e1e0d8'; ctx.beginPath(); ctx.moveTo(left,yy); ctx.lineTo(width-right,yy); ctx.stroke();
+      ctx.fillText(value.toPrecision(3),left-8,yy+4);
+    }
+    ctx.textAlign='center';
+    for (let i=0; i<=5; i++) { const f=state.xMin+(state.xMax-state.xMin)*i/5; ctx.fillText(f.toFixed(3),x(f),height-bottom+20); }
+    ctx.fillText('Frequency (Hz)',left+plotW/2,height-5);
+    ctx.save(); ctx.translate(13,top+plotH/2); ctx.rotate(-Math.PI/2); ctx.fillText('Mean amplitude',0,0); ctx.restore();
+    state.points=[];
+    ctx.strokeStyle='#145f74'; ctx.lineWidth=1.4; ctx.beginPath();
+    state.curve.forEach((value,bin) => {
+      const f=state.frequencies[bin]; if (f<state.xMin || f>state.xMax) return;
+      const point={x:x(f),y:y(value),bin};
+      if (!state.points.length) ctx.moveTo(point.x,point.y); else ctx.lineTo(point.x,point.y);
+      state.points.push(point);
+    }); ctx.stroke();
+    for (const point of state.points) {
+      ctx.fillStyle=state.selected.has(point.bin)?'#c07b19':'#145f74';
+      ctx.beginPath(); ctx.arc(point.x,point.y,state.points.length<120?3:1.7,0,2*Math.PI); ctx.fill();
+    }
+    const f=state.frequencies[state.bin];
+    if (f>=state.xMin && f<=state.xMax) {
+      ctx.strokeStyle='#ac4034'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(x(f),top); ctx.lineTo(x(f),height-bottom); ctx.stroke();
+      if (state.curve.length) { ctx.fillStyle='#ac4034'; ctx.beginPath(); ctx.arc(x(f),y(state.curve[state.bin]),4,0,2*Math.PI); ctx.fill(); }
+    }
+  }
+  async function refresh() {
+    const request = ++state.request;
+    if (controller) controller.abort(); controller = new AbortController();
+    state.ready=false; state.curve=[]; draw();
+    for (const name of ['reference','amplitude','u','v']) el[name].removeAttribute('src');
+    el.pixel.textContent='No pixel selected.'; status('Reading cached modal image…');
+    try {
+      const query = new URLSearchParams({view:el.view.value,bin:state.bin,region:el.region.value});
+      const data = await api('/api/view?'+query, undefined, controller.signal);
+      if (request !== state.request) return;
+      state.curve=data.curve; state.ready=true;
+      for (const [name,url] of Object.entries(data.images)) el[name].src=url;
+      el.scale.textContent=`U/V shared p99 scale: ${data.uv_scale.toPrecision(5)} · joint amplitude p99: ${data.amplitude_scale.toPrecision(5)}`;
+      status('Cached slice loaded. Click a plotted sample or enter an exact grid frequency.'); draw();
+    } catch (error) { if (request===state.request && error.name!=='AbortError') status(error.message,true); }
+  }
+  el.choose.onclick=() => {
+    const value=el.frequency.value.trim(), bin=value===''?-1:exactFrequencyBin(state.frequencies,Number(value));
+    if (bin<0) { status(`Frequency is not on the cached grid (step ${state.frequencies[1]-state.frequencies[0]} Hz). Selection unchanged.`,true); return; }
+    selectBin(bin);
+  };
+  el.frequency.onkeydown=event => { if(event.key==='Enter') el.choose.click(); };
+  el.previous.onclick=() => selectBin(state.bin-1); el.next.onclick=() => selectBin(state.bin+1);
+  el.view.onchange=el.region.onchange=refresh;
+  el.reset.onclick=() => { state.xMin=state.frequencies[0]; state.xMax=state.frequencies.at(-1); draw(); };
+  el.add.onclick=() => { if(state.bin>0) { state.selected.add(state.bin); updateSelection(); } };
+  el.spectrum.onclick=event => { const rect=el.spectrum.getBoundingClientRect(), bin=hitSpectrumPoint(state.points,event.clientX-rect.left,event.clientY-rect.top); if(bin>=0) selectBin(bin); };
+  el.spectrum.onmousemove=event => {
+    const rect=el.spectrum.getBoundingClientRect(), bin=hitSpectrumPoint(state.points,event.clientX-rect.left,event.clientY-rect.top);
+    el.spectrum.style.cursor=bin>=0?'pointer':'default';
+    el.hover.textContent=bin>=0?`${state.frequencies[bin].toFixed(6)} Hz · bin ${bin} · mean amplitude ${state.curve[bin].toPrecision(5)}`:'Click a plotted sample. Blank space does not select a frequency. Scroll to zoom.';
+  };
+  el.spectrum.onkeydown=event => { if(event.key==='ArrowLeft'||event.key==='ArrowRight') { event.preventDefault(); selectBin(state.bin+(event.key==='ArrowLeft'?-1:1)); } };
+  el.spectrum.addEventListener('wheel',event => {
+    event.preventDefault(); if(!state.frequencies.length) return;
+    const rect=el.spectrum.getBoundingClientRect(), fraction=Math.max(0,Math.min(1,(event.clientX-rect.left-66)/(rect.width-84)));
+    const allMin=state.frequencies[0], allMax=state.frequencies.at(-1), oldSpan=state.xMax-state.xMin;
+    const span=Math.min(allMax-allMin,Math.max((state.frequencies[1]-allMin)*4,oldSpan*Math.exp(event.deltaY*0.0015)));
+    const anchor=state.xMin+fraction*oldSpan;
+    state.xMin=Math.max(allMin,Math.min(allMax-span,anchor-fraction*span)); state.xMax=state.xMin+span; draw();
+  },{passive:false});
+  for (const name of ['reference','amplitude','u','v']) el[name].onclick=async event => {
+    if(!state.ready) return;
+    const request=state.request, rect=el[name].getBoundingClientRect(), shape=state.views[Number(el.view.value)].shape_hw;
+    const scale=Math.min(rect.width/shape[1],rect.height/shape[0]), offsetX=(rect.width-shape[1]*scale)/2, offsetY=(rect.height-shape[0]*scale)/2;
+    const x=Math.floor((event.clientX-rect.left-offsetX)/scale), y=Math.floor((event.clientY-rect.top-offsetY)/scale);
+    if(x<0||y<0||x>=shape[1]||y>=shape[0]) return;
+    try {
+      const data=await api('/api/pixel?'+new URLSearchParams({view:el.view.value,bin:state.bin,x,y}));
+      if(request!==state.request) return;
+      el.pixel.textContent=`Pixel (${x}, ${y})\n`+Object.entries(data.components).map(([component,z])=>`${component.toUpperCase()}: Re ${z.real.toPrecision(6)}  Im ${z.imag.toPrecision(6)}\n   amplitude ${z.amplitude.toPrecision(6)}  phase ${z.phase_rad.toPrecision(6)} rad`).join('\n');
+    } catch(error) { if(request===state.request) status(error.message,true); }
+  };
+  for (const action of ['save','export']) el[action].onclick=async () => {
+    el.save.disabled=el.export.disabled=true; status(action==='save'?'Saving selection…':'Exporting cached slices for all views…');
+    try { const result=await api('/api/'+action,{bins:[...state.selected].sort((a,b)=>a-b)}); status(Object.entries(result).map(([key,value])=>`${key}: ${value}`).join('\n')); }
+    catch(error) { status(error.message,true); }
+    finally { updateSelection(); }
+  };
+  new ResizeObserver(draw).observe(el.spectrum);
+  try {
+    const config=await api('/api/config'); state.frequencies=config.frequencies; state.views=config.views; state.bin=config.initial_bin;
+    for(const [index,view] of config.views.entries()) { const option=document.createElement('option'); option.value=index; option.textContent=view.label; el.view.append(option); }
+    state.xMin=config.frequencies[0]; state.xMax=config.frequencies.at(-1);
+    el.grid.textContent=`${config.frequencies.length} bins · ${(config.frequencies[1]-config.frequencies[0]).toFixed(6)} Hz step`;
+    el.frequency.max=state.xMax; updateCurrent(); updateSelection(); await refresh();
+  } catch(error) { status(error.message,true); }
+})();
+</script>
+</body>
+</html>

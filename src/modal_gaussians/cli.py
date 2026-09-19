@@ -13,11 +13,6 @@ from modal_gaussians.colmap import (
     ReferenceInput,
     prepare_colmap,
 )
-from modal_gaussians.flow.pipeline import (
-    SMOOTHING_METHODS,
-    FlowAnalysisConfig,
-    run_flow_analysis,
-)
 from modal_gaussians.progress import progress_log, report_progress
 
 
@@ -73,42 +68,35 @@ def build_parser() -> argparse.ArgumentParser:
     mask_gui.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/masking"))
     mask_gui.add_argument("--port", type=_positive_int, default=8890)
     mask_gui.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    from modal_gaussians.legacy.cli import add_legacy_commands
+    add_legacy_commands(command_parsers, _positive_float, _non_negative_float, _positive_int)
     flow_parser = command_parsers.add_parser(
-        "flow", help="Dense 2D image-plane motion analysis"
+        "flow", help="SEA-RAFT reference-to-frame flow (FFT is a separate cache step)"
     )
+    spectrum_parser = command_parsers.add_parser("spectrum", help="Shared-grid FFT cache and manual peak inspection")
+    spectrum_commands = spectrum_parser.add_subparsers(dest="spectrum_command", required=True)
+    spectrum_build = spectrum_commands.add_parser("build", help="Cache a common FFT grid from existing SEA-RAFT flows")
+    spectrum_build.add_argument("--view", action="append", nargs=2, required=True, metavar=("LABEL", "SEA_FLOW"))
+    spectrum_build.add_argument("--scene", required=True, type=Path)
+    spectrum_build.add_argument("--nfft", required=True, type=_positive_int)
+    spectrum_build.add_argument("--output", required=True, type=Path)
+    spectrum_viewer = spectrum_commands.add_parser("viewer", help="Standalone browser spectrum GUI (no automatic snapping)")
+    spectrum_viewer.add_argument("--input", required=True, type=Path)
+    spectrum_viewer.add_argument("--work-dir", required=True, type=Path)
+    spectrum_viewer.add_argument("--host", default="127.0.0.1")
+    spectrum_viewer.add_argument("--port", type=_positive_int, default=8110)
+    spectrum_export = spectrum_commands.add_parser("export", help="Copy selected cached bins into modal-image inputs")
+    spectrum_export.add_argument("--input", required=True, type=Path)
+    spectrum_export.add_argument("--selection", required=True, type=Path)
+    spectrum_export.add_argument("--output", required=True, type=Path)
     flow_commands = flow_parser.add_subparsers(dest="flow_command", required=True)
-    analyze = flow_commands.add_parser(
-        "analyze",
-        help="Compute reference-to-frame flow and its temporal rFFT",
-    )
-    analyze.add_argument("--images", required=True, type=Path)
-    analyze.add_argument("--masks", required=True, type=Path)
-    analyze.add_argument("--fps", required=True, type=_positive_float)
-    analyze.add_argument("--reference-frame", required=True)
-    analyze.add_argument("--output", required=True, type=Path)
-    analyze.add_argument(
-        "--stabilize",
-        action="store_true",
-        help="Apply the accepted reference-background homography stabilization",
-    )
-    analyze.add_argument(
-        "--smoothing",
-        choices=SMOOTHING_METHODS,
-        default="none",
-        help="Optional spatial smoothing before the temporal FFT",
-    )
-    analyze.add_argument(
-        "--sigma-b-px",
-        type=_positive_float,
-        default=3.0,
-        help="Weighted Gaussian displacement blur sigma in pixels",
-    )
-    analyze.add_argument(
-        "--sigma-c-px",
-        type=_non_negative_float,
-        default=0.0,
-        help="Pre-gradient contrast blur sigma in pixels",
-    )
+    flow_compute = flow_commands.add_parser("compute", help="Compute full-frame SEA-RAFT flow using local M weights")
+    flow_compute.add_argument("--images", required=True, type=Path)
+    flow_compute.add_argument("--reuse-stabilization", required=True, type=Path,
+                              help="Existing preparation manifest: reuse timing, reference and stabilized RGBs only")
+    flow_compute.add_argument("--output", required=True, type=Path)
+    flow_compute.add_argument("--sea-raft-repo", type=Path, default=Path("outputs/third_party/SEA-RAFT"))
+    flow_compute.add_argument("--model-dir", type=Path, default=Path("outputs/models/sea-raft-M"))
     colmap_parser = command_parsers.add_parser(
         "colmap", help="Joint COLMAP preparation for static Gaussian training"
     )
@@ -218,43 +206,6 @@ def build_parser() -> argparse.ArgumentParser:
     topology_build.add_argument(
         "--mask-erode-iters", type=_non_negative_int, default=1
     )
-    frequency_parser = command_parsers.add_parser(
-        "frequency", help="Automatic shared modal-frequency selection"
-    )
-    frequency_commands = frequency_parser.add_subparsers(
-        dest="frequency_command", required=True
-    )
-    frequency_select = frequency_commands.add_parser(
-        "select", help="Greedily select the first K shared exact-DFT frequencies"
-    )
-    frequency_select.add_argument("--topology", required=True, type=Path)
-    frequency_select.add_argument(
-        "--view",
-        required=True,
-        action="append",
-        nargs=2,
-        metavar=("LABEL", "FLOW_ARTIFACT"),
-        help="Topology view label and matching flow artifact; repeat in view order",
-    )
-    frequency_select.add_argument("--min-hz", required=True, type=_positive_float)
-    frequency_select.add_argument("--max-hz", required=True, type=_positive_float)
-    frequency_select.add_argument("--step-hz", required=True, type=_positive_float)
-    frequency_select.add_argument("--count", required=True, type=_positive_int)
-    frequency_select.add_argument("--output", required=True, type=Path)
-    frequency_export = frequency_commands.add_parser(
-        "export-modes",
-        help="Export dense complex 2D fields at the selected frequencies",
-    )
-    frequency_export.add_argument("--selection", required=True, type=Path)
-    frequency_export.add_argument(
-        "--view",
-        required=True,
-        action="append",
-        nargs=2,
-        metavar=("LABEL", "FLOW_ARTIFACT"),
-        help="Selection view label and matching flow artifact; repeat in view order",
-    )
-    frequency_export.add_argument("--output", required=True, type=Path)
     measurements_parser = command_parsers.add_parser(
         "measurements",
         help="Topology-aligned complex pixel measurement bank",
@@ -687,6 +638,31 @@ def _dispatch(
     """Dispatch the parsed command and preserve existing CLI error semantics."""
 
     try:
+        if args.command == "flow" and args.flow_command == "compute":
+            from modal_gaussians.flow.sea_raft import compute_flow
+            output = compute_flow(images=args.images, reuse_stabilization=args.reuse_stabilization,
+                                  output_dir=args.output, sea_raft_repo=args.sea_raft_repo,
+                                  model_dir=args.model_dir, command=[parser.prog, *arguments])
+            print(f"SEA-RAFT flow: {output}")
+            return 0
+        if args.command == "legacy":
+            from modal_gaussians.legacy.cli import dispatch_legacy
+            return dispatch_legacy(parser, args, arguments)
+        if args.command == "spectrum":
+            from modal_gaussians.spectrum_cache import build_spectrum, export_selection, load_spectrum
+            if args.spectrum_command == "build":
+                cache = build_spectrum(views=args.view, scene_dir=args.scene,
+                                       fft_length=args.nfft, output_dir=args.output)
+                print(f"Spectrum: {cache.path}")
+                print(f"{len(cache.frequencies)} bins | step={cache.manifest['fps_hz'] / cache.manifest['fft_length']:g} Hz")
+            elif args.spectrum_command == "viewer":
+                from modal_gaussians.vis.spectrum_viewer import run_spectrum_viewer
+                run_spectrum_viewer(spectrum_dir=args.input, work_dir=args.work_dir,
+                                    host=args.host, port=args.port)
+            else:
+                output = export_selection(load_spectrum(args.input), args.selection, args.output)
+                print(f"Selected modal images: {output}")
+            return 0
         if args.command == "prepare" and args.prepare_command == "gui":
             try:
                 from modal_gaussians.mask_gui import run_mask_gui
@@ -694,24 +670,6 @@ def _dispatch(
                 raise RuntimeError("Mask preparation requires the optional [mask] dependencies; see README") from error
             run_mask_gui(root_dir=args.root_dir, checkpoint_dir=args.checkpoint_dir,
                          port=args.port, device=args.device)
-            return 0
-        if args.command == "flow" and args.flow_command == "analyze":
-            artifact = run_flow_analysis(
-                image_dir=args.images,
-                mask_dir=args.masks,
-                fps_hz=args.fps,
-                reference_frame_name=args.reference_frame,
-                output_dir=args.output,
-                config=FlowAnalysisConfig(
-                    stabilize=bool(args.stabilize),
-                    smoothing=str(args.smoothing),
-                    sigma_b_px=float(args.sigma_b_px),
-                    sigma_c_px=float(args.sigma_c_px),
-                ),
-                command=[parser.prog, *arguments],
-            )
-            print(f"flow artifact: {artifact.path.resolve()}")
-            print(f"manifest: {(artifact.path / 'manifest.json').resolve()}")
             return 0
         if args.command == "colmap" and args.colmap_subcommand == "prepare":
             output = prepare_colmap(
@@ -825,57 +783,6 @@ def _dispatch(
             )
             print(f"observation topology: {artifact.path.resolve()}")
             print(f"identity: {artifact.manifest['topology_identity']}")
-            return 0
-        if args.command == "frequency" and args.frequency_command == "select":
-            from modal_gaussians.frequency import (
-                FrequencySelectionConfig,
-                FrequencyViewInput,
-                build_frequency_selection_artifact,
-            )
-
-            artifact = build_frequency_selection_artifact(
-                topology_dir=args.topology,
-                views=tuple(
-                    FrequencyViewInput(
-                        label=label, flow_artifact=Path(flow_artifact)
-                    )
-                    for label, flow_artifact in args.view
-                ),
-                output_dir=args.output,
-                config=FrequencySelectionConfig(
-                    minimum_hz=float(args.min_hz),
-                    maximum_hz=float(args.max_hz),
-                    step_hz=float(args.step_hz),
-                    count=int(args.count),
-                ),
-                command=[parser.prog, *arguments],
-            )
-            selected = artifact.arrays.selected_frequencies_hz
-            print(f"frequency selection: {artifact.path.resolve()}")
-            print("selected Hz: " + ", ".join(f"{value:.9g}" for value in selected))
-            print(f"identity: {artifact.manifest['frequency_selection_identity']}")
-            return 0
-        if args.command == "frequency" and args.frequency_command == "export-modes":
-            from modal_gaussians.modes import (
-                ComplexModeViewInput,
-                build_complex_2d_modes_artifact,
-            )
-
-            artifact = build_complex_2d_modes_artifact(
-                selection_dir=args.selection,
-                views=tuple(
-                    ComplexModeViewInput(
-                        label=label, flow_artifact=Path(flow_artifact)
-                    )
-                    for label, flow_artifact in args.view
-                ),
-                output_dir=args.output,
-                command=[parser.prog, *arguments],
-            )
-            print(f"complex 2D modes: {artifact.path.resolve()}")
-            print(f"views: {len(artifact.view_modes)}")
-            print(f"modes: {len(artifact.manifest['modes'])}")
-            print(f"identity: {artifact.manifest['complex_2d_modes_identity']}")
             return 0
         if (
             args.command == "measurements"

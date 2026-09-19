@@ -6,6 +6,19 @@ recipe. Both use SEA-RAFT modal images, soft graph weights with fixed control
 sampling, **Gaussian rigidity 0.03**, and **control-rotation loss 0**.
 The earlier hard-cut Bush result is retained as a historical comparison.
 
+## Next direction: multiple frequencies (decision, not implemented)
+
+On 2026-09-18, the user chose **shared topology with per-frequency weights**
+as the first approach on branch `multiple-frequency`.
+For the same scene, share KNN candidates, geometric lengths, control placement,
+owners and geometric interpolation supports. Derive each frequency's soft edge
+weights from its own modal images, with corresponding control-graph weights
+and interpolation attenuation. Reuse geometric construction rather than building
+a complete independent KNN graph for every frequency. Cross-frequency fusion
+into one shared weight set is deferred. This records a direction only; no
+implementation or experiment is requested yet, and the accepted baseline below
+remains unchanged.
+
 ## Accepted Corn and Bush results
 
 | | Corn | Bush |
@@ -26,13 +39,24 @@ view alignment and reference geometry remain scene-specific.
 
 ## Default experiment recipe
 
-Use SEA-RAFT reference-to-frame flow and selected-frequency exact DFT modal
-images for both graph construction and training. The Bush sources are
+For new frequency work, use SEA-RAFT reference-to-frame flow, one shared-grid FFT
+cache across views, and `spectrum export` to copy selected complex U/V slices for
+both graph construction and training. There is no repeated selected-frequency
+DFT or automatic frequency snapping. Corn's completed cache is
+`outputs/corn_spectrum_001` (20 fps, Nfft 1600, 0–10 Hz, 0.0125 Hz spacing).
+See [README.md](README.md) for current commands. Farneback, greedy selection and
+selected-frequency DFT execution are retained only under the explicit `legacy`
+CLI group; old readers and ancestor metadata remain compatible.
+
+The accepted results below retain their original selected-frequency SEA-RAFT
+artifacts and are not regenerated. The Bush sources are
 `outputs/bush1_sea_raft_0744_001`, `outputs/bush2_sea_raft_0744_001`, and
 `outputs/bush3_sea_raft_0744_001`; Corn uses `outputs/corn1_sea_raft_0225_001`
 and `outputs/corn2_sea_raft_0225_001`. When preparing new inputs, compute complex view alignment and target
 normalization through `motion prepare-selected-modal`; inherited Farneback flow
-metadata supplies reference geometry/timing only. No full spectrum is required.
+metadata supplies reference geometry/timing only. Existing prepared geometry is
+still required by this handoff; this is not a new from-scratch bootstrap. Reusing
+an accepted selected-frequency artifact does not require building a full spectrum.
 
 Start with unfiltered mutual-KNN candidates, **K=16**, maximum radius **0.08**
 in scene units. Apply `graph build-modal-similarity --soft-weights` with similarity threshold

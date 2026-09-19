@@ -1,4 +1,4 @@
-"""Shared exact-DFT greedy frequency selection from fixed-view optical flow."""
+"""Historical frequency-selection readers and opt-in legacy greedy computation."""
 
 from __future__ import annotations
 

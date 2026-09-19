@@ -19,7 +19,7 @@ from modal_gaussians.flow.artifact import (
     FlowAnalysisArrays,
     publish_flow_analysis_artifact,
 )
-from modal_gaussians.flow.estimation import (
+from modal_gaussians.legacy.flow.estimation import (
     FARNEBACK_PARAMETERS,
     compute_farneback_pair,
     make_gaussian_smoother,

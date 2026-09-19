@@ -1,15 +1,15 @@
 ---
 name: modal-gaussians-pipeline
-description: Run, debug, and resume this repository's standalone modal-Gaussian pipeline from prepared image/mask sequences to saved 3D modes at the requested frequencies, without fitting per-frame modal coordinates. Optional manual previews do not start Viser. Use for end-to-end pipeline execution or recovery, not generic 3DGS advice or pipeline execution when the user only requests a plan.
+description: Run, debug, and resume this repository's SEA-RAFT/shared-FFT modal-Gaussian pipeline from existing reference metadata and prepared geometry to saved 3D modes at requested frequencies, without fitting per-frame coordinates. Optional manual previews do not start Viser. Use for pipeline execution or recovery, not generic 3DGS advice or plan-only requests.
 ---
 
 # Modal Gaussians Pipeline
 
-Run the required real-data stages until the **final 3D modes at the user's requested frequencies** are saved. Do not run validation stages for ordinary experiments. The default endpoint is `modes_ready`, including the accepted neural-field and small-fragment propagation recipe. Stop after this endpoint.
+Run the required real-data stages until the **final 3D modes at the user's requested frequencies** are saved. Do not run validation stages for ordinary experiments. The default endpoint is `modes_ready`, including the accepted component field and its donor/follower propagation. Stop after this endpoint.
 
 **Do not automatically fit modal coordinates to video optical flow.** Do not append `coordinates solve-direct`, `coordinates physics-fit`, `iterate-neural --stage full`, video replay, coordinate-dependent flow R², or a coordinate-backed result merely to call the pipeline complete. An old run-spec, a previous benchmark, or the phrase “run the entire pipeline” does not opt into these stages. A later explicit user request for coordinate/video reconstruction can change that scope.
 
-The existing flow/DFT inputs, selected 2D modal images, fixed complex view alpha and modal-image supervision remain part of learning the 3D modes. This stopping rule does not remove that supervision or change the established frequency-selection algorithm.
+Use SEA-RAFT flow, a shared-grid FFT cache, and direct cached-bin export for new frequency work. Selected complex U/V images, fixed complex view alpha and modal-image supervision remain part of learning the 3D modes. Existing selected-frequency inputs remain readable; do not recompute them just to migrate formats. Farneback, greedy selection and repeated selected-frequency DFT execution now require the explicit `legacy` CLI group and a historical-work request.
 
 When the user requests viewing the modes, append only `--stage preview`: rendered-design and an independent preview artifact. Hand off the launch command without initializing Viewer data or inspecting visualization results. Use manual oscillation, never invented or fitted video coordinates. Do not compute full spectra automatically. **Do not start Viser, open a browser, or configure a tunnel unless separately requested.**
 
@@ -45,27 +45,29 @@ This preference overrides the reference documents' diagnostic checklists for rou
 
 ## Accepted baseline (2026-09-18)
 
-Read the repository's `BASELINE.md` for the current accepted result and immutable paths before a new experiment. The user visually accepted **Bush 0.744 Hz**, `outputs/bush_neural_modal_similarity_0744_001/experiment/preview`, as the new baseline. Future experiments start from this recipe unless the user specifies a comparison; acceptance at this frequency does not imply evaluation on other scenes/frequencies.
+Read the repository's `BASELINE.md` for accepted results and immutable paths before a new experiment. The current baseline is **Corn 0.225 Hz** and **Bush 0.744 Hz** with soft weights, fixed control placement, Gaussian rigidity **0.03** and control-rotation loss **0**. Future experiments start from this recipe unless the user specifies a comparison; acceptance does not imply evaluation on other scenes/frequencies.
 
-- Use **SEA-RAFT** reference-to-frame flow and selected exact-DFT modal images for both graph evidence and training targets. Reuse existing selected fields; do not recompute full spectra. Do not silently fall back to old Farneback modal targets.
+- Use **SEA-RAFT** reference-to-frame flow and cached complex U/V images for both graph evidence and training targets. `flow compute` reuses existing timing/reference/stabilization metadata without reading Farneback arrays. `spectrum build` computes one shared grid across views; `spectrum export` copies chosen slices with no FFT/DFT fallback. Do not silently fall back to Farneback targets or snap an off-grid requested frequency.
 - With an existing prepared geometry snapshot, use `motion prepare-selected-modal` to sample the new fields and recompute fixed complex view alpha and target normalization. Old flow metadata serves reference geometry/timing only. The accepted three-view snapshot is `outputs/bush_neural_modal_similarity_0744_001/prepared`.
-- Start with unfiltered mutual-KNN candidates: **K=16**, maximum radius **0.08** in scene units. Use `graph build-modal-similarity`: similarity threshold **0.20**, conflict threshold **0.30**, amplitude floor fraction **0.02**, maximum projected endpoint distance **32 pixels**; retain its other defaults. Require reliable support and no reliable conflict. Do not precede this with depth-discontinuity pruning; depth/alpha still supplies visibility evidence.
-- Pass the saved matching graph through `motion iterate-neural --geometry-graph` with neural `graph_edge_filter=none`. The accepted graph is `outputs/bush_graph_modal_similarity_0744_002`. Training must use its retained edges and derive controls/interpolation from them. Numeric K/radius defaults alone do not select the modal graph. Do not apply this single-frequency Bush graph to another scene/frequency.
-- Keep width **256**, local features **32**, **3** message layers, control radius **0.015L**, maximum 32,768 controls, deformation/rotation weights **0.1/0.1**, and the existing component-field donor rules. Use `configs/neural_component_field.json` and the accepted run's frozen `config.json`; keep learning rate 0.001, maximum 2,000 steps, patience 50, relative tolerance 1e-6, seed 1729. Donor propagation remains a separate mechanism that can cross graph boundaries.
+- Start with unfiltered mutual-KNN candidates: **K=16**, maximum radius **0.08** in scene units. Use `graph build-modal-similarity --soft-weights`: similarity threshold **0.20**, conflict threshold **0.30**, amplitude floor fraction **0.02**, maximum projected endpoint distance **32 pixels**. Keep all candidate edges: reliable support without conflict retains original weight; all other edges get factor **0.05**. Do not precede this with depth-discontinuity pruning; depth/alpha still supplies visibility evidence.
+- Pass the saved matching graph through `motion iterate-neural --geometry-graph` with neural `graph_edge_filter=none`; use exact paths in `BASELINE.md`. Controls, owners and support use original geometric distances. Soft propagation attenuates existing interpolation weights and must not add controls. Numeric K/radius defaults alone do not select the modal graph. Do not apply a saved frequency-specific graph to another scene/frequency.
+- Preserve Corn's manual subject selection and visible-subject supervision instead of returning to old fine masks. The failed weak-edge-zero ablations are removed; do not restore them as part of pipeline migration.
+- Keep width **256**, local features **32**, **3** message layers, control radius **0.015L**, maximum 32,768 controls, deformation/rotation weights **0.03/0**, and the existing component-field donor rules. Use `configs/neural_component_field.json` for new runs; exact historical reproduction uses that run's frozen config. Keep learning rate 0.001, maximum 2,000 steps, patience 50, relative tolerance 1e-6, seed 1729. Local field rotations and Viewer ellipsoid rotations remain enabled. Donor propagation remains separate.
+- Custom partial configs inherit omitted settings from the prepared snapshot; explicitly include the current loss weights when reusing an older preparation.
 - Preserve the accepted outputs and ancestors. Approval is recorded in `BASELINE.md`, not by modifying hashed artifact manifests. Do not retrain to register a baseline. Continue the no-validation/no-coordinate-fitting policy and manual preview handoff above.
 
-The legacy command reference's Farneback/full-spectrum chain describes historical preparation, not a replacement for this accepted supervision/graph recipe. The README section beside `graph build-modal-similarity` contains the selected-modal preparation and external-graph training commands.
+The current command reference covers this migration using existing reference metadata and prepared geometry. A fresh scene without those ancestors still needs a separately resolved bootstrap; do not silently execute the archived Farneback chain. Shared topology with per-frequency weights is a recorded next direction, not a completed implementation.
 
 ## 1. Resolve the run contract
 
 Locate the repository containing `src/modal_gaussians/cli.py`, read its applicable instructions, and inspect its dirty worktree without reverting user changes. Read [commands.md](references/commands.md) before assembling commands. Read [validation-recovery.md](references/validation-recovery.md) only for a relevant failure; its validation checklists do not override the no-validation policy.
 
-Use [run-spec.example.json](assets/run-spec.example.json) as a template for one run-owned `run-spec.json`. It is a planning record, not a new CLI config format. Fill in:
+Use one concise run note only when existing configuration/logs do not capture the requested changes. An older run-spec is historical context, not a command to repeat its Farneback/greedy stages. Resolve:
 
 - Repository, exact Python interpreter, exact COLMAP executable, and absolute run-root paths on the execution host.
-- Sweep PNG and mask directories; an explicit sweep sampling stride.
-- An ordered list of fixed views: unique label, image/mask directories, FPS, reference **stem**, stabilization and smoothing choices. Derive each reference RGB/mask path from this same view, not another export.
-- Frequency range, grid step, and requested greedy prefix length K. Never infer these from an old bush experiment.
+- Existing static scene, manual subject selection when applicable, parent prepared snapshot and candidate geometry graph; sweep/mask inputs only if static bootstrap is explicitly part of the request.
+- An ordered list of fixed views: unique label, image directory, reusable timing/reference/stabilization artifact, sample rate and existing SEA-RAFT source. Preserve their reference pixel geometry; no fine mask clips the flow or spectrum.
+- Shared Nfft and sample rate, spectrum cache, selected bins and exact frequencies. The grid is `fps/Nfft`, with Nfft at least every sequence length; each view uses its original-length mean/Hann window before padding. Never infer these from another dataset. GUI selection is manual with no automatic snapping.
 - Explicit endpoint (`modes` by default; `preview` only when requested), `fit_modal_coordinates: false`, resolved training settings and optional viewer host/port; resource/time constraints and any scientific overrides the user has actually authorized.
 
 Ask one consolidated question for missing information that cannot be discovered safely. Do not guess FPS, view synchronization, reference frames, masks, frequency settings, or cluster allocation/account. Defaults shown in the command reference are the current mainline, not evidence that they fit every dataset.
@@ -82,24 +84,23 @@ On a cluster, use an authorized GPU allocation and its actual paths; do not trai
 
 ## 3. Execute the dependency chain
 
-Use the numbered commands in the reference:
+Use the current commands in the reference. Reuse existing complete upstream data:
 
 ```text
-per-view flow + diagnostic rFFT
-    + sampled sweep / fixed-view references -> joint COLMAP
-    -> static 3DGS / accepted foreground partition
-    -> topology -> requested frequency selection -> dense exact-DFT modes
-    -> measurements -> observed graph -> fixed complex alpha alignment
-    -> neural preparation (or reuse the immutable prepared snapshot)
-    -> independent neural 3D modes for the requested frequencies
-    -> accepted small-fragment propagation
+existing timing/reference/stabilization metadata -> SEA-RAFT flow (or reuse it)
+    -> one shared-grid FFT cache -> manual frequency selection
+    -> cached-bin U/V export (no repeated DFT)
+    + existing prepared geometry / accepted subject partition
+    -> selected-modal preparation with fresh complex view alignment
+    -> matching soft graph from unfiltered KNN candidates
+    -> neural 3D modes with the existing donor/follower propagation
     -> save completed modes; modes_ready; STOP (no validation)
 
 Only when a preview is requested:
     existing 3D modes -> rendered-design -> manual preview -> preview_ready; STOP
 ```
 
-Use `motion prepare-neural` once and `motion iterate-neural --stage modes` for repeated experiments. Reuse identity-matched observation, fine-graph and control/interpolation caches. Recompute support roles for a changed geometry graph. Historical preparations source alignment from a rigid artifact; SEA-RAFT selected-modal preparations publish their own alignment. The neural field consumes only fixed alpha and identifiability data; it does not use rigid motion, rigid trust filtering, legacy motion fill or green refinement. Keep the accepted neural/fragment parameters unless the user changes them.
+Use `motion prepare-selected-modal` with an existing prepared parent; new frequencies may be absent from the parent and receive fresh alignment/normalization. Reuse identity-matched geometry and use `motion iterate-neural --stage modes` for training. Recompute support roles for a changed geometry graph. Historical `motion prepare-neural` and rigid alignment artifacts remain compatibility paths, not reasons to repeat legacy upstream stages. The neural field consumes fixed alpha and identifiability data; it does not use rigid motion, rigid trust filtering, legacy motion fill or green refinement.
 
 
 Run one stage at a time initially. Per-view flow and COLMAP are independent, but do not parallelize large jobs without checking resource headroom. For every stage:
@@ -117,13 +118,13 @@ Enable the CLI's global `--log-file` before the stage subcommand, using one path
 
 ## Scientific invariants
 
-- Ready binary masks are inputs; do not add segmentation or masking services. RGB/mask/reference pixel geometry and FPS must remain consistent. Stabilization and smoothing are explicit choices.
+- Preserve frame/reference pixel geometry and FPS. SEA-RAFT flow and shared FFT are full-image and unsmoothed. Existing masks may remain dependencies of old static/prepared artifacts; manual-subject preparation uses visible rendered contributions instead. Do not add segmentation or masking services.
 - COLMAP sees sampled sweep RGB and one reference per fixed view, with full-image features. Semantic masks classify static FG/BG only. Keep raw and normalized camera conventions intact. Current grouping shares intrinsics within sweep and within references; flag incompatible input cameras instead of silently accepting them.
 - Static training uses fixed cameras, separate FG/BG parameter domains, joint depth-ordered rasterization, direct RGB, RGB L1 + SSIM, and the accepted eroded semantic-mask loss. BG densification stops earlier than FG and obeys its configured hard count cap. Depth supervision is still disabled until the aligned-depth artifact is specified; do not invent depth inputs or restore scale/dynamic/track state or Shape-of-Motion dependencies.
 - Freeze final foreground indexing. Preserve static-scene, foreground, reference-camera, flow, and downstream identities. Never repair a mismatch by rewriting hashes or mixing incompatible inputs.
-- Preserve view order and greedy mode slots everywhere. Frequency-sorted GUI labels must map back to immutable greedy slots, not reorder arrays.
-- Preserve dense rFFT artifacts as upstream data; full-spectrum GUI statistics are optional cached work, not a mode-completion requirement. Selected dense modes are negative-exponent exact DFT with temporal-mean detrend, symmetric Hann, complex64, `(u,v)` order, and no mask/clamp/amplitude normalization.
-- Preserve fixed complex alpha alignment, neural geometry/interpolation, structure losses, support roles and unresolved zeros. Apply the accepted fragment propagation without modifying host motion. Do not reintroduce rigid trust or legacy fill into the neural pipeline. When explicitly running a historical rigid pipeline, preserve that pipeline's own trust/fill contract.
+- Preserve view order and artifact mode slots everywhere, including historical greedy slots. Display sorting never reorders stored arrays. Cache exports bind exact bins/Hz and shared-grid identity; mismatches fail rather than recompute DFT.
+- Preserve old dense rFFT ancestors and current shared caches. New spectra use original-length temporal-mean detrend and symmetric Hann before zero padding, negative-exponent FFT, unnormalized complex64 and `(u,v)` order, with no mask/clamp. Computing a spectrum is necessary only when requested or when the chosen new-frequency cache does not yet exist; reusing selected inputs does not require a full spectrum.
+- Preserve fixed complex alpha alignment, neural geometry/interpolation, structure losses, support roles and unresolved zeros. Donor/follower propagation is part of the current neural field; do not append historical post-training fragment propagation, rigid trust or legacy fill. When explicitly running a historical rigid pipeline, preserve that pipeline's own trust/fill contract.
 - A rendered-design or manual preview does not require fitting time-dependent coordinates. Manual display uses `means + Re(sum(q*phi))` with user-controlled sinusoidal gain/phase. Do not report a fitted-video flow R² when no coordinates were fitted.
 - Preserve existing complete results and their historical coordinates. They are optional compatibility inputs, not a reason to repeat coordinate fitting in future runs.
 

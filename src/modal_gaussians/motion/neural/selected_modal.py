@@ -164,6 +164,8 @@ def _subject_topology(parent, source, scene, output_dir, final_dir, config):
 
 def prepare_selected_modal(*, prepared_dir, views, frequency_hz, output_dir, scene_dir=None):
     """Publish one new observation snapshot, with no graph build or training."""
+    if not math.isfinite(frequency_hz) or frequency_hz <= 0:
+        raise ValueError("Selected modal frequency must be finite and positive")
     destination = Path(output_dir).expanduser().resolve()
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(destination)
@@ -188,6 +190,9 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
     with timer.stage("selected_modal_sources"):
         parent = load_prepared(prepared_dir)
         source = copy.deepcopy(parent.source)
+        # This snapshot gets a new frequency source, not a prefix of the old modes.
+        source.pop("source_modes", None)
+        source.pop("mode_selection", None)
         visible_subject = (scene_dir is not None or
             source.get("selected_modal_supervision", {}).get("observation_region") == "visible_subject")
         requested = dict(views)
@@ -195,9 +200,7 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
         if len(requested) != len(views) or set(requested) != set(labels):
             raise ValueError("Selected modal sources must provide every prepared view exactly once")
         selected = [m for m in source["modes"] if math.isclose(m["frequency_hz"], frequency_hz, rel_tol=0, abs_tol=1e-9)]
-        if len(selected) != 1:
-            raise ValueError("Selected frequency must match exactly one prepared mode")
-        mode = {**selected[0], "mode_slot": 0}
+        candidate_index = selected[0]["candidate_index"] if len(selected) == 1 else 0
         modal_fields, records = [], []
         for view, flow in zip(source["views"], parent.manifest["flows"]):
             field, _, record = _modal_view(requested[view["label"]], flow, view, frequency_hz,
@@ -211,6 +214,18 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
                 "modes_file_sha256": sha256(Path(record["path"]) / "modal_image.npy"),
                 "modes_dtype": "complex64", "modes_shape": [1, *view["shape_hw"], 2],
                 "selected_source": record})
+        spectrum_sources = [r["selected_source"]["manifest"]["spectrum_source"] for r in records
+                            if r["selected_source"].get("manifest", {}).get("format")
+                            == "modal_gaussians.spectrum_selected_frequency"]
+        if spectrum_sources:
+            grid = spectrum_sources[0]
+            if any(s["fft_length"] != grid["fft_length"] or s["bin_index"] != grid["bin_index"]
+                   or not math.isclose(s["frequency_step_hz"], grid["frequency_step_hz"], rel_tol=0, abs_tol=1e-12)
+                   for s in spectrum_sources[1:]):
+                raise ValueError("Selected spectrum views must share the same FFT grid and bin")
+            candidate_index = grid["bin_index"]
+            frequency_hz = candidate_index * grid["frequency_step_hz"]
+        mode = {"mode_slot": 0, "candidate_index": candidate_index, "frequency_hz": float(frequency_hz)}
         scene, observation_renders = None, None
         config = nm.NeuralModesConfig.from_dict(parent.manifest["defaults"]["neural"])
         if scene_dir is None:
@@ -240,14 +255,15 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
         bundle = {"format": FORMAT, "version": 1, "modes": [mode], "views": records,
             "topology_identity": source["topology_identity"], "transform": TRANSFORM_CONVENTION,
             "full_spectrum_available": False,
-            "frequency_selection_identity": identity({"parent_prepared": parent.manifest["prepared_identity"], "mode": mode})}
+            "frequency_selection_identity": identity({"parent_prepared": parent.manifest["prepared_identity"],
+                "mode": mode, **({"spectrum_sources": spectrum_sources} if spectrum_sources else {})})}
         bundle["complex_2d_modes_identity"] = identity(bundle)
         previous_alignment = _manifest(source["alignment_from"])
         old_alpha_config = previous_alignment.get("alpha_sync", {})
         alpha_config = AlphaSyncConfig(**{f.name: old_alpha_config[f.name] for f in fields(AlphaSyncConfig)
                                          if f.name in old_alpha_config})
     with timer.stage("selected_modal_alignment"):
-        report_progress("selected modal: estimating cross-view complex gains from SEA-RAFT observations")
+        report_progress("selected modal: estimating cross-view complex gains from selected observations")
         observations = prepare_observations(points=points, topology=topology,
             sample_measurements=_sample_fields(modal_fields, topology.sample_pixels_xy, topology.sample_view_index)[0],
             view_labels=tuple(labels))

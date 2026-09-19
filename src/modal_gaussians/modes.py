@@ -1,4 +1,4 @@
-"""Dense complex 2D modal fields at the greedily selected frequencies."""
+"""Complex modal artifact readers, shared convention, and legacy exact-DFT export."""
 
 from __future__ import annotations
 
