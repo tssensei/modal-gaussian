@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import threading
 import time
 from typing import Any
@@ -273,13 +274,14 @@ def _completed_mode_display_roles(
 ) -> tuple[np.ndarray, tuple[str, ...], str]:
     """Resolve exact debug-role labels for sequential fill or basis blending."""
 
-    if manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16):
-        derived = manifest["version"] in (9, 10, 11, 12, 13, 14, 15, 16)
+    if manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
+        derived = manifest["version"] in (9, 10, 11, 12, 13, 14, 15, 16, 17)
         method = {8: "neural_complex_displacement_field", 9: "neural_fragment_motion_propagation",
                   10: "neural_field_with_training_fragment_fill", 11: "neural_field_with_surface_attachments",
                   12: "neural_field_with_pointwise_displacement_fill", 13: "neural_pointwise_observation_refinement",
                   14: "neural_field_with_guarded_neighbor_residuals", 15: "neural_guarded_observation_refinement",
-                  16: "neural_component_field_with_stable_donors"}[manifest["version"]]
+                  16: "neural_component_field_with_stable_donors",
+                  17: "fixed_frequency_mode_bank"}[manifest["version"]]
         if manifest.get("completion_method") != method:
             raise ValueError("Unsupported neural completion role contract")
         phi = np.asarray(arrays["phi"])
@@ -352,7 +354,7 @@ def _viewer_cameras(result: ModalResultArtifact) -> tuple[ViewerCamera, ...]:
         for camera in cameras_from_scene_manifest(result.scene.manifest)
     }
     cameras: list[ViewerCamera] = []
-    for view in result.manifest["views"]:
+    for view in result.rendered_design.manifest["views"]:
         name = str(view["camera_name"])
         camera = by_name.get(name)
         if camera is None:
@@ -378,11 +380,11 @@ def _observation_counts(result: ModalResultArtifact) -> np.ndarray:
     """Count unique topology views contributing to each foreground Gaussian."""
 
     completed = result.completed_modes
-    if completed.manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16):
+    if completed.manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
         observed = np.asarray(completed.arrays["observation_view_mask"])
         expected = (
             len(result.manifest["modes"]), result.scene.foreground.count,
-            len(result.manifest["views"]),
+            len(completed.manifest["views"]),
         )
         if observed.dtype != np.bool_ or observed.shape != expected:
             raise ValueError("Neural observation view mask must be boolean [K,G,V]")
@@ -394,7 +396,7 @@ def _observation_counts(result: ModalResultArtifact) -> np.ndarray:
         np.diff(offsets),
     )
     contributors = topology.arrays.contributor_gaussian_index
-    view_count = len(result.manifest["views"])
+    view_count = len(completed.manifest["views"])
     gaussian_count = result.scene.foreground.count
     observed = np.zeros((gaussian_count, view_count), dtype=bool)
     observed[contributors, contributor_views] = True
@@ -450,24 +452,12 @@ class ModalViewerData:
         requested_device = torch.device(device)
         if requested_device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("Modal Gaussian Viser requires a CUDA device")
-        prepared = None
         self.is_preview = preview
         if preview:
             from modal_gaussians.motion.neural.preview import load_preview
             self.result = load_preview(result_dir)
-            prepared = self.result.prepared
         else:
             self.result = load_modal_result(result_dir)
-            contract_path = Path(result_dir).resolve().parent / "iteration.json"
-            if contract_path.is_file():
-                import json
-                from modal_gaussians.motion.neural.prepared import load_prepared
-                from modal_gaussians.motion.neural.neural_modes import _source_identity
-                contract = json.loads(contract_path.read_text())
-                prepared = load_prepared(contract["prepared"])
-                if (prepared.manifest["prepared_identity"] != contract["prepared_identity"]
-                        or _source_identity(self.result.completed_modes.manifest) != prepared.manifest["source_identity"]):
-                    raise ValueError("Viewer preparation differs from result sources")
         self.device = requested_device
         self.scene = self.result.scene.to(self.device)
         self.cameras = _viewer_cameras(self.result)
@@ -525,11 +515,21 @@ class ModalViewerData:
                     or not np.isfinite(self.control_displacement).all()):
                 raise ValueError("Viewer control displacement must be finite complex64 [K,C,3]")
         self._load_graph_display()
-        self.spectrum = SpectrumComparisonController(self.result, prepared=prepared)
+        # The new panel binds each bank frequency to its saved shared-FFT source.
+        # Legacy artifacts still render in 3D, without the removed legacy spectrum loader.
+        self.spectrum = (SpectrumComparisonController(self.result)
+                         if self.result.completed_modes.manifest.get("version") == 17 else None)
 
     def _load_graph_display(self) -> None:
         """Select geometry diagnostics belonging to the completed-mode method."""
 
+        if self.result.completed_modes.manifest.get("version") == 17:
+            self.structure_graph = None
+            self.graph_edge_gaussian_index = np.empty((0, 2), dtype=np.int64)
+            self.graph_edge_colors = np.empty((0, 3), dtype=np.uint8)
+            self.graph_edge_colors_by_mode = None
+            self.graph_legend = "Frequency-specific graphs remain in the original single-mode artifacts."
+            return
         if self.result.completed_modes.manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16):
             self.structure_graph = None
             self.graph_edge_gaussian_index, self.graph_edge_colors = _neural_graph_display(
@@ -683,7 +683,7 @@ class ModalViewerData:
             jacobian_camera = distortion @ jacobian_camera
         jacobian = torch.einsum("nij,jk->nik", jacobian_camera, rotation)
         projected = torch.einsum(
-            "nij,nj->ni", jacobian, self.phi[mode_index]
+            "nij,nj->ni", jacobian.to(self.phi.dtype), self.phi[mode_index]
         )[:, component_index]
         alpha_tensor = torch.as_tensor(alpha, device=self.device)
         projected = alpha_tensor * projected
@@ -754,7 +754,7 @@ class ModalViserViewer:
         viewer_resolution: int = 2048,
     ) -> None:
         self.data = data
-        self.work_dir = Path(work_dir).expanduser().resolve()
+        self.work_dir = resolve_path(work_dir)
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.server = viser.ViserServer(host=host, port=port, label="Modal Gaussians")
         self.server.gui.configure_theme(
@@ -863,6 +863,8 @@ class ModalViserViewer:
                 self.work_dir / "camera_paths",
                 self.timestep,
             )
+        if self.data.spectrum is None:
+            return
         self.spectrum_window = self.server.gui.add_panel()
         with self.spectrum_window.add_tab("Spectrum"):
             self.spectrum_panel = ModalSpectrumPanel(
@@ -1028,7 +1030,8 @@ class ModalViserViewer:
         with self.server.gui.add_folder("Gaussian color"):
             self.color_mode = self.server.gui.add_dropdown(
                 "Render color mode",
-                options=(COLOR_RGB, COLOR_PHASE, COLOR_OBSERVATIONS),
+                options=((COLOR_RGB, COLOR_PHASE, COLOR_OBSERVATIONS) if self.data.spectrum is not None
+                         else (COLOR_RGB, COLOR_OBSERVATIONS)),
                 initial_value=COLOR_RGB,
             )
             self.phase_component = self.server.gui.add_dropdown(
@@ -1036,7 +1039,7 @@ class ModalViserViewer:
             )
             self.phase_normalization = self.server.gui.add_dropdown(
                 "Amplitude normalization",
-                options=("per mode", "entire spectrum"),
+                options=("per mode", "all saved modes"),
                 initial_value="per mode",
             )
             self.phase_mode = self.server.gui.add_slider(
@@ -1126,9 +1129,7 @@ class ModalViserViewer:
         """Synchronize phase-image brightness policy between both panels."""
 
         value = str(normalization)
-        if value == "entire spectrum" and not self.data.spectrum.full_spectrum_ready:
-            value = "per mode"
-        if value not in ("per mode", "entire spectrum"):
+        if value not in ("per mode", "all saved modes"):
             raise ValueError(f"Unknown Viewer normalization: {value!r}")
         if self._selection_sync:
             return

@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import tempfile
 
 import numpy as np
@@ -21,12 +22,12 @@ from .modal_similarity import ModalSimilarityConfig, build_modal_similarity_grap
 
 
 def _manifest(path):
-    return json.loads((Path(path) / "manifest.json").read_text(encoding="utf-8"))
+    return json.loads((resolve_path(path) / "manifest.json").read_text(encoding="utf-8"))
 
 
 def _modal_view(path, flow, view, frequency, *, read_mask=True):
     """Bind the experimental dense field to the prepared reference coordinates."""
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest = _manifest(root)
     frozen = flow["manifest"]
     if (manifest.get("format") not in ("modal_gaussians.sea_raft_selected_frequency_experiment",
@@ -42,8 +43,8 @@ def _modal_view(path, flow, view, frequency, *, read_mask=True):
             or manifest["fps_hz"] != frozen["fps_hz"]
             or manifest["reference_frame_name"] != frozen["reference_frame_name"]
             or manifest["reference_frame_index"] != frozen["reference_frame_index"]
-            or Path(manifest["stabilization_source"]).resolve() != Path(flow["path"]).resolve()
-            or Path(manifest["images"]).resolve() != Path(frozen["inputs"]["sequence"]["image_directory"]).resolve()):
+            or resolve_path(manifest["stabilization_source"]) != resolve_path(flow["path"])
+            or resolve_path(manifest["images"]) != resolve_path(frozen["inputs"]["sequence"]["image_directory"])):
         raise ValueError(f"Modal image differs from prepared frequency/reference coordinates: {view['label']}")
     if manifest["format"] == "modal_gaussians.spectrum_selected_frequency":
         spectrum = manifest.get("spectrum_source")
@@ -63,16 +64,16 @@ def _modal_view(path, flow, view, frequency, *, read_mask=True):
             raise ValueError("Spectrum selection cache/grid contract is invalid")
     stabilized = frozen.get("stabilized_sequence")
     if stabilized is not None:
-        sequence = Path(flow["path"]) / stabilized["path"]
+        sequence = resolve_path(flow["path"]) / stabilized["path"]
         image_dir, mask_dir = sequence / "images", sequence / "masks"
     else:
         sequence = frozen["inputs"]["sequence"]
-        image_dir = Path(sequence["image_directory"])
-        mask_dir = Path(sequence["mask_directory"]) if read_mask else None
+        image_dir = resolve_path(sequence["image_directory"])
+        mask_dir = resolve_path(sequence["mask_directory"]) if read_mask else None
     reference = frozen["reference_frame_name"] + ".png"
     inference_images = manifest.get("inference_images") or manifest.get("stabilized_images")
-    if (inference_images is None or Path(inference_images).resolve() != image_dir.resolve()
-            or Path(manifest["reference_image"]).resolve() != (image_dir / reference).resolve()):
+    if (inference_images is None or resolve_path(inference_images) != image_dir.resolve()
+            or resolve_path(manifest["reference_image"]) != (image_dir / reference).resolve()):
         raise ValueError(f"Modal reference image differs: {view['label']}")
     field = np.load(root / "modal_image.npy", mmap_mode="r", allow_pickle=False)
     expected = (1, *view["shape_hw"], 2)
@@ -98,11 +99,11 @@ def build_modal_similarity_graph_artifact(*, prepared_dir, geometry_graph_dir, v
     settings.validate()
     if not math.isfinite(frequency_hz) or frequency_hz <= 0:
         raise ValueError("Frequency must be finite and positive")
-    output = Path(output_dir).expanduser().resolve()
+    output = resolve_path(output_dir)
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite graph experiment: {output}")
-    prepared_path = Path(prepared_dir).expanduser().resolve(strict=True)
-    graph_path = Path(geometry_graph_dir).expanduser().resolve(strict=True)
+    prepared_path = resolve_path(prepared_dir, strict=True)
+    graph_path = resolve_path(geometry_graph_dir, strict=True)
     timer = Timings()
     with timer.stage("modal_similarity_inputs"):
         prepared = _manifest(prepared_path)

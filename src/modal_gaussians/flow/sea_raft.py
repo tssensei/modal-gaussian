@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import sys
 import time
 
@@ -28,7 +29,7 @@ def read_image(path):
 
 
 def load_model(repo, weights):
-    repo, weights = Path(repo).resolve(), Path(weights).resolve()
+    repo, weights = resolve_path(repo), resolve_path(weights)
     if not (weights / "model.safetensors").is_file():
         raise FileNotFoundError(weights / "model.safetensors")
     config = argparse.Namespace(**json.loads(
@@ -48,14 +49,14 @@ def compute_flow(*, images, reuse_stabilization, output_dir, sea_raft_repo, mode
     artifacts without running the legacy estimator or a frequency transform.
     """
     started = time.perf_counter()
-    previous, images = Path(reuse_stabilization).resolve(), Path(images).resolve()
-    output = Path(output_dir).resolve()
+    previous, images = resolve_path(reuse_stabilization), resolve_path(images)
+    output = resolve_path(output_dir)
     if output.exists():
         raise FileExistsError(f"Choose a new flow output directory: {output}")
     source = json.loads((previous / "manifest.json").read_text(encoding="utf-8"))
     if source.get("format") != "modal_gaussians.flow_analysis" or source.get("version") not in (6, 7):
         raise ValueError("Expected an existing geometry preparation flow manifest")
-    if images != Path(source["inputs"]["sequence"]["image_directory"]).resolve():
+    if images != resolve_path(source["inputs"]["sequence"]["image_directory"]):
         raise ValueError("Images differ from the recorded sequence")
     names, fps = source["frame_names"], float(source["fps_hz"])
     reference_index = source["reference_frame_index"]
@@ -95,8 +96,8 @@ def compute_flow(*, images, reuse_stabilization, output_dir, sea_raft_repo, mode
         "flow_dtype": "float32", "flow_units": "input_pixels", "flow_direction": "reference_to_frame",
         "smoothing": "none", "full_spectrum": False, "transform": TRANSFORM_CONVENTION,
         "completed_frames": 0, "validation": False,
-        "model": {"weights": str(Path(model_dir).resolve() / "model.safetensors"),
-                  "repository": str(Path(sea_raft_repo).resolve()),
+        "model": {"weights": str(resolve_path(model_dir) / "model.safetensors"),
+                  "repository": str(resolve_path(sea_raft_repo)),
                   "config": vars(model.args), "native_resolution": True},
     }
     output.mkdir(parents=True, exist_ok=False)

@@ -7,7 +7,7 @@ not a physical oscillation amplitude.  This module performs no artifact I/O.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import copy
 import math
 from typing import Any, Callable, Mapping, Sequence
@@ -235,18 +235,84 @@ def _positive_scale(value: float, name: str) -> float:
     return result
 
 
-def weighted_neighbor_mean(features: Tensor, edges: Tensor, weights: Tensor) -> Tensor:
-    """Undirected fixed-weight mean; isolated nodes receive a zero message."""
-    if not len(edges):
-        return torch.zeros_like(features)
+def _neighbor_inputs(edges: Tensor, weights: Tensor, template: Tensor) -> tuple[Tensor, ...]:
     source = torch.cat((edges[:, 0], edges[:, 1]))
     destination = torch.cat((edges[:, 1], edges[:, 0]))
     directed_weights = torch.cat((weights, weights))
+    denominator = template.new_zeros(len(template)).index_add_(0, destination, directed_weights)
+    return source, destination, directed_weights, denominator.clamp_min(torch.finfo(template.dtype).tiny)
+
+
+@dataclass(frozen=True)
+class _LossEdges:
+    left: Tensor
+    right: Tensor
+    weights: Tensor
+    distance: Tensor
+    weight_sum: Tensor
+    direction: Tensor | None = None
+
+
+def _rigidity_edges(geometry: NeuralFieldGeometry, length: float) -> _LossEdges:
+    keep = (geometry.gaussian_supported[geometry.gaussian_edges[:, 0]]
+            & geometry.gaussian_supported[geometry.gaussian_edges[:, 1]]
+            & (geometry.gaussian_edge_weights > 0))
+    edges, weights = geometry.gaussian_edges[keep], geometry.gaussian_edge_weights[keep]
+    left, right = edges[:, 0], edges[:, 1]
+    edge = (geometry.gaussian_positions[right] - geometry.gaussian_positions[left]) / length
+    distance = torch.linalg.vector_norm(edge, dim=-1)
+    kind = torch.complex64 if edge.dtype == torch.float32 else torch.complex128
+    return _LossEdges(left, right, weights, distance, weights.sum(), (edge / distance[:, None]).to(kind))
+
+
+def _rotation_edges(geometry: NeuralFieldGeometry, length: float) -> _LossEdges:
+    keep = (geometry.control_supported[geometry.control_edges[:, 0]]
+            & geometry.control_supported[geometry.control_edges[:, 1]]
+            & (geometry.control_edge_weights > 0))
+    edges, weights = geometry.control_edges[keep], geometry.control_edge_weights[keep]
+    # Control distances are material-path lengths, not Euclidean distances.
+    return _LossEdges(edges[:, 0], edges[:, 1], weights,
+                      geometry.control_edge_lengths[keep] / length, weights.sum())
+
+
+@dataclass(frozen=True)
+class _FieldRuntime:
+    """One training call's immutable tensors; never serialized or shared between modes."""
+    coordinates: Tensor
+    neighbors: tuple[Tensor, ...]
+    interpolation_offset: Tensor
+    transfer_targets: Tensor | None
+    rigidity: _LossEdges
+    rotation: _LossEdges | None
+
+
+@torch.no_grad()
+def _prepare_runtime(geometry: NeuralFieldGeometry, length_scale: float, *,
+                     compute_rotation: bool) -> _FieldRuntime:
+    length = _positive_scale(length_scale, "length_scale")
+    points, controls = geometry.gaussian_positions, geometry.control_positions
+    kind = torch.complex64 if points.dtype == torch.float32 else torch.complex128
+    return _FieldRuntime(
+        (controls - controls.mean(0)) / length,
+        _neighbor_inputs(geometry.control_edges, geometry.control_edge_weights, controls),
+        (points[geometry.interpolation_rows] - controls[geometry.interpolation_indices]).to(kind),
+        None if geometry.transfer_rows is None else torch.unique(geometry.transfer_rows),
+        _rigidity_edges(geometry, length),
+        _rotation_edges(geometry, length) if compute_rotation else None,
+    )
+
+
+def weighted_neighbor_mean(features: Tensor, edges: Tensor, weights: Tensor, *,
+                           runtime: _FieldRuntime | None = None) -> Tensor:
+    """Undirected fixed-weight mean; isolated nodes receive a zero message."""
+    if not len(edges):
+        return torch.zeros_like(features)
+    source, destination, directed_weights, denominator = (
+        _neighbor_inputs(edges, weights, features) if runtime is None else runtime.neighbors)
     numerator = torch.zeros_like(features).index_add_(
         0, destination, features[source] * directed_weights[:, None],
     )
-    denominator = features.new_zeros(len(features)).index_add_(0, destination, directed_weights)
-    return numerator / denominator.clamp_min(torch.finfo(features.dtype).tiny)[:, None]
+    return numerator / denominator[:, None]
 
 
 class PerFrequencyModalGNN(nn.Module):
@@ -276,9 +342,11 @@ class PerFrequencyModalGNN(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-    def forward(self, geometry: NeuralFieldGeometry, length_scale: float) -> tuple[Tensor, Tensor]:
+    def forward(self, geometry: NeuralFieldGeometry, length_scale: float, *,
+                runtime: _FieldRuntime | None = None) -> tuple[Tensor, Tensor]:
         length = _positive_scale(length_scale, "length_scale")
-        coordinates = (geometry.control_positions - geometry.control_positions.mean(0)) / length
+        coordinates = ((geometry.control_positions - geometry.control_positions.mean(0)) / length
+                       if runtime is None else runtime.coordinates)
         inputs = coordinates
         if self.local_features is not None:
             if len(self.local_features) != len(coordinates):
@@ -288,7 +356,8 @@ class PerFrequencyModalGNN(nn.Module):
             inputs = torch.cat((coordinates, features), dim=-1)
         hidden = self.encoder(inputs)
         for layer in self.layers:
-            message = weighted_neighbor_mean(hidden, geometry.control_edges, geometry.control_edge_weights)
+            message = weighted_neighbor_mean(hidden, geometry.control_edges, geometry.control_edge_weights,
+                                             runtime=runtime)
             hidden = hidden + layer(torch.cat((hidden, message), dim=-1))
         # Keep a direct local-feature route, alongside graph-aggregated features.
         values = self.head(torch.cat((hidden, inputs), dim=-1))
@@ -307,7 +376,8 @@ class ComposedField:
     residual_field: Tensor | None = None
 
 
-def compose_field(geometry: NeuralFieldGeometry, displacement: Tensor, rotation: Tensor) -> ComposedField:
+def compose_field(geometry: NeuralFieldGeometry, displacement: Tensor, rotation: Tensor, *,
+                  runtime: _FieldRuntime | None = None) -> ComposedField:
     """Interpolate original-unit complex control fields with local rotations."""
     expected = geometry.control_positions.shape
     if displacement.shape != expected or rotation.shape != expected:
@@ -318,7 +388,8 @@ def compose_field(geometry: NeuralFieldGeometry, displacement: Tensor, rotation:
     rotation = rotation * geometry.control_supported[:, None]
     rows, indices, weights = (geometry.interpolation_rows, geometry.interpolation_indices,
                               geometry.interpolation_weights)
-    offset = (geometry.gaussian_positions[rows] - geometry.control_positions[indices]).to(displacement.dtype)
+    offset = ((geometry.gaussian_positions[rows] - geometry.control_positions[indices]).to(displacement.dtype)
+              if runtime is None else runtime.interpolation_offset)
     contributions = displacement[indices] + torch.linalg.cross(rotation[indices], offset, dim=-1)
     field = displacement.new_zeros(geometry.gaussian_positions.shape).index_add_(
         0, rows, weights[:, None] * contributions,
@@ -332,7 +403,7 @@ def compose_field(geometry: NeuralFieldGeometry, displacement: Tensor, rotation:
         residual_rotation = blended_rotation * geometry.residual_mask[:, None]
     if geometry.transfer_rows is not None:
         # Copy final source displacement, without rotation extrapolation to the target.
-        target = torch.unique(geometry.transfer_rows)
+        target = torch.unique(geometry.transfer_rows) if runtime is None else runtime.transfer_targets
         def transfer(values):
             propagated = values.new_zeros(values.shape).index_add_(0, geometry.transfer_rows,
                 geometry.transfer_weights[:, None] * values[geometry.transfer_sources])
@@ -346,16 +417,18 @@ def compose_field(geometry: NeuralFieldGeometry, displacement: Tensor, rotation:
 
 
 def model_field(model: PerFrequencyModalGNN, geometry: NeuralFieldGeometry, *,
-                length_scale: float, amplitude_scale: float) -> ComposedField:
+                length_scale: float, amplitude_scale: float,
+                runtime: _FieldRuntime | None = None) -> ComposedField:
     amplitude = _positive_scale(amplitude_scale, "amplitude_scale")
     length = _positive_scale(length_scale, "length_scale")
-    displacement, rotation = model(geometry, length)
-    return compose_field(geometry, amplitude * displacement, (amplitude / length) * rotation)
+    displacement, rotation = model(geometry, length, runtime=runtime)
+    return compose_field(geometry, amplitude * displacement, (amplitude / length) * rotation, runtime=runtime)
 
 
 def structural_losses(geometry: NeuralFieldGeometry, field: ComposedField, *,
                       length_scale: float, amplitude_scale: float,
-                      rotation_length_fraction: float = 0.05) -> tuple[Tensor, Tensor]:
+                      rotation_length_fraction: float = 0.05, compute_rotation: bool = True,
+                      runtime: _FieldRuntime | None = None) -> tuple[Tensor, Tensor]:
     """Dimensionless final-Gaussian strain and control-rotation variation."""
     length = _positive_scale(length_scale, "length_scale")
     amplitude = _positive_scale(amplitude_scale, "amplitude_scale")
@@ -364,34 +437,24 @@ def structural_losses(geometry: NeuralFieldGeometry, field: ComposedField, *,
     normalized_rotation = field.rotation * (length / amplitude)
     zero = normalized_field.real.sum() * 0.0
 
-    gaussian_keep = (geometry.gaussian_supported[geometry.gaussian_edges[:, 0]]
-                     & geometry.gaussian_supported[geometry.gaussian_edges[:, 1]]
-                     & (geometry.gaussian_edge_weights > 0))
-    edges = geometry.gaussian_edges[gaussian_keep]
-    weights = geometry.gaussian_edge_weights[gaussian_keep]
+    edges = _rigidity_edges(geometry, length) if runtime is None else runtime.rigidity
     edge_loss = zero
-    if len(edges):
-        left, right = edges[:, 0], edges[:, 1]
-        edge = (geometry.gaussian_positions[right] - geometry.gaussian_positions[left]) / length
-        distance = torch.linalg.vector_norm(edge, dim=-1)
-        direction = (edge / distance[:, None]).to(normalized_field.dtype)
+    if len(edges.left):
+        left, right, distance = edges.left, edges.right, edges.distance
+        direction = edges.direction.to(normalized_field.dtype)
         mean_rotation = (normalized_rotation[left] + normalized_rotation[right]) * 0.5
         residual = ((normalized_field[right] - normalized_field[left]) / distance[:, None]
                     - torch.linalg.cross(mean_rotation, direction, dim=-1))
-        edge_loss = (weights * residual.abs().square().sum(-1)).sum() / weights.sum()
+        edge_loss = (edges.weights * residual.abs().square().sum(-1)).sum() / edges.weight_sum
 
-    control_keep = (geometry.control_supported[geometry.control_edges[:, 0]]
-                    & geometry.control_supported[geometry.control_edges[:, 1]]
-                    & (geometry.control_edge_weights > 0))
-    edges, weights = geometry.control_edges[control_keep], geometry.control_edge_weights[control_keep]
     rotation_loss = zero
-    if len(edges):
-        left, right = edges[:, 0], edges[:, 1]
-        # The control graph follows material paths; close folds can have long paths.
-        distance = geometry.control_edge_lengths[control_keep] / length
-        controls = field.control_rotation * (length / amplitude)
-        residual = (controls[right] - controls[left]) * (bending_length / distance[:, None])
-        rotation_loss = (weights * residual.abs().square().sum(-1)).sum() / weights.sum()
+    if compute_rotation:
+        edges = (_rotation_edges(geometry, length)
+                 if runtime is None or runtime.rotation is None else runtime.rotation)
+        if len(edges.left):
+            controls = field.control_rotation * (length / amplitude)
+            residual = (controls[edges.right] - controls[edges.left]) * (bending_length / edges.distance[:, None])
+            rotation_loss = (edges.weights * residual.abs().square().sum(-1)).sum() / edges.weight_sum
     return edge_loss, rotation_loss
 
 
@@ -486,6 +549,11 @@ def _cpu_snapshot(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+def _device_model_snapshot(state: Mapping[str, Tensor], device: torch.device) -> dict[str, Tensor]:
+    """Best parameters own their storage without a device-to-host copy on improvement."""
+    return {name: value.detach().to(device=device).clone() for name, value in state.items()}
+
+
 def _validate_finite_payload(value: Any, context: str) -> None:
     """Reject corrupted model/optimizer payloads before evaluation or resume."""
     if isinstance(value, Tensor):
@@ -518,6 +586,79 @@ def evaluate_model(model_state: Mapping[str, Any], geometry: NeuralFieldGeometry
     model.eval()
     result = model_field(model, geometry, length_scale=length_scale, amplitude_scale=amplitude_scale)
     return result.field, result.rotation, result.control_displacement, result.control_rotation
+
+
+_LOSS_FIELDS = ("field", "rotation", "control_rotation", "residual_field")
+
+
+def _loss_leaves(field: ComposedField) -> ComposedField:
+    return replace(field, control_displacement=field.control_displacement.detach(), **{
+        name: None if (value := getattr(field, name)) is None else value.detach().requires_grad_(value.requires_grad)
+        for name in _LOSS_FIELDS
+    })
+
+
+def _backward_shared_field(field: ComposedField, leaves: ComposedField) -> None:
+    """One traversal of the shared GNN, including rotation and optional residual routes."""
+    outputs, gradients = [], []
+    for name in _LOSS_FIELDS:
+        leaf = getattr(leaves, name)
+        if leaf is not None and leaf.grad is not None:
+            outputs.append(getattr(field, name))
+            gradients.append(leaf.grad)
+    if outputs:
+        # Complex gradients already use Torch's convention; do not conjugate again.
+        torch.autograd.backward(outputs, gradients)
+
+
+def _objective(model: PerFrequencyModalGNN, geometry: NeuralFieldGeometry,
+               prepared: Sequence[tuple[ModalObservation, Tensor, Tensor, complex]],
+               scales: Sequence[float], settings: NeuralFieldConfig, runtime: _FieldRuntime, *,
+               length: float, amplitude: float, backward: bool) -> dict[str, Any]:
+    compute_rotation = settings.rotation_weight != 0
+    with torch.set_grad_enabled(backward):
+        field = model_field(model, geometry, length_scale=length, amplitude_scale=amplitude, runtime=runtime)
+        leaves = _loss_leaves(field) if backward else field
+        view_losses = []
+        # Each rasterizer graph is freed after reaching the detached field leaf.
+        for (observation, target, confidence, alpha), scale in zip(prepared, scales):
+            prediction = observation.project(leaves.field)
+            if prediction.shape != target.shape:
+                raise ValueError(f"Projection shape differs from target for {observation.name!r}")
+            residual = (alpha * prediction - target) / scale
+            term = (confidence * radial_huber(residual, settings.huber_delta)).sum() / len(prepared)
+            view_losses.append(term.detach())
+            if backward:
+                term.backward()
+            del prediction, residual, term
+        edge, rotation = structural_losses(
+            geometry, leaves, length_scale=length, amplitude_scale=amplitude,
+            rotation_length_fraction=settings.rotation_length_fraction,
+            compute_rotation=compute_rotation, runtime=runtime,
+        )
+        regularizer = settings.deformation_weight * edge + settings.rotation_weight * rotation
+        prior = edge.new_zeros(())
+        if leaves.residual_field is not None:
+            residual = leaves.residual_field[geometry.residual_mask] / amplitude
+            prior = (residual.abs().square().sum(dim=-1).mean() if len(residual)
+                     else leaves.residual_field.real.sum() * 0.0)
+            regularizer = regularizer + geometry.residual_prior_weight * prior
+        if backward:
+            regularizer.backward()
+            _backward_shared_field(field, leaves)
+        # Read all scalar losses together, but retain the original Python summation order.
+        values = torch.stack([*view_losses, edge.detach(), rotation.detach(), prior.detach()]).cpu().tolist()
+        data_value = sum(values[:-3])
+        edge_value, rotation_value, prior_value = values[-3:]
+        total = (data_value + settings.deformation_weight * edge_value + settings.rotation_weight * rotation_value
+                 + geometry.residual_prior_weight * prior_value)
+        if not math.isfinite(total):
+            raise FloatingPointError("Non-finite neural field objective")
+        result = {"loss": total, "data_loss": data_value, "edge_loss": edge_value,
+                  "rotation_loss": rotation_value, "rotation_loss_computed": compute_rotation}
+        if field.residual_field is not None:
+            result["neighbor_prior_loss"] = prior_value
+        return result
 
 
 def train_single_frequency(
@@ -561,6 +702,8 @@ def train_single_frequency(
     scales = [(_positive_scale(float(observation.normalized_rms), "normalized_rms")
                if observation.normalized_rms is not None else float(automatic_rms[index]))
               for index, observation in enumerate(observations)]
+    compute_rotation = settings.rotation_weight != 0
+    runtime = _prepare_runtime(geometry, length, compute_rotation=compute_rotation)
 
     torch.manual_seed(settings.seed)
     model = PerFrequencyModalGNN(settings, control_count=len(geometry.control_positions)).to(points)
@@ -594,56 +737,17 @@ def train_single_frequency(
             raise ValueError("max_iterations precedes the resumed step")
         best_step, best_loss = int(resume_state["best_step"]), float(resume_state["best_loss"])
         stale_steps = int(resume_state["stale_steps"])
-        best_state = _cpu_snapshot(resume_state["best_model_state"])
+        best_state = _device_model_snapshot(resume_state["best_model_state"], points.device)
         history = copy.deepcopy(resume_state["history"])
+        for row in history:
+            row.setdefault("rotation_loss_computed", True)
         torch.random.set_rng_state(resume_state["rng_state"]["cpu"].cpu())
         cuda_rng = resume_state["rng_state"].get("cuda", [])
         if cuda_rng and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(cuda_rng)
         already_recorded = True
 
-    def objective(backward: bool) -> dict[str, float]:
-        optimizer.zero_grad(set_to_none=True)
-        with torch.set_grad_enabled(backward):
-            field = model_field(model, geometry, length_scale=length, amplitude_scale=amplitude)
-            data_value = 0.0
-            # Backpropagate one view at a time; do not retain all rasterizer graphs.
-            for (observation, target, confidence, alpha), scale in zip(prepared, scales):
-                prediction = observation.project(field.field)
-                if prediction.shape != target.shape:
-                    raise ValueError(f"Projection shape differs from target for {observation.name!r}")
-                residual = (alpha * prediction - target) / scale
-                term = (confidence * radial_huber(residual, settings.huber_delta)).sum() / len(prepared)
-                data_value += float(term.detach())
-                if backward:
-                    term.backward(retain_graph=True)
-                del prediction, residual, term
-            edge, rotation = structural_losses(
-                geometry, field, length_scale=length, amplitude_scale=amplitude,
-                rotation_length_fraction=settings.rotation_length_fraction,
-            )
-            regularizer = settings.deformation_weight * edge + settings.rotation_weight * rotation
-            prior_value = 0.0
-            if field.residual_field is not None:
-                residual = field.residual_field[geometry.residual_mask] / amplitude
-                prior = (residual.abs().square().sum(dim=-1).mean() if len(residual)
-                         else field.residual_field.real.sum() * 0.0)
-                regularizer = regularizer + geometry.residual_prior_weight * prior
-                prior_value = float(prior.detach())
-            if backward:
-                regularizer.backward()
-            edge_value, rotation_value = float(edge.detach()), float(rotation.detach())
-            total = (data_value + settings.deformation_weight * edge_value + settings.rotation_weight * rotation_value
-                     + geometry.residual_prior_weight * prior_value)
-            if not math.isfinite(total):
-                raise FloatingPointError("Non-finite neural field objective")
-            result = {"loss": total, "data_loss": data_value, "edge_loss": edge_value,
-                      "rotation_loss": rotation_value}
-            if field.residual_field is not None:
-                result["neighbor_prior_loss"] = prior_value
-            return result
-
-    def snapshot(losses: Mapping[str, float], status: str) -> dict[str, Any]:
+    def snapshot(losses: Mapping[str, Any], status: str) -> dict[str, Any]:
         return _cpu_snapshot({
             "version": 1, "step": step, "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(), "best_model_state": best_state,
@@ -657,14 +761,16 @@ def train_single_frequency(
 
     while True:
         can_update = step < settings.max_iterations
-        losses = objective(backward=can_update)
+        optimizer.zero_grad(set_to_none=True)
+        losses = _objective(model, geometry, prepared, scales, settings, runtime,
+                            length=length, amplitude=amplitude, backward=can_update)
         if not already_recorded:
             improvement = best_loss - losses["loss"]
             significant = (not math.isfinite(best_loss)
                            or improvement > settings.relative_tolerance * max(abs(best_loss), 1.0e-12))
             if losses["loss"] < best_loss:
                 best_loss, best_step = losses["loss"], step
-                best_state = _cpu_snapshot(model.state_dict())
+                best_state = _device_model_snapshot(model.state_dict(), points.device)
             stale_steps = 0 if significant else stale_steps + 1
             history.append({"step": step, **losses})
         already_recorded = False
@@ -688,7 +794,8 @@ def train_single_frequency(
     model.load_state_dict(best_state)
     model.eval()
     with torch.no_grad():
-        field = model_field(model, geometry, length_scale=length, amplitude_scale=amplitude)
+        field = model_field(model, geometry, length_scale=length, amplitude_scale=amplitude, runtime=runtime)
+    best_state = _cpu_snapshot(latest_state["best_model_state"])
     return TrainingResult(field.field, field.rotation, field.control_displacement,
                           field.control_rotation, best_state, latest_state, history,
                           step, best_step, best_loss, converged)

@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import shutil
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -639,7 +640,7 @@ def _identity_payload(
 def load_observation_topology(path: str | Path) -> ObservationTopologyArtifact:
     """Load and fully validate one compact topology artifact directory."""
 
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest_path = root / "manifest.json"
     arrays_path = root / ARRAY_FILENAME
     if not manifest_path.is_file() or not arrays_path.is_file():
@@ -757,13 +758,13 @@ def build_observation_topology_artifact(
     labels = [view.label.strip() for view in views]
     if any(not label for label in labels) or len(set(labels)) != len(labels):
         raise ValueError("Topology view labels must be non-empty and unique")
-    destination = Path(output_dir).expanduser().resolve()
+    destination = resolve_path(output_dir)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"Topology output already exists: {destination}")
     if not torch.cuda.is_available():
         raise RuntimeError("Topology construction requires CUDA foreground rendering")
     device = torch.device("cuda")
-    scene_path = Path(scene_dir).expanduser().resolve(strict=True)
+    scene_path = resolve_path(scene_dir, strict=True)
     scene = load_static_scene(scene_path, device)
     if scene.manifest is None:
         raise ValueError("Static scene has no manifest")
@@ -786,7 +787,7 @@ def build_observation_topology_artifact(
         for label, view in zip(labels, views):
             camera = reference_cameras[label]
             flow_artifact = load_flow_analysis_artifact(
-                Path(view.flow_artifact).expanduser().resolve(strict=True)
+                resolve_path(view.flow_artifact, strict=True)
             )
             mask = np.asarray(flow_artifact.arrays.mask_union, dtype=bool)
             if mask.shape != (camera.height, camera.width):

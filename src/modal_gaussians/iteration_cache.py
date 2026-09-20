@@ -14,6 +14,7 @@ import os
 import shutil
 from functools import lru_cache
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import tempfile
 import time
 from typing import Any, Callable
@@ -70,7 +71,20 @@ def atomic_json(path: Path, value: Any) -> None:
         json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
         stream.write("\n")
         temporary = Path(stream.name)
-    os.replace(temporary, path)
+    try:
+        # Windows readers/scanners can briefly prevent replacing a complete file.
+        delays = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
+        for attempt in range(len(delays) + 1):
+            try:
+                os.replace(temporary, path)
+                return
+            except OSError as error:
+                if (os.name != "nt" or getattr(error, "winerror", None) not in {5, 32, 33}
+                        or attempt == len(delays)):
+                    raise
+                time.sleep(delays[attempt])
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @lru_cache(maxsize=256)
@@ -146,7 +160,7 @@ class Timings:
 
 
 def load_entry(root: Path, contract: dict[str, Any], *, validate: bool = False) -> dict[str, np.ndarray] | None:
-    path = root / identity(contract)
+    path = resolve_path(root / identity(contract))
     if not path.exists():
         return None
     if path.is_symlink() or not (path / "manifest.json").is_file():
@@ -163,8 +177,9 @@ def load_entry(root: Path, contract: dict[str, Any], *, validate: bool = False) 
 
 
 def put_entry(root: Path, contract: dict[str, Any], arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    destination = resolve_path(root / identity(contract))
+    root = destination.parent
     root.mkdir(parents=True, exist_ok=True)
-    destination = root / identity(contract)
     if destination.exists():
         return load_entry(root, contract)  # type: ignore[return-value]
     temporary = Path(tempfile.mkdtemp(prefix=".writing-", dir=root))
@@ -195,4 +210,5 @@ def cached(root: Path, contract: dict[str, Any], build: Callable[[], dict[str, n
         if arrays is None:
             arrays = put_entry(root, contract, build())
     timer.records[-1]["cache_hit"] = hit
+    timer.records[-1]["cache_path"] = str(resolve_path(root / identity(contract)))
     return arrays

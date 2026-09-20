@@ -5,7 +5,7 @@ import math
 import numpy as np
 from scipy.sparse import coo_matrix
 
-from .geometry_graph import build_control_graph
+from .geometry_graph import ControlGraph, build_control_graph
 from ..common.point_transfer import assign_points
 
 VERSION = 16
@@ -66,18 +66,10 @@ def observation_inputs(points, cameras, depths, alphas, tolerances, alpha_minimu
     return {"u_surface_visible": data["h_surface_visible"]}
 
 
-def build_component_controls(graph, *, geometry_config, fragment_config, scene_scale, attachment_inputs):
+def build_component_geometry(graph, *, geometry_config, fragment_config, scene_scale):
+    """Frequency-independent host eligibility, control layout and geometric support."""
     from ..common.graph_ops import host_subgraph
     settings = ComponentFieldConfig.from_dict(fragment_config)
-    observed = attachment_inputs["observation_view_mask"]
-    mass = attachment_inputs["contribution_mass"]
-    visible = attachment_inputs["u_surface_visible"]
-    G, C = len(graph.points), len(graph.component_size)
-    if (observed.dtype != np.bool_ or observed.ndim != 3 or observed.shape[1] != G
-            or observed.shape[0] == 0 or observed.shape[2] == 0
-            or visible.dtype != np.bool_ or visible.shape != observed.shape[1:]
-            or mass.shape != visible.shape or not np.isfinite(mass).all() or np.any(mass < 0)):
-        raise ValueError("Component field frozen observation domains/values differ")
     component, sizes = graph.component_index, graph.component_size
     eligible = sizes >= settings.min_learning_nodes
     # Static control ordering is independent of frequency selection and donor
@@ -91,13 +83,37 @@ def build_component_controls(graph, *, geometry_config, fragment_config, scene_s
     controls = build_control_graph(host_graph, config=sampling_config, scene_scale=scene_scale)
     # Count controls at the configured coverage radius before removing whole
     # components. Rejected controls must not be inputs to the final network.
-    control_count = np.bincount(component[hosts[controls.control_point_index]], minlength=C).astype(np.int64)
+    control_count = np.bincount(component[hosts[controls.control_point_index]], minlength=len(sizes)).astype(np.int64)
     if settings.min_learning_controls > 1:
         eligible &= control_count >= settings.min_learning_controls
         hosts = np.flatnonzero(eligible[component]).astype(np.int64)
         if not len(hosts):
             raise ValueError("Component field has no component meeting min_learning_nodes/min_learning_controls")
         controls = build_control_graph(host_subgraph(graph, hosts), config=geometry_config, scene_scale=scene_scale)
+    return {**{"c_" + k: v for k, v in controls.as_dict().items()},
+            "u_control_count": control_count, "f_candidate_component_mask": ~eligible,
+            "t_host_gaussian_index": hosts}
+
+
+def build_component_controls(graph, *, geometry_config, fragment_config, scene_scale, attachment_inputs,
+                             geometry_arrays=None):
+    settings = ComponentFieldConfig.from_dict(fragment_config)
+    observed = attachment_inputs["observation_view_mask"]
+    mass = attachment_inputs["contribution_mass"]
+    visible = attachment_inputs["u_surface_visible"]
+    G, C = len(graph.points), len(graph.component_size)
+    if (observed.dtype != np.bool_ or observed.ndim != 3 or observed.shape[1] != G
+            or observed.shape[0] == 0 or observed.shape[2] == 0
+            or visible.dtype != np.bool_ or visible.shape != observed.shape[1:]
+            or mass.shape != visible.shape or not np.isfinite(mass).all() or np.any(mass < 0)):
+        raise ValueError("Component field frozen observation domains/values differ")
+    geometry = (build_component_geometry(graph, geometry_config=geometry_config,
+        fragment_config=fragment_config, scene_scale=scene_scale) if geometry_arrays is None else geometry_arrays)
+    controls = ControlGraph.from_dict({k[2:]: v for k, v in geometry.items() if k.startswith("c_")})
+    hosts = geometry["t_host_gaussian_index"]
+    control_count = geometry["u_control_count"]
+    eligible = ~geometry["f_candidate_component_mask"]
+    component, sizes = graph.component_index, graph.component_size
     rows = np.repeat(hosts, np.diff(controls.interpolation_indptr))
     N = coo_matrix((controls.interpolation_weights, (rows, controls.interpolation_indices)),
                    shape=(G, len(controls.positions))).tocsr()

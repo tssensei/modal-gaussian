@@ -1,12 +1,21 @@
 # Current neural motion baseline
 
+Storage update (2026-09-19): the accepted results below now have physical entries
+in `scene_library/corn/experiments/baseline_0225` and
+`scene_library/bush/experiments/baseline_0744`. Their models, prepared inputs,
+graphs and dependencies have also moved into the corresponding scene library.
+Historical paths in this document remain identity-preserving aliases through
+`registry.json`. Use `modal-gaussians storage list --scene corn|bush` and
+[SCENE_STORAGE.md](SCENE_STORAGE.md) before creating new experiments.
+
 On **2026-09-18**, the user accepted the **Corn 0.225 Hz** result below as the
 new baseline, following visual acceptance of the matching **Bush 0.744 Hz**
 recipe. Both use SEA-RAFT modal images, soft graph weights with fixed control
 sampling, **Gaussian rigidity 0.03**, and **control-rotation loss 0**.
-The earlier hard-cut Bush result is retained as a historical comparison.
+The earlier hard-cut Bush result is historical; its superseded experiment was
+removed during the user-authorized 2026-09-19 storage cleanup.
 
-## Next direction: multiple frequencies (decision, not implemented)
+## Multiple frequencies: shared geometry, independent weights
 
 On 2026-09-18, the user chose **shared topology with per-frequency weights**
 as the first approach on branch `multiple-frequency`.
@@ -14,10 +23,15 @@ For the same scene, share KNN candidates, geometric lengths, control placement,
 owners and geometric interpolation supports. Derive each frequency's soft edge
 weights from its own modal images, with corresponding control-graph weights
 and interpolation attenuation. Reuse geometric construction rather than building
-a complete independent KNN graph for every frequency. Cross-frequency fusion
-into one shared weight set is deferred. This records a direction only; no
-implementation or experiment is requested yet, and the accepted baseline below
-remains unchanged.
+a complete independent KNN graph for every frequency. This reuse is implemented
+for prepared component-field training as of 2026-09-19. `control_geometry` caches
+hosts, control placement/adjacency, owners, support indices and material distances;
+`control_weights` caches frequency-dependent control weights and interpolation.
+Observation-dependent donor roles remain separate. Use `motion prepare-shared-controls`
+to import a compatible existing v16 control layout instead of resampling it.
+Old artifacts lack per-support material distances, so these are computed once.
+Per-frequency graph files and mode artifacts remain separate; cross-frequency
+fusion into one weight set is deferred. The accepted baseline below is unchanged.
 
 ## Accepted Corn and Bush results
 
@@ -38,6 +52,12 @@ preparation. Corn uses two views and Bush uses three. Their frozen normalization
 view alignment and reference geometry remain scene-specific.
 
 ## Default experiment recipe
+
+On 2026-09-19, the user raised the default GNN iteration cap to **5,000 total
+updates per frequency**, retaining patience 50 and relative tolerance `1e-6`.
+Continue compatible existing checkpoints, including optimizer/RNG/early-stop
+state, into new experiments; train from initialization when continuation is
+unavailable. Previously accepted artifacts keep their frozen configurations.
 
 For new frequency work, use SEA-RAFT reference-to-frame flow, one shared-grid FFT
 cache across views, and `spectrum export` to copy selected complex U/V slices for

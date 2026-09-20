@@ -10,6 +10,15 @@ configuration and launch commands are recorded in [BASELINE.md](BASELINE.md).
 Earlier preparation and research recipes are archived in
 [docs/legacy/pipeline.md](docs/legacy/pipeline.md); they are not the default workflow.
 
+## Scene-owned storage
+
+Current reusable Bush/Corn data now lives in `scene_library/`. Before a new
+experiment, run `modal-gaussians storage list --scene bush` (or `corn`).
+See [SCENE_STORAGE.md](SCENE_STORAGE.md) for the directory layout, cache reuse,
+accepted-result lookup and classification of old outputs. Existing historical
+paths below remain provenance aliases; new outputs belong under the scene's
+`experiments/` directory.
+
 ## Environment
 
 From the repository root:
@@ -95,6 +104,22 @@ modal-gaussians spectrum export --input outputs\corn_spectrum_001 --selection PA
 Export copies cached slices directly. It never reruns FFT/DFT, estimates a nearby
 frequency, or silently falls back to the old pipeline.
 
+For explicitly requested selection comparisons, `spectrum select` saves a list
+without copying the full-resolution fields. Uniform selection covers `(0, Nyquist]`;
+greedy selection uses existing topology pixels and the original equal-view flow
+reconstruction R² objective, with paired real/imaginary cached modal columns.
+It reads SEA-RAFT targets but never recomputes DFT. Greedy order and prefix gains
+are retained in `selection.json` and `report.json`:
+
+```bat
+modal-gaussians spectrum select --input outputs\bush_spectrum_001 --method uniform --count 60 --output outputs\bush_spectrum_uniform60_001
+modal-gaussians spectrum select --input outputs\bush_spectrum_001 --method greedy --count 60 --topology outputs\bush_neural_dense_controls_001\topology --output outputs\bush_spectrum_greedy60_001
+```
+
+For scenes without a manual 3D box, `spectrum build` accepts repeated
+`--region LABEL BOOL_NPY` instead of `--scene`. These regions affect curves only;
+the FFT cache still includes every pixel. The GUI remains manual, without snapping.
+
 ## 4. Prepare and train selected modes
 
 For each exported frequency, pass its per-view directories to
@@ -132,9 +157,103 @@ launch it separately with `modal-gaussians viewer --preview ... --work-dir ...`.
 Ordinary mode generation does not fit per-frame coefficients, train a video
 reconstruction, start Viser or run experiment validation.
 
-Shared topology with per-frequency weights is the recorded next direction;
-complete multi-frequency graph reuse is not yet implemented. Current graph
-artifacts and their modal inputs must still match the requested frequency.
+Prepared component-field training shares control layout, adjacency, owners and
+material support distances across frequencies. Control edge weights and soft
+interpolation attenuation have a separate cache; modal graph artifacts and inputs
+must still match each frequency. To reuse controls from an existing compatible
+v16 result, run `motion prepare-shared-controls --prepared ... --geometry-graph
+PATH_TO_UNFILTERED_KNN_CACHE --controls-from COMPLETED_MODES --config
+configs/neural_component_field.json` once. Subsequent training uses this cache
+automatically. This imports the layout and fills missing support distances without
+rebuilding KNN, resampling controls or replaying a network. See the
+[command reference](skills/modal-gaussians-pipeline/references/commands.md).
+`--controls-from` also accepts an existing compatible `control_geometry` cache;
+its saved support distances are imported directly, without recomputation.
+
+For multiple exported frequencies, `motion batch-neural --modal-images EXPORT
+--prepared PARENT --geometry-graph KNN_CACHE --config CONFIG --output RUN_ROOT
+--cpu-workers 3 --gpu-workers 2` maintains separate preparation and training queues.
+CPU workers prepare observations, graph weights and the existing soft-propagation
+cache; GPU workers consume published caches through the same training command.
+CPU preparation of later frequencies can overlap GPU optimization. Each CPU worker
+defaults to two library threads and four separate soft-propagation
+processes (`--propagation-workers 4`). Control-source searches use the same exact
+shortest paths and fixed supports, with results placed at their original indices.
+Budget the product of CPU workers and propagation workers against CPU/RAM.
+Single-frequency calls can opt in with `MODAL_GAUSSIANS_PROPAGATION_WORKERS=4`.
+`batch_state.json` records progress, active CPU/GPU counts and the ready queue;
+`gpu_usage.csv` samples GPU resources every five seconds. Edit `batch_workers.json`
+atomically to change `cpu_workers` and `gpu_workers` independently (0–8 each).
+Zero pauses new launches in that queue while active processes finish.
+An optional positive `propagation_workers` in the same file overrides the CPU
+pool size for subsequently started soft-propagation stages; existing pools keep
+their size until completion. This can also update an already-running scheduler's
+new CPU children without restarting training.
+Failures stop further launches, preserving logs/checkpoints.
+Re-running the same command resumes matching work and skips published modes.
+New runs default to 5,000 total updates per frequency, retaining patience 50 and
+relative tolerance `1e-6`. To raise a stopped batch's cap, use a fresh output with
+`--continue-from OLD_BATCH` and the larger-cap config. This reuses published
+prepared inputs/graphs and continues each compatible checkpoint with its optimizer,
+RNG and early-stop state. Already-converged modes retain their learned result;
+missing or incompatible checkpoints start from initialization with an explicit log.
+Only the iteration cap may change. Parent artifacts are preserved. The same
+`--continue-from OLD_EXPERIMENT` option is available on `motion iterate-neural`.
+The initial batch needs a fresh experiment directory name (default
+`experiment_shared_001`); use `--experiment-name` to preserve older attempts.
+After a code change, use a new output directory and `--resume-from OLD_BATCH` to
+carry completed frequencies with matching inputs/configuration. The source batch
+must be stopped. Old mode identities/files remain unchanged; each state's
+`result_dir` points to its actual experiment. Unfinished frequencies start under
+the new code, while repeated launches of that new batch resume its checkpoints.
+
+## 5. Experimental fixed-mode RGB coefficients
+
+`coordinates fit-rgb` fits independent complex coefficients for every frame of
+each recording. It freezes the static scene, appearance, cameras, displacement
+modes and rotation modes. Initialization uses the existing direct-coordinate
+artifact: subtract its reference coefficient, fit a common RGB pose offset,
+then optimize all modes jointly per frame. The objective is full-image
+`0.8 L1 + 0.2 (1 - SSIM)` plus a weak, decaying anchor in the direct solver's
+pair-normalized units. There is no zero-mean or temporal/oscillator constraint.
+
+```bat
+modal-gaussians storage run --scene bush -- coordinates fit-rgb --scene @static --modes @experiments/coefficient40_rgb_001/mode_bank --input @experiments/coefficient40_rgb_001/direct_coordinates --config configs/rgb_coordinates.json --output @experiments/coefficient40_rgb_001/rgb_coordinates
+modal-gaussians storage run --scene bush -- result materialize --scene @static --modes @experiments/coefficient40_rgb_001/mode_bank --coordinates @experiments/coefficient40_rgb_001/rgb_coordinates --output @experiments/coefficient40_rgb_001/result
+```
+
+RGBs are discovered from the direct artifact's recorded image directory, using
+the stabilized images when applicable. `--images LABEL DIRECTORY` overrides
+one view explicitly; frames must retain the recorded PNG names, dimensions and
+camera geometry. Gaussian centers and orientations both follow the fixed
+complex modes. Isotropic image pyramids preserve the camera distortion model.
+The JSON config controls scales, epochs, learning rates, anchor weights and
+batch size. Defaults are an initial experiment budget, not a quality guarantee.
+
+Add `--view view2` to `coordinates fit-rgb` to fit only that recording using the
+existing shared inputs. The output contains only its coefficients and can be
+materialized and exported normally. Omit `--view` to fit all recordings.
+
+Outputs contain only coefficients, source identities, image checksums and
+training-loss history; fitting does not launch a Viewer or compute evaluation
+metrics. Use a new output directory. For separate single-frequency results,
+`coordinates prepare --scene bush --expected-modes 40 --output ...` collects
+indexed fixed modes, creates a rendered design, and initializes coefficients
+from saved SEA-RAFT flow. It never starts RGB fitting or resumes mode training.
+See [COEFFICIENT_FITTING.md](COEFFICIENT_FITTING.md) for the exact scene-library
+storage layout, stage reuse, commands and supported Viewer features.
+
+`result export-video --result ... --view view1 --output ...` explicitly exports
+one RGB-fitted recording as `comparison.mp4`: original fitting frames above,
+reconstruction below, at recorded resolution and FPS. It uses a new directory
+and never runs automatically after fitting. See the offline export command in
+[COEFFICIENT_FITTING.md](COEFFICIENT_FITTING.md).
+
+Synthetic CPU checks (no scene data or GPU needed):
+
+```bat
+python -m unittest discover -s tests -p "test_coefficient_rgb_*.py"
+```
 
 ## Compatibility and execution policy
 

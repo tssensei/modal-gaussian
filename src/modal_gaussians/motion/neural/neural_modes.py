@@ -14,6 +14,7 @@ import json
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import shutil
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -235,7 +236,7 @@ def _load_sources(*, scene_dir: str | Path, topology_dir: str | Path,
             if view[name] != expected[name]:
                 raise ValueError(f"Neural dense modal view {name} differs")
     source.update(
-        static_scene=str(Path(scene_dir).expanduser().resolve()),
+        static_scene=str(resolve_path(scene_dir)),
         alignment_from=str(alignment.path), alignment_identity=alignment.manifest["rigid_modes_identity"],
         complex_2d_modes=str(dense.path), complex_2d_modes_identity=dense.manifest["complex_2d_modes_identity"],
     )
@@ -690,7 +691,7 @@ def _prepare_work(work: Path, destination: Path, source: Mapping[str, Any],
     if work == destination or work.is_relative_to(destination) or destination.is_relative_to(work):
         raise ValueError("Neural work and output directories must be disjoint")
     for name in ("static_scene", "topology", "measurements", "observed_structure_graph", "alignment_from", "complex_2d_modes"):
-        parent = Path(source[name]).resolve()
+        parent = resolve_path(source[name])
         if work == parent or work.is_relative_to(parent) or destination == parent or destination.is_relative_to(parent):
             raise ValueError("Neural work/output must not modify an input artifact")
     manifest_path = work / "manifest.json"
@@ -833,8 +834,8 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
         raise ValueError("Specify either a prefix count or source mode slots")
     if mode_slots is None and (type(count) is not int or count <= 0):
         raise ValueError("Neural prefix count must be a positive integer")
-    work = Path(work_dir).expanduser().resolve(strict=True)
-    destination = Path(output_dir).expanduser().resolve()
+    work = resolve_path(work_dir, strict=True)
+    destination = resolve_path(output_dir)
     if not work.is_dir() or work.is_symlink():
         raise ValueError("Neural prefix work path must be a normal directory")
     if destination.exists() or destination.is_symlink():
@@ -848,7 +849,7 @@ def export_neural_prefix_artifact(*, scene_dir: str | Path, topology_dir: str | 
         graph_dir=graph_dir, alignment_from=alignment_from,
     )
     for name in ("static_scene", "topology", "measurements", "observed_structure_graph", "alignment_from", "complex_2d_modes"):
-        parent = Path(source[name]).resolve()
+        parent = resolve_path(source[name])
         if (destination == parent or destination.is_relative_to(parent) or parent.is_relative_to(destination)
                 or work == parent or work.is_relative_to(parent) or parent.is_relative_to(work)):
             raise ValueError("Neural prefix work/output must be disjoint from input artifacts")
@@ -910,7 +911,7 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
                                output_dir: str | Path, config: NeuralModesConfig | None = None,
                                resume: bool = False, command: Sequence[str] = (),
                                prepared_inputs: Any = None, timings: Any = None,
-                               mode_slots: Sequence[int] | None = None) -> NeuralModesArtifact:
+                               mode_slots: Sequence[int] | None = None, continuation=None) -> NeuralModesArtifact:
     """Train on explicit invocation only; bake the full field using the selected strategy."""
     from modal_gaussians.motion.neural.geometry_graph import (
         build_geometry_graph_arrays,
@@ -927,8 +928,8 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
     from modal_gaussians.iteration_cache import Timings
     timings = timings or Timings()
     settings.validate()
-    destination = Path(output_dir).expanduser().resolve()
-    work = Path(work_dir).expanduser().resolve()
+    destination = resolve_path(output_dir)
+    work = resolve_path(work_dir)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"Neural output already exists: {destination}")
     if settings.device == "cpu" or not torch.cuda.is_available():
@@ -940,7 +941,7 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         source = dict(prepared_inputs.source)
         scene = load_static_scene(scene_dir, "cpu")
         old_graph = SimpleNamespace(manifest=json.loads(
-            (Path(graph_dir) / "manifest.json").read_text(encoding="utf-8")))
+            (resolve_path(graph_dir) / "manifest.json").read_text(encoding="utf-8")))
     else:
         source, scene, _, _, old_graph, alignment, dense = _load_sources(
             scene_dir=scene_dir, topology_dir=topology_dir, measurements_dir=measurements_dir,
@@ -956,9 +957,13 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         _prepare_work(work, destination, source, previous_contract, resume=True)
     report_progress("neural modes: freezing full-foreground observation renderer")
     if prepared_inputs is not None:
+        if continuation is not None and frozen is None:
+            from .continuation import frozen_inputs
+            frozen = frozen_inputs(continuation, _source_identity(source), settings.to_dict(), runtime)
         arrays, projectors, cameras, depths, alpha_images = prepared_inputs.training_inputs(
-            source, scene, old_graph, settings, device, timings)
-        if frozen is not None and _arrays_identity(arrays) != _arrays_identity(frozen):
+            source, scene, old_graph, settings, device, timings,
+            **({"frozen_arrays": frozen} if continuation is not None and frozen is not None else {}))
+        if frozen is not None and arrays is not frozen and _arrays_identity(arrays) != _arrays_identity(frozen):
             raise ValueError("Prepared fixed inputs differ from resumed work")
         frozen = arrays
     else:
@@ -1029,7 +1034,9 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
         geometry_metadata["control_sampling_distance"] = "original_geometry_graph_shortest_path"
         geometry_metadata["interpolation_attenuation"] = "geometric_distance_over_propagation_distance_then_row_normalize"
     if getattr(prepared_inputs, "external_geometry_contract", None) is not None:
-        geometry_metadata.update(policy="saved_modal_graph_with_rebuilt_controls",
+        shared_controls = (settings.training_fragment_config or {}).get("strategy") == "component_field"
+        geometry_metadata.update(policy=("saved_modal_graph_with_shared_control_geometry" if shared_controls
+                                         else "saved_modal_graph_with_rebuilt_controls"),
                                  external_graph=prepared_inputs.external_geometry_contract)
         geometry_metadata["config"]["edge_filter"] = prepared_inputs.external_geometry_contract["config"]["graph_edge_filter"]
     if settings.training_fragment_config is not None:
@@ -1043,6 +1050,11 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
     run_contract = {"format": "modal_gaussians.neural_modes_work", "version": 1,
                     "source_identity": _source_identity(source), "config": settings.to_dict(), "runtime": runtime,
                     "geometry_graph": geometry_metadata, "fixed_arrays_identity": _arrays_identity(arrays)}
+    parent_work = None
+    if continuation is not None:
+        from .continuation import bind_work
+        parent_work = bind_work(continuation, run_contract)
+        run_contract["continuation"] = continuation
     run_identity = _identity(run_contract)
     run_contract["run_identity"] = run_identity
     _prepare_work(work, destination, source, run_contract, resume)
@@ -1066,6 +1078,11 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
             payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
             if payload.get("run_identity") != run_identity or payload.get("mode") != mode:
                 raise ValueError("Neural checkpoint mode or run identity differs")
+        elif parent_work is not None:
+            from .continuation import checkpoint as parent_checkpoint
+            payload = parent_checkpoint(parent_work, mode, continuation["run_identity"], run_identity)
+            if payload is not None:
+                _atomic_torch(checkpoint, payload)
         field_config = _field_config(settings, mode)
         if payload is not None and payload.get("complete") is True:
             state = payload["best_model_state"]
@@ -1092,6 +1109,7 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
                 report_progress(f"neural mode {mode + 1}/{mode_count}: step {step}")
 
             report_progress(f"neural mode {mode + 1}/{mode_count}: fitting {source['modes'][mode]['frequency_hz']:.6g} Hz")
+            start_step = 0 if payload is None else int(payload["trainer_state"]["step"])
             with timings.stage("network_optimization", mode=mode):
                 fitted = train_single_frequency(
                     geometry, observations, length_scale=float(arrays["scene_scale"]),
@@ -1099,6 +1117,9 @@ def build_neural_modes_artifact(*, scene_dir: str | Path, topology_dir: str | Pa
                     resume_state=None if payload is None else payload["trainer_state"], checkpoint_callback=save_checkpoint,
                 )
             timings.records[-1]["iterations"] = fitted.iterations
+            updates = fitted.iterations - start_step
+            timings.records[-1].update(start_step=start_step, updates_performed=updates,
+                mean_seconds_per_update=timings.records[-1]["seconds"] / updates if updates else None)
             state = fitted.best_model_state
             summary = {"mode_slot": mode, "iterations": fitted.iterations, "best_step": fitted.best_step,
                        "best_loss": fitted.best_loss, "converged": fitted.converged, "history": fitted.history}

@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import re
 import shutil
 import tempfile
@@ -27,7 +28,7 @@ REGIONS = ("selected_box", "full_frame")
 
 
 def _json(path):
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    return json.loads(resolve_path(path).read_text(encoding="utf-8"))
 
 
 @dataclass
@@ -53,7 +54,7 @@ def _file(cache, relative):
 
 def load_spectrum(path):
     """Open only metadata and the small frequency table, never scan numerical data."""
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest = _json(root / "manifest.json")
     if (manifest.get("format") != FORMAT or manifest.get("version") != 1
             or manifest.get("status") != "complete"):
@@ -123,7 +124,7 @@ def read_curves(cache, view_index):
 
 
 def _source(path):
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     source = _json(root / "manifest.json")
     if (source.get("format") not in ("modal_gaussians.sea_raft_flow",
                                    "modal_gaussians.sea_raft_selected_frequency_experiment")
@@ -147,7 +148,7 @@ def _scene_regions(scene_dir, sources):
     from modal_gaussians.static import cameras_from_scene_manifest
     from modal_gaussians.subject_selection import projected_box_pixels
 
-    root = Path(scene_dir).expanduser().resolve(strict=True)
+    root = resolve_path(scene_dir, strict=True)
     scene = _json(root / "manifest.json")
     partition = scene.get("partition", {})
     if (partition.get("method") != "manual_subject_selection_v1"
@@ -172,7 +173,7 @@ def _scene_regions(scene_dir, sources):
                      "box": [value.tolist() for value in box]}
 
 
-def build_spectrum(*, views, scene_dir, fft_length, output_dir):
+def build_spectrum(*, views, scene_dir=None, fft_length, output_dir, region_paths=None):
     """Compute every view once and atomically publish a common-frequency cache."""
     started = time.perf_counter()
     if (not views or len({label for label, _ in views}) != len(views)
@@ -185,12 +186,29 @@ def build_spectrum(*, views, scene_dir, fft_length, output_dir):
     if (isinstance(fft_length, bool) or not isinstance(fft_length, int)
             or fft_length < max(len(source["frames"]) for _, _, source in sources)):
         raise ValueError("FFT length must cover every source sequence without truncation")
-    regions, scene_record = _scene_regions(scene_dir, sources)
+    if region_paths is None:
+        if scene_dir is None:
+            raise ValueError("Provide a subject scene or per-view analysis regions")
+        regions, scene_record = _scene_regions(scene_dir, sources)
+    else:
+        import hashlib
+        if scene_dir is not None or len(region_paths) != len(sources) or dict(region_paths).keys() != {v[0] for v in sources}:
+            raise ValueError("Provide exactly one analysis region per view, without --scene")
+        regions, records = [], []
+        for label, _, source in sources:
+            path = Path(dict(region_paths)[label]).resolve()
+            region = np.load(path, allow_pickle=False)
+            if region.dtype != bool or list(region.shape) != source["flow_shape"][1:3] or not region.any():
+                raise ValueError(f"Invalid analysis region: {path}")
+            regions.append(region)
+            records.append({"label": label, "path": str(path),
+                            "sha256": hashlib.sha256(region.tobytes()).hexdigest()})
+        scene_record = {"analysis_regions": records, "cache_clipped": False}
     contract = {"implementation": "shared_zero_padded_rfft_v1", "fft_length": fft_length,
                 "fps_hz": fps, "transform": TRANSFORM_CONVENTION, "scene": scene_record,
                 "views": [{"label": label, "path": str(path), "source_identity": identity(source)}
                           for label, path, source in sources]}
-    destination = Path(output_dir).expanduser().resolve()
+    destination = resolve_path(output_dir)
     if destination.exists():
         cached = load_spectrum(destination)
         if cached.manifest.get("contract") != contract:
@@ -237,7 +255,7 @@ def build_spectrum(*, views, scene_dir, fft_length, output_dir):
             sums["selected_box"] /= int(region.sum())
             np.savez(folder / "curves.npz", **sums)
             np.save(folder / "region.npy", region, allow_pickle=False)
-            shutil.copyfile(source["reference_image"], folder / "reference.png")
+            shutil.copyfile(resolve_path(source["reference_image"]), folder / "reference.png")
             record = {"label": label, "shape_hw": [height, width], "source_path": str(source_path),
                       "source_manifest": source, "reference_image": (relative / "reference.png").as_posix(),
                       "spectrum_file": (relative / "spectrum.zarr").as_posix(),
@@ -257,11 +275,13 @@ def build_spectrum(*, views, scene_dir, fft_length, output_dir):
     return SpectrumCache(destination, manifest, frequencies)
 
 
-def save_selection(cache, bins, destination):
-    selected = sorted({_index(value, len(cache.frequencies), "frequency bin") for value in bins})
+def save_selection(cache, bins, destination, *, preserve_order=False):
+    selected = list(dict.fromkeys(_index(value, len(cache.frequencies), "frequency bin") for value in bins))
+    if not preserve_order:
+        selected.sort()
     if 0 in selected:
         raise ValueError("DC can be inspected but cannot be selected for training")
-    output = Path(destination).expanduser().resolve()
+    output = resolve_path(destination)
     if output.exists():
         raise FileExistsError(output)
     atomic_json(output, {"format": SELECTION_FORMAT, "version": 1,
@@ -285,7 +305,7 @@ def export_selection(cache, selection_path, output_dir):
     frequencies = [float(cache.frequencies[k]) for k in selected]
     if selection.get("frequencies_hz") != frequencies:
         raise ValueError("Selection frequencies differ from cached bin frequencies")
-    output = Path(output_dir).expanduser().resolve()
+    output = resolve_path(output_dir)
     if output.exists():
         raise FileExistsError(output)
     output.parent.mkdir(parents=True, exist_ok=True)

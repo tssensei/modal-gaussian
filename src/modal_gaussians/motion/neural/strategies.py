@@ -41,12 +41,16 @@ def array_names(config):
     return strategy_module(config).ARRAY_NAMES
 
 
-def build_training_controls(graph, *, geometry_config, fragment_config, scene_scale, attachment_inputs=None):
+def build_training_controls(graph, *, geometry_config, fragment_config, scene_scale, attachment_inputs=None,
+                            geometry_arrays=None):
     module = strategy_module(fragment_config)
     name = fragment_config.get("strategy")
     builder = "build_component_controls" if name == "component_field" else _LEGACY[name][2]
+    if geometry_arrays is not None and name != "component_field":
+        raise ValueError("Shared control geometry is only supported by component_field")
     return getattr(module, builder)(graph, geometry_config=geometry_config,
-        fragment_config=fragment_config, scene_scale=scene_scale, attachment_inputs=attachment_inputs)
+        fragment_config=fragment_config, scene_scale=scene_scale, attachment_inputs=attachment_inputs,
+        **({"geometry_arrays": geometry_arrays} if name == "component_field" else {}))
 
 
 def _array_strategy(arrays):

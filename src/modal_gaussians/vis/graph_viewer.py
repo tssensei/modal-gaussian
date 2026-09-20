@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 
 import numpy as np
 import torch
@@ -81,7 +82,7 @@ class GraphViewerData:
         self.device = torch.device(device)
         self.scene = load_static_scene(scene_dir, self.device).eval()
         self.scene.requires_grad_(False)
-        path = Path(graph_dir).expanduser().resolve(strict=True)
+        path = resolve_path(graph_dir, strict=True)
         manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
         self.is_similarity_graph = manifest.get("format") == "modal_gaussians.modal_similarity_graph"
         self.is_soft_graph = self.is_similarity_graph and manifest["config"]["modal_similarity"].get("soft_weights", False)

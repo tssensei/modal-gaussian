@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path, logical_path, scene_cache
 import tempfile
 from typing import Any
 
@@ -48,12 +49,12 @@ class PreparedNeuralInputs:
 
     @property
     def cache_dir(self):
-        return Path(self.manifest["cache_dir"])
+        return scene_cache(self.source, self.manifest["cache_dir"])
 
     def attach_geometry_graph(self, path):
         """Bind a saved experimental graph without rebuilding its candidates."""
         from .geometry_graph import GeometryGraph
-        root = Path(path).expanduser().resolve(strict=True)
+        root = resolve_path(path, strict=True)
         manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
         if (manifest.get("format") not in ("modal_gaussians.modal_similarity_graph", "modal_gaussians.modal_gradient_graph")
                 or manifest.get("version") != 1 or manifest.get("graph_file") != "graph.npz"
@@ -82,7 +83,7 @@ class PreparedNeuralInputs:
             graph = GeometryGraph.from_dict(arrays)
         self.external_geometry_graph = arrays
         self.external_geometry_contract = {
-            "path": str(root), "format": manifest["format"], "manifest_identity": identity(manifest),
+            "path": str(logical_path(root)), "format": manifest["format"], "manifest_identity": identity(manifest),
             "arrays_identity": nm._arrays_identity(arrays), "frequency_hz": manifest["frequency_hz"],
             "config": manifest["config"],
         }
@@ -90,9 +91,9 @@ class PreparedNeuralInputs:
             self.external_geometry_contract["propagation"] = "saved_or_derived_edge_length_over_modal_factor"
 
     def flow(self, path: str | Path) -> FlowAnalysisArtifact:
-        requested = Path(path).expanduser().resolve()
+        requested = resolve_path(path)
         for index, record in enumerate(self.manifest["flows"]):
-            if requested != Path(record["path"]):
+            if requested != resolve_path(record["path"]):
                 continue
             manifest = record["manifest"]
             def meta(name):
@@ -114,13 +115,14 @@ class PreparedNeuralInputs:
             if getattr(config, name) != getattr(baseline, name):
                 raise ValueError(f"Observation setting {name} changed; build a new preparation")
 
-    def training_inputs(self, source, scene, old_graph, config, device, timer):
+    def training_inputs(self, source, scene, old_graph, config, device, timer, *, frozen_arrays=None):
         from modal_gaussians.static import cameras_from_scene_manifest
         from modal_gaussians.motion.neural.geometry_graph import (
             GeometryGraph, build_geometry_graph_arrays, build_control_graph, depth_thresholds_from_manifest,
         )
         self.validate_sources(source, config)
-        arrays = {k[2:]: v.copy() for k, v in self.arrays.items() if k.startswith("o_")}
+        arrays = (frozen_arrays if frozen_arrays is not None else
+                  {k[2:]: v.copy() for k, v in self.arrays.items() if k.startswith("o_")})
         with timer.stage("observation_cache"):
             scene.to(device).eval()
             for parameter in scene.parameters():
@@ -139,6 +141,8 @@ class PreparedNeuralInputs:
                 depths.append(self.arrays[f"v{index}_depth"])
                 alphas.append(self.arrays[f"v{index}_alpha"])
         timer.records[-1]["cache_hit"] = True
+        if frozen_arrays is not None:
+            return arrays, projectors, cameras, depths, alphas
         endpoint, jump = depth_thresholds_from_manifest(old_graph.manifest, [v["label"] for v in source["views"]])
         settings = nm._geometry_config(config)
         from modal_gaussians.motion.neural import geometry_graph as geometry_module
@@ -189,20 +193,26 @@ class PreparedNeuralInputs:
                                          contribution_mass=arrays["contribution_mass"])
                 control_contract["guarded_inputs"] = nm._arrays_identity(attachment_inputs)
             if config.training_fragment_config.get("strategy") == "component_field":
-                from modal_gaussians.motion.neural import component_field
+                from modal_gaussians.motion.neural import component_field, control_propagation, shared_controls
                 attachment_inputs = component_field.observation_inputs(arrays["g_points"], cameras, depths,
                                                                         alphas, endpoint, config.alpha_minimum)
                 attachment_inputs.update(observation_view_mask=arrays["observation_view_mask"],
                                          contribution_mass=arrays["contribution_mass"])
                 control_contract["component_inputs"] = nm._arrays_identity(attachment_inputs)
+                control_contract["shared_control_revision"] = module_revision(shared_controls, control_propagation)
             control_contract.update(implementation="host_controls_with_training_fill_v1",
                 fragment_config=config.training_fragment_config,
                 attachment_code=module_revision(strategies, *strategies.implementation_modules(config.training_fragment_config)))
-            control_arrays = cached(self.cache_dir / "controls", control_contract,
-                lambda: strategies.build_training_controls(graph, geometry_config=settings,
+            def build_controls():
+                geometry_arrays = None
+                if config.training_fragment_config.get("strategy") == "component_field":
+                    geometry_arrays = shared_controls.weighted_geometry(graph, geometry_config=settings,
+                        fragment_config=config.training_fragment_config, scene_scale=float(arrays["scene_scale"]),
+                        cache_dir=self.cache_dir, timer=timer)
+                return strategies.build_training_controls(graph, geometry_config=settings,
                     fragment_config=config.training_fragment_config, scene_scale=float(arrays["scene_scale"]),
-                    attachment_inputs=attachment_inputs),
-                timer, "control_cache")
+                    attachment_inputs=attachment_inputs, geometry_arrays=geometry_arrays)
+            control_arrays = cached(self.cache_dir / "controls", control_contract, build_controls, timer, "control_cache")
             arrays.update(control_arrays)
         else:
             control_arrays = cached(self.cache_dir / "controls", control_contract,
@@ -214,7 +224,7 @@ class PreparedNeuralInputs:
 
 
 def load_prepared(path: str | Path, *, validate: bool = False) -> PreparedNeuralInputs:
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("format") != FORMAT or manifest.get("version") != 1:
         raise ValueError("Unsupported neural preparation")
@@ -249,10 +259,10 @@ def prepare_neural(*, output_dir, cache_dir=DEFAULT_CACHE, from_result=None,
     from .component_field import ComponentFieldConfig
     from modal_gaussians.motion.common.projection import RenderedDesignConfig
     timer = timer or Timings()
-    destination = Path(output_dir).expanduser().resolve()
+    destination = resolve_path(output_dir)
     if destination.exists():
         raise FileExistsError(destination)
-    cache_dir = Path(cache_dir).expanduser().resolve()
+    cache_dir = resolve_path(cache_dir)
     frozen = None
     legacy_controls_requested = (config_overrides or {}).get("training_fragment_config", "default") is None
     with timer.stage("source_validation"):
@@ -314,7 +324,7 @@ def prepare_neural(*, output_dir, cache_dir=DEFAULT_CACHE, from_result=None,
         observed, projectors, _, depths, alpha_images = nm._prepare_observation_arrays(
             scene, source, dense, config, torch.device("cuda"), alignment.arrays["alphas"],
             alignment.arrays["alpha_identifiable_mask"], frozen_arrays=frozen,
-            flow_loader=lambda path: loaded_flows[str(Path(path).resolve())])
+            flow_loader=lambda path: loaded_flows[str(resolve_path(path))])
         for key, value in observed.items():
             if (not key.startswith(("g_", "c_", "t_", "f_", "a_", "p_", "h_", "u_")) or key == "g_points") and key != "support_class":
                 arrays["o_" + key] = value

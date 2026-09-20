@@ -845,6 +845,8 @@ def _load_sources(
     """Load the direct artifact and revalidate its exact design/flow chain."""
 
     direct = load_direct_modal_coordinates(direct_coordinates_dir)
+    if direct.manifest.get("version") != 1:
+        raise ValueError("Legacy physics-fit requires evaluated v1 direct coordinates; use fit-rgb for SEA-RAFT initialization")
     design_source = direct.manifest.get("rendered_design")
     if not isinstance(design_source, str) or not design_source:
         raise ValueError("Direct coordinates do not name their rendered design")

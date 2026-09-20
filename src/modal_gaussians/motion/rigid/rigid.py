@@ -11,6 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import shutil
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -1066,7 +1067,7 @@ def _validate_final_arrays(
 def load_rigid_modes(path: str | Path) -> RigidModesArtifact:
     """Load and fully validate a final alpha/rigid solver candidate artifact."""
 
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest_path = root / "manifest.json"
     arrays_path = root / RIGID_MODES_FILENAME
     if not manifest_path.is_file() or not arrays_path.is_file():

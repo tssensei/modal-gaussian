@@ -4,6 +4,7 @@ import json
 from dataclasses import fields
 import math
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 from typing import Any, Mapping
 import numpy as np
 import torch
@@ -239,7 +240,7 @@ def _check_persisted_sources(manifest: Mapping[str, Any], arrays: Mapping[str, n
 def load_neural_completed_modes(path: str | Path, *, validate: bool = False) -> nm.NeuralModesArtifact:
     """Read saved modes; exhaustive consistency checks are explicit diagnostics only."""
     from modal_gaussians.motion.neural.neural_field import evaluate_model
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     if (manifest.get("format") != nm.COMPLETED_MODES_FORMAT or type(manifest.get("version")) is not int
             or manifest["version"] not in (8, 10, 11, 12, 14, 16)):

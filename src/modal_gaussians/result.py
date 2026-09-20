@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import shutil
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -23,6 +24,11 @@ from modal_gaussians.physics_coordinates import (
     PHYSICS_COORDINATES_FORMAT,
     PhysicsModalCoordinatesArtifact,
     load_physics_modal_coordinates,
+)
+from modal_gaussians.rgb_coordinates import (
+    RGB_COORDINATES_FORMAT,
+    RGBModalCoordinatesArtifact,
+    load_rgb_modal_coordinates,
 )
 from modal_gaussians.rendered_design import (
     RenderedModalDesignArtifact,
@@ -54,7 +60,16 @@ DEFORMATION_CONVENTION = {
 }
 
 
-CoordinateArtifact = DirectModalCoordinatesArtifact | PhysicsModalCoordinatesArtifact
+CoordinateArtifact = (
+    DirectModalCoordinatesArtifact
+    | PhysicsModalCoordinatesArtifact
+    | RGBModalCoordinatesArtifact
+)
+COORDINATE_IDENTITY_NAMES = {
+    "direct": "direct_coordinates_identity",
+    "physics": "physics_coordinates_identity",
+    "rgb": "rgb_coordinates_identity",
+}
 
 
 @dataclass(frozen=True)
@@ -117,22 +132,24 @@ def _source_path(sources: Mapping[str, Any], name: str) -> Path:
     record = sources.get(name)
     if not isinstance(record, dict) or not isinstance(record.get("path"), str):
         raise ValueError(f"Modal result source {name!r} is invalid")
-    path = Path(record["path"]).expanduser().resolve(strict=True)
+    path = resolve_path(record["path"], strict=True)
     if not path.is_dir():
         raise FileNotFoundError(f"Modal result source is not a directory: {path}")
     return path
 
 
 def _load_coordinate_artifact(path: Path) -> tuple[str, CoordinateArtifact]:
-    """Auto-detect and strictly load direct or physics modal coordinates."""
+    """Auto-detect and strictly load direct, physics, or RGB coordinates."""
 
     artifact_format = _read_manifest(path).get("format")
     if artifact_format == DIRECT_COORDINATES_FORMAT:
         return "direct", load_direct_modal_coordinates(path)
     if artifact_format == PHYSICS_COORDINATES_FORMAT:
         return "physics", load_physics_modal_coordinates(path)
+    if artifact_format == RGB_COORDINATES_FORMAT:
+        return "rgb", load_rgb_modal_coordinates(path)
     raise ValueError(
-        "Result coordinates must be a direct- or physics-coordinate artifact"
+        "Result coordinates must be a direct-, physics-, or RGB-coordinate artifact"
     )
 
 
@@ -141,6 +158,22 @@ def _require_equal(name: str, actual: Any, expected: Any) -> None:
 
     if actual != expected:
         raise ValueError(f"Modal result {name} differs across linked artifacts")
+
+
+def _select_views(views: Sequence[Mapping[str, Any]], labels: Sequence[str]) -> list[dict[str, Any]]:
+    """Copy selected view records into a local index/frame layout; never mutate sources."""
+    by_label = {view["label"]: view for view in views}
+    if (len(by_label) != len(views) or not labels or len(set(labels)) != len(labels)
+            or any(label not in by_label for label in labels)):
+        raise ValueError("Selected view labels must be unique and present in the source")
+    selected, offset = [], 0
+    for index, label in enumerate(labels):
+        view = {**by_label[label], "index": index}
+        if "frame_offset" in view:
+            view["frame_offset"] = offset
+            offset += view["frame_count"]
+        selected.append(view)
+    return selected
 
 
 def _coordinate_view_records(
@@ -222,9 +255,9 @@ def _load_sources(
 ]:
     """Load and cross-check the complete static/mode/design/coordinate chain."""
 
-    scene_path = Path(scene_dir).expanduser().resolve(strict=True)
-    completed_path = Path(completed_modes_dir).expanduser().resolve(strict=True)
-    coordinate_path = Path(coordinates_dir).expanduser().resolve(strict=True)
+    scene_path = resolve_path(scene_dir, strict=True)
+    completed_path = resolve_path(completed_modes_dir, strict=True)
+    coordinate_path = resolve_path(coordinates_dir, strict=True)
     scene = load_static_scene(scene_path, "cpu")
     completed = load_completed_modes(completed_path)
     coordinate_kind, coordinates = _load_coordinate_artifact(coordinate_path)
@@ -275,27 +308,36 @@ def _load_sources(
         scene.foreground.count,
     )
 
+    design_views = design.manifest["views"]
+    completed_views = completed.manifest["views"]
     direct: DirectModalCoordinatesArtifact | None = None
-    if coordinate_kind == "physics":
+    if coordinate_kind in ("physics", "rgb"):
         direct_source = coordinates.manifest.get("direct_coordinates")
         if not isinstance(direct_source, str) or not direct_source:
-            raise ValueError("Physics coordinates do not name their direct source")
+            raise ValueError(f"{coordinate_kind} coordinates do not name their direct source")
         direct = load_direct_modal_coordinates(direct_source)
         _require_equal(
-            "physics direct-coordinate identity",
+            f"{coordinate_kind} direct-coordinate identity",
             coordinates.manifest.get("direct_coordinates_identity"),
             direct.manifest["direct_coordinates_identity"],
         )
         for name in ("rendered_design_identity", "completed_modes_identity", "modes"):
             _require_equal(
-                f"physics/direct {name}",
+                f"{coordinate_kind}/direct {name}",
                 coordinates.manifest.get(name),
                 direct.manifest.get(name),
             )
         direct_views = direct.manifest["views"]
         coordinate_views = coordinates.manifest["views"]
+        if coordinate_kind == "rgb":
+            # Check the complete source chain before mapping a fitted subset by label.
+            _coordinate_view_records(direct_views, design_views, completed_views)
+            labels = [view["label"] for view in coordinate_views]
+            direct_views = _select_views(direct_views, labels)
+            design_views = _select_views(design_views, labels)
+            completed_views = _select_views(completed_views, labels)
         if len(coordinate_views) != len(direct_views):
-            raise ValueError("Physics/direct coordinate view counts differ")
+            raise ValueError(f"{coordinate_kind}/direct coordinate view counts differ")
         runtime_fields = (
             "index",
             "label",
@@ -309,20 +351,20 @@ def _load_sources(
             "reference_frame_index",
             "sample_count",
         )
-        for index, (physics_view, direct_view) in enumerate(
+        for index, (coordinate_view, direct_view) in enumerate(
             zip(coordinate_views, direct_views)
         ):
             for name in runtime_fields:
                 _require_equal(
-                    f"physics/direct view {index} {name}",
-                    physics_view.get(name),
+                    f"{coordinate_kind}/direct view {index} {name}",
+                    coordinate_view.get(name),
                     direct_view.get(name),
                 )
 
     views = _coordinate_view_records(
         coordinates.manifest["views"],
-        design.manifest["views"],
-        completed.manifest["views"],
+        design_views,
+        completed_views,
     )
     expected_shape = (
         sum(record["frame_count"] for record in views),
@@ -360,7 +402,7 @@ def _source_record(path: Path, identity_name: str, identity: str) -> dict[str, s
 def load_modal_result(path: str | Path) -> ModalResultArtifact:
     """Load a materialized result and revalidate every linked source artifact."""
 
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest = _read_manifest(root)
     if manifest.get("format") != MODAL_RESULT_FORMAT:
         raise ValueError("Unsupported modal-result format")
@@ -399,11 +441,7 @@ def load_modal_result(path: str | Path) -> ModalResultArtifact:
         design.path.resolve(strict=True),
         rendered_design_path,
     )
-    coordinate_identity_name = (
-        "direct_coordinates_identity"
-        if coordinate_kind == "direct"
-        else "physics_coordinates_identity"
-    )
+    coordinate_identity_name = COORDINATE_IDENTITY_NAMES[coordinate_kind]
     coordinate_identity = coordinates.manifest[coordinate_identity_name]
     expected_coordinate_source = {
         "kind": coordinate_kind,
@@ -491,7 +529,7 @@ def materialize_modal_result(
 ) -> ModalResultArtifact:
     """Atomically publish a lightweight result binding without copying tensors."""
 
-    destination = Path(output_dir).expanduser().resolve()
+    destination = resolve_path(output_dir)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"Modal-result output already exists: {destination}")
     (
@@ -511,11 +549,7 @@ def materialize_modal_result(
     scene_manifest = scene.manifest
     if scene_manifest is None:
         raise ValueError("Static scene has no manifest")
-    coordinate_identity_name = (
-        "direct_coordinates_identity"
-        if coordinate_kind == "direct"
-        else "physics_coordinates_identity"
-    )
+    coordinate_identity_name = COORDINATE_IDENTITY_NAMES[coordinate_kind]
     coordinate_identity = coordinates.manifest[coordinate_identity_name]
     sources = {
         "static_scene": _source_record(

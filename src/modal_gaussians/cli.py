@@ -61,6 +61,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Append live progress and failures to this external log (before subcommand)",
     )
     command_parsers = parser.add_subparsers(dest="command", required=True)
+    storage = command_parsers.add_parser("storage", help="Discover and use scene-owned reusable inputs/results")
+    storage_commands = storage.add_subparsers(dest="storage_command", required=True)
+    storage_list = storage_commands.add_parser("list")
+    storage_list.add_argument("--scene")
+    storage_path = storage_commands.add_parser("path")
+    storage_path.add_argument("--scene", required=True)
+    storage_path.add_argument("--asset", required=True)
+    storage_run = storage_commands.add_parser("run", help="Run an existing command with @scene-asset paths")
+    storage_run.add_argument("--scene", required=True)
+    storage_run.add_argument("arguments", nargs=argparse.REMAINDER)
     prepare_parser = command_parsers.add_parser("prepare", help="Optional video/SAM/XMem preparation")
     prepare_commands = prepare_parser.add_subparsers(dest="prepare_command", required=True)
     mask_gui = prepare_commands.add_parser("gui", help="Local interactive frame/mask preparation")
@@ -77,7 +87,10 @@ def build_parser() -> argparse.ArgumentParser:
     spectrum_commands = spectrum_parser.add_subparsers(dest="spectrum_command", required=True)
     spectrum_build = spectrum_commands.add_parser("build", help="Cache a common FFT grid from existing SEA-RAFT flows")
     spectrum_build.add_argument("--view", action="append", nargs=2, required=True, metavar=("LABEL", "SEA_FLOW"))
-    spectrum_build.add_argument("--scene", required=True, type=Path)
+    spectrum_region = spectrum_build.add_mutually_exclusive_group(required=True)
+    spectrum_region.add_argument("--scene", type=Path)
+    spectrum_region.add_argument("--region", action="append", nargs=2, metavar=("LABEL", "BOOL_NPY"),
+                                 help="Analysis region only; full-image FFT data is always saved")
     spectrum_build.add_argument("--nfft", required=True, type=_positive_int)
     spectrum_build.add_argument("--output", required=True, type=Path)
     spectrum_viewer = spectrum_commands.add_parser("viewer", help="Standalone browser spectrum GUI (no automatic snapping)")
@@ -89,6 +102,12 @@ def build_parser() -> argparse.ArgumentParser:
     spectrum_export.add_argument("--input", required=True, type=Path)
     spectrum_export.add_argument("--selection", required=True, type=Path)
     spectrum_export.add_argument("--output", required=True, type=Path)
+    spectrum_select = spectrum_commands.add_parser("select", help="Save uniform bins or greedy flow-reconstruction frequencies from the cache")
+    spectrum_select.add_argument("--input", required=True, type=Path)
+    spectrum_select.add_argument("--method", required=True, choices=("uniform", "greedy"))
+    spectrum_select.add_argument("--count", required=True, type=_positive_int)
+    spectrum_select.add_argument("--topology", type=Path, help="Existing sampling topology; required for greedy")
+    spectrum_select.add_argument("--output", required=True, type=Path)
     flow_commands = flow_parser.add_subparsers(dest="flow_command", required=True)
     flow_compute = flow_commands.add_parser("compute", help="Compute full-frame SEA-RAFT flow using local M weights")
     flow_compute.add_argument("--images", required=True, type=Path)
@@ -311,11 +330,37 @@ def build_parser() -> argparse.ArgumentParser:
                                   metavar=("LABEL", "MODAL_IMAGE_DIR"))
     prepare_selected.add_argument("--frequency-hz", type=_positive_float, required=True)
     prepare_selected.add_argument("--output", type=Path, required=True)
+    prepare_controls = motion_commands.add_parser(
+        "prepare-shared-controls", help="Reuse a saved control layout and cache geometry shared by all frequencies")
+    for name in ("prepared", "geometry-graph", "controls-from"):
+        prepare_controls.add_argument(f"--{name}", type=Path, required=True)
+    prepare_controls.add_argument("--config", type=Path)
+    prepare_weights = motion_commands.add_parser("prepare-control-weights", help="Populate exact CPU soft weights before GPU training")
+    for name in ("prepared", "geometry-graph", "config", "output"):
+        prepare_weights.add_argument(f"--{name}", type=Path, required=True)
+    prepare_weights.add_argument("--frequency-hz", type=_positive_float, required=True)
+    batch_neural = motion_commands.add_parser("batch-neural", help="Run independent CPU preparation and GPU training queues")
+    for name in ("modal-images", "prepared", "geometry-graph", "config", "output"):
+        batch_neural.add_argument(f"--{name}", type=Path, required=True)
+    batch_neural.add_argument("--cpu-workers", "--workers", dest="cpu_workers", type=_positive_int, default=3,
+                              help="Concurrent CPU preparation stages (--workers is a compatibility alias)")
+    batch_neural.add_argument("--gpu-workers", type=_positive_int, default=2,
+                              help="Concurrent GPU training stages")
+    batch_neural.add_argument("--threads-per-worker", type=_positive_int, default=2)
+    batch_neural.add_argument("--propagation-workers", type=_positive_int, default=4,
+                              help="CPU processes per frequency for exact soft propagation")
+    batch_neural.add_argument("--resume-from", type=Path,
+                              help="Carry completed frequencies from a stopped batch into a new attempt")
+    batch_neural.add_argument("--continue-from", type=Path,
+                              help="Extend a stopped batch's iteration cap, reusing prepared inputs and checkpoints")
+    batch_neural.add_argument("--experiment-name", default="experiment_shared_001")
     iterate_neural = motion_commands.add_parser("iterate-neural", help="Produce 3D modes; optionally prepare a preview or fit coordinates")
     iterate_neural.add_argument("--prepared", type=Path, required=True)
     iterate_neural.add_argument("--config", type=Path)
+    iterate_neural.add_argument("--continue-from", type=Path,
+                                help="Continue this experiment with a larger iteration cap into a new output")
     iterate_neural.add_argument("--geometry-graph", type=Path,
-                                help="Use this saved modal graph and rebuild controls from its retained edges")
+                                help="Use this saved modal graph; reuse shared control geometry and update its weights")
     iterate_neural.add_argument("--refine-observations", action="store_true",
                                 help="After v12 propagation, refine visible followers while keeping hosts fixed; reuse training")
     iterate_neural.add_argument("--refinement-config", type=Path,
@@ -516,6 +561,21 @@ def build_parser() -> argparse.ArgumentParser:
     coordinates_commands = coordinates_parser.add_subparsers(
         dest="coordinates_command", required=True
     )
+    prepare_coordinates = coordinates_commands.add_parser(
+        "prepare", help="Collect fixed modes and initialize coordinates from saved SEA-RAFT flow",
+    )
+    prepare_coordinates.add_argument("--scene", required=True, help="Registered scene name")
+    prepare_coordinates.add_argument("--output", required=True, type=Path, help="New scene experiment directory")
+    prepare_coordinates.add_argument("--index", type=Path, help="Result index (default: scene results/index.json)")
+    prepare_coordinates.add_argument("--status", default="completed_uniform60", help="Exact indexed result status to include")
+    prepare_coordinates.add_argument("--expected-modes", required=True, type=_positive_int)
+    prepare_coordinates.add_argument("--resume", action="store_true", help="Reuse published stages with an identical contract")
+    prepare_coordinates.add_argument("--pixel-stride", type=_positive_int, default=2)
+    prepare_coordinates.add_argument("--alpha-min", type=_positive_float, default=0.05)
+    prepare_coordinates.add_argument("--mask-erode-iters", type=_non_negative_int, default=1)
+    prepare_coordinates.add_argument("--modes-per-batch", type=_positive_int, default=8)
+    prepare_coordinates.add_argument("--ridge-relative", type=_positive_float, default=1e-4)
+    prepare_coordinates.add_argument("--frame-chunk-size", type=_positive_int, default=64)
     render_design = coordinates_commands.add_parser(
         "render-design",
         help="Rasterize completed foreground modes into flow-space columns",
@@ -574,6 +634,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--assigned-band-half-width-hz", type=_positive_float, default=0.1
     )
     physics_fit.add_argument("--frame-chunk-size", type=_positive_int, default=64)
+    rgb_fit = coordinates_commands.add_parser(
+        "fit-rgb", help="Refine direct coefficients against RGB with fixed spatial modes",
+    )
+    rgb_fit.add_argument("--scene", required=True, type=Path)
+    rgb_fit.add_argument("--modes", required=True, type=Path)
+    rgb_fit.add_argument("--input", required=True, type=Path, help="Direct-coordinate artifact")
+    rgb_fit.add_argument("--output", required=True, type=Path)
+    rgb_fit.add_argument("--config", type=Path, help="RGBFitConfig JSON (defaults if omitted)")
+    rgb_fit.add_argument("--view", help="Fit only this recorded video label; default: all views")
+    rgb_fit.add_argument(
+        "--images", action="append", nargs=2, metavar=("LABEL", "DIRECTORY"),
+        help="Override a view's recorded/stabilized RGB directory; preserve frame names and geometry",
+    )
+    rgb_fit.add_argument("--device", default="cuda")
     result_parser = command_parsers.add_parser(
         "result", help="Bind one immutable static/mode/coordinate result"
     )
@@ -588,6 +662,13 @@ def build_parser() -> argparse.ArgumentParser:
     result_materialize.add_argument("--modes", required=True, type=Path)
     result_materialize.add_argument("--coordinates", required=True, type=Path)
     result_materialize.add_argument("--output", required=True, type=Path)
+    result_video = result_commands.add_parser(
+        "export-video", help="Export one RGB-fitted view: original above reconstruction"
+    )
+    result_video.add_argument("--result", required=True, type=Path)
+    result_video.add_argument("--view", required=True, help="Recorded view label, e.g. view1")
+    result_video.add_argument("--output", required=True, type=Path, help="New export directory")
+    result_video.add_argument("--device", default="cuda")
     viewer = command_parsers.add_parser(
         "viewer", help="Inspect modal results, geometry graphs, or select a 3D subject in Viser"
     )
@@ -638,6 +719,25 @@ def _dispatch(
     """Dispatch the parsed command and preserve existing CLI error semantics."""
 
     try:
+        from modal_gaussians.scene_store import asset_path, expand_arguments, list_scene, resolve_path
+        if args.command == "storage":
+            if args.storage_command == "list":
+                print(json.dumps(list_scene(args.scene), indent=2, ensure_ascii=False))
+            elif args.storage_command == "path":
+                print(asset_path(args.scene, args.asset))
+            else:
+                command = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+                if not command or command[0] == "storage":
+                    raise ValueError("Specify an existing pipeline command after --")
+                try:
+                    return main(expand_arguments(args.scene, command))
+                except SystemExit as error:
+                    return int(error.code or 0)
+            return 0
+        # Resolve explicitly typed paths before delegating to existing commands.
+        for name, value in vars(args).items():
+            if isinstance(value, Path):
+                setattr(args, name, resolve_path(value))
         if args.command == "flow" and args.flow_command == "compute":
             from modal_gaussians.flow.sea_raft import compute_flow
             output = compute_flow(images=args.images, reuse_stabilization=args.reuse_stabilization,
@@ -652,13 +752,18 @@ def _dispatch(
             from modal_gaussians.spectrum_cache import build_spectrum, export_selection, load_spectrum
             if args.spectrum_command == "build":
                 cache = build_spectrum(views=args.view, scene_dir=args.scene,
-                                       fft_length=args.nfft, output_dir=args.output)
+                                       fft_length=args.nfft, output_dir=args.output, region_paths=args.region)
                 print(f"Spectrum: {cache.path}")
                 print(f"{len(cache.frequencies)} bins | step={cache.manifest['fps_hz'] / cache.manifest['fft_length']:g} Hz")
             elif args.spectrum_command == "viewer":
                 from modal_gaussians.vis.spectrum_viewer import run_spectrum_viewer
                 run_spectrum_viewer(spectrum_dir=args.input, work_dir=args.work_dir,
                                     host=args.host, port=args.port)
+            elif args.spectrum_command == "select":
+                from modal_gaussians.spectrum_selection import select_spectrum
+                output = select_spectrum(spectrum_dir=args.input, method=args.method, count=args.count,
+                                         topology_dir=args.topology, output_dir=args.output)
+                print(f"Frequency selection: {output}")
             else:
                 output = export_selection(load_spectrum(args.input), args.selection, args.output)
                 print(f"Selected modal images: {output}")
@@ -917,11 +1022,34 @@ def _dispatch(
             print(f"Selected-modal prepared: {artifact.path}")
             print(f"prepared_identity: {artifact.manifest['prepared_identity']}")
             return 0
+        if args.command == "motion" and args.motion_command == "batch-neural":
+            from modal_gaussians.motion.neural.batch import run_batch
+            path = run_batch(modal_images=args.modal_images, prepared_dir=args.prepared,
+                geometry_graph_dir=args.geometry_graph, config_path=args.config, output_dir=args.output,
+                cpu_workers=args.cpu_workers, gpu_workers=args.gpu_workers, threads_per_worker=args.threads_per_worker,
+                propagation_workers=args.propagation_workers, resume_from=args.resume_from,
+                continue_from=args.continue_from,
+                experiment_name=args.experiment_name)
+            print(f"Batch modes ready: {path}")
+            return 0
+        if args.command == "motion" and args.motion_command == "prepare-control-weights":
+            from modal_gaussians.motion.neural.control_preparation import prepare_control_weights
+            path = prepare_control_weights(prepared_dir=args.prepared, geometry_graph_dir=args.geometry_graph,
+                config_path=args.config, frequency_hz=args.frequency_hz, output_path=args.output)
+            print(f"CPU control weights ready: {path}")
+            return 0
+        if args.command == "motion" and args.motion_command == "prepare-shared-controls":
+            from modal_gaussians.motion.neural.shared_controls import prepare_shared_controls
+            path, count = prepare_shared_controls(prepared_dir=args.prepared, geometry_graph_dir=args.geometry_graph,
+                controls_from=args.controls_from, config_path=args.config)
+            print(f"Shared control geometry: {path} | controls={count}")
+            return 0
         if args.command == "motion" and args.motion_command == "iterate-neural":
             from modal_gaussians.motion.neural.iteration import iterate_neural
             root = iterate_neural(prepared_dir=args.prepared, config_path=args.config,
                                   output_dir=args.output, stage=args.stage, frequencies_hz=args.frequency_hz,
                                   geometry_graph_dir=args.geometry_graph,
+                                  continue_from=args.continue_from,
                                   refine_observations=args.refine_observations, refinement_config_path=args.refinement_config)
             print(f"iteration: {root}")
             return 0
@@ -1268,6 +1396,46 @@ def _dispatch(
                 f"{artifact.manifest['physics_coordinates_identity']}"
             )
             return 0
+        if args.command == "coordinates" and args.coordinates_command == "prepare":
+            from modal_gaussians.coefficient_preparation import prepare_coefficient_inputs
+            from modal_gaussians.rendered_design import RenderedDesignConfig
+            from modal_gaussians.direct_coordinates import DirectCoordinateConfig
+
+            artifact = prepare_coefficient_inputs(
+                scene=args.scene, output_dir=args.output, index_path=args.index, status=args.status,
+                expected_modes=args.expected_modes, resume=args.resume,
+                design_config=RenderedDesignConfig(pixel_sample_stride=args.pixel_stride,
+                    alpha_minimum=args.alpha_min, mask_erosion_iterations=args.mask_erode_iters,
+                    modes_per_batch=args.modes_per_batch),
+                direct_config=DirectCoordinateConfig(ridge_relative=args.ridge_relative,
+                    frame_chunk_size=args.frame_chunk_size),
+            )
+            print(f"Coefficient inputs prepared: {artifact.path.parent}")
+            print("RGB fitting has not been started.")
+            return 0
+        if args.command == "coordinates" and args.coordinates_command == "fit-rgb":
+            from dataclasses import fields
+            from modal_gaussians.rgb_coordinates import build_rgb_modal_coordinates_artifact
+            from modal_gaussians.rgb_fitting import RGBFitConfig
+
+            payload = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
+            if not isinstance(payload, dict) or set(payload) - {field.name for field in fields(RGBFitConfig)}:
+                raise ValueError("RGB config must be an object containing only RGBFitConfig fields")
+            image_pairs = args.images or []
+            if len({label for label, _ in image_pairs}) != len(image_pairs):
+                raise ValueError("RGB image override labels must be unique")
+            artifact = build_rgb_modal_coordinates_artifact(
+                scene_dir=args.scene, completed_modes_dir=args.modes,
+                direct_coordinates_dir=args.input, output_dir=args.output,
+                config=RGBFitConfig(**payload), image_directories=dict(image_pairs),
+                view_label=args.view,
+                device=args.device, command=[parser.prog, *arguments],
+            )
+            counts = artifact.manifest["counts"]
+            print(f"RGB modal coordinates: {artifact.path.resolve()}")
+            print(f"views/frames/modes: {counts['views']}/{counts['frames']}/{counts['modes']}")
+            print(f"identity: {artifact.manifest['rgb_coordinates_identity']}")
+            return 0
         if args.command == "result" and args.result_command == "materialize":
             from modal_gaussians.result import materialize_modal_result
 
@@ -1290,6 +1458,13 @@ def _dispatch(
             print(f"coordinates: {coordinate_source['kind']}")
             print("quality gate: unified visualization approval required")
             print(f"identity: {artifact.manifest['modal_result_identity']}")
+            return 0
+        if args.command == "result" and args.result_command == "export-video":
+            from modal_gaussians.result_video import export_result_video
+
+            video = export_result_video(result_dir=args.result, view_label=args.view,
+                                        output_dir=args.output, device=args.device)
+            print(f"comparison video: {video}")
             return 0
         if args.command == "viewer":
             if args.selection is not None and not args.select_subject:

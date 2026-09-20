@@ -15,6 +15,7 @@ import json
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import shutil
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -29,9 +30,9 @@ from modal_gaussians.numpy_io import save_named_arrays
 from modal_gaussians import __version__
 from modal_gaussians.flow.artifact import (
     FlowAnalysisArtifact,
-    flow_artifact_identity,
     load_flow_analysis_artifact,
 )
+from modal_gaussians.coefficient_sources import coordinate_flow_identity as flow_artifact_identity
 from modal_gaussians.motion.common.completed_modes import (
     CompletedModesArtifact,
     load_completed_modes,
@@ -255,7 +256,7 @@ def _validate_finite_design(design: np.ndarray) -> None:
 def load_rendered_modal_design(path: str | Path, *, validate: bool = False) -> RenderedModalDesignArtifact:
     """Read a saved design; exhaustive checks are explicit diagnostics only."""
 
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest_path = root / "manifest.json"
     design_path = root / DESIGN_FILENAME
     samples_path = root / SAMPLES_FILENAME
@@ -399,12 +400,12 @@ def _load_sources(
     labels = [view.label.strip() for view in views]
     if any(not label for label in labels) or len(set(labels)) != len(labels):
         raise ValueError("Rendered-design view labels must be non-empty and unique")
-    scene_path = Path(scene_dir).expanduser().resolve(strict=True)
+    scene_path = resolve_path(scene_dir, strict=True)
     scene = load_static_scene(scene_path, device)
     if scene.manifest is None:
         raise ValueError("Static scene has no manifest")
     completed = validated_completed if validated_completed is not None else load_completed_modes(completed_modes_dir)
-    if completed.path.resolve() != Path(completed_modes_dir).expanduser().resolve():
+    if completed.path.resolve() != resolve_path(completed_modes_dir):
         raise ValueError("Reused completed modes belong to a different path")
     for name, actual, expected in (
         (
@@ -443,7 +444,7 @@ def _load_sources(
         if completed_view.get("camera_identity") != camera_identity:
             raise ValueError(f"Completed-mode camera identity for {label!r} differs")
         flow = (flow_loader or load_flow_analysis_artifact)(
-            Path(source.flow_artifact).expanduser().resolve(strict=True)
+            resolve_path(source.flow_artifact, strict=True)
         )
         flow_identity = flow_artifact_identity(flow)
         if completed_view.get("flow_identity") != flow_identity:
@@ -498,7 +499,7 @@ def build_rendered_modal_design_artifact(
 
     settings = config or RenderedDesignConfig()
     settings.validate()
-    destination = Path(output_dir).expanduser().resolve()
+    destination = resolve_path(output_dir)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"Rendered-design output already exists: {destination}")
     if not torch.cuda.is_available():

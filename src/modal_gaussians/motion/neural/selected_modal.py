@@ -6,8 +6,10 @@ import copy
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import shutil
 import tempfile
+import time
 
 import numpy as np
 import torch
@@ -24,9 +26,26 @@ FORMAT = "modal_gaussians.selected_complex_2d_modes"
 ALIGNMENT_FORMAT = "modal_gaussians.selected_modal_alignment"
 
 
+def _publish_prepared(temporary, destination):
+    # Windows scanners can briefly hold a just-written directory. Retry the
+    # atomic rename only, preserving the expensive computed arrays in place.
+    delays = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
+    for attempt in range(len(delays) + 1):
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(destination)
+        try:
+            os.rename(temporary, destination)
+            return
+        except OSError as error:
+            if (os.name != "nt" or getattr(error, "winerror", None) not in {5, 32, 33}
+                    or attempt == len(delays)):
+                raise
+            time.sleep(delays[attempt])
+
+
 def load_selected_modal_bundle(path, manifest=None):
     """Open selected fields without scanning arrays or loading the flow sequences."""
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest = manifest if manifest is not None else _manifest(root)
     if (manifest.get("format") != FORMAT or manifest.get("version") != 1
             or manifest.get("transform") != TRANSFORM_CONVENTION
@@ -40,7 +59,7 @@ def load_selected_modal_bundle(path, manifest=None):
         if (view["index"] != index or view.get("flow_role") != "geometry_reference_only"
                 or not view.get("label")):
             raise ValueError("Selected modal view order/reference role differs")
-        value = np.load(view["modes_file"], mmap_mode="r", allow_pickle=False)
+        value = np.load(resolve_path(view["modes_file"]), mmap_mode="r", allow_pickle=False)
         if value.dtype != np.complex64 or value.shape != (1, *view["shape_hw"], 2):
             raise ValueError("Selected modal field must be complex64 [1,H,W,2]")
         labels.append(view["label"])
@@ -166,7 +185,7 @@ def prepare_selected_modal(*, prepared_dir, views, frequency_hz, output_dir, sce
     """Publish one new observation snapshot, with no graph build or training."""
     if not math.isfinite(frequency_hz) or frequency_hz <= 0:
         raise ValueError("Selected modal frequency must be finite and positive")
-    destination = Path(output_dir).expanduser().resolve()
+    destination = resolve_path(output_dir)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -229,7 +248,7 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
         scene, observation_renders = None, None
         config = nm.NeuralModesConfig.from_dict(parent.manifest["defaults"]["neural"])
         if scene_dir is None:
-            topology_path = Path(source["topology"])
+            topology_path = resolve_path(source["topology"])
             topology_manifest = _manifest(topology_path)
             if (topology_manifest["topology_identity"] != source["topology_identity"]
                     or topology_manifest["foreground_identity"] != source["foreground_identity"]):
@@ -239,7 +258,7 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
             points = parent.arrays["o_g_points"]
         else:
             from modal_gaussians.static import load_static_scene
-            scene_path = Path(scene_dir).expanduser().resolve(strict=True)
+            scene_path = resolve_path(scene_dir, strict=True)
             scene = load_static_scene(scene_path, "cuda").eval()
             if (scene.manifest["static_scene_identity"] != parent.source["static_scene_identity"]
                     and scene.manifest.get("partition", {}).get("source_static_scene_identity")
@@ -322,8 +341,6 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
             "arrays_identity": nm._arrays_identity(arrays), "defaults": parent.manifest["defaults"]}
         manifest["prepared_identity"] = identity(manifest)
         atomic_json(temporary / "manifest.json", manifest)
-        if destination.exists() or destination.is_symlink():
-            raise FileExistsError(destination)
-        os.rename(temporary, destination)
+        _publish_prepared(temporary, destination)
     timer.save(destination / "timings.json")
     return PreparedNeuralInputs(destination, manifest, arrays)

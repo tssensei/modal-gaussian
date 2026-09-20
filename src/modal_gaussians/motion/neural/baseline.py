@@ -3,6 +3,7 @@ from .component_field import ComponentFieldConfig
 
 
 NEURAL_OVERRIDES = {
+    "max_iterations": 5000,
     "hidden_dim": 256,
     "local_feature_dim": 32,
     "message_layers": 3,

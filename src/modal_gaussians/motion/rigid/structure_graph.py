@@ -19,6 +19,7 @@ import json
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import shutil
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -1024,7 +1025,7 @@ def _validate_graph_arrays(
 def load_observed_structure_graph(path: str | Path) -> ObservedStructureGraphArtifact:
     """Load and fully validate one observed structure graph candidate."""
 
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest_path = root / "manifest.json"
     graph_path = root / GRAPH_FILENAME
     if not manifest_path.is_file() or not graph_path.is_file():

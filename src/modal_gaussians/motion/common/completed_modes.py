@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 from typing import Any
 import numpy as np
 
@@ -31,12 +32,17 @@ class CompletedModesArtifact:
 def load_completed_modes(path: str | Path) -> CompletedModesArtifact:
     """Load each supported completed-mode method through its format-specific loader."""
 
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest_path = root / "manifest.json"
     arrays_path = root / COMPLETED_MODES_FILENAME
-    if not manifest_path.is_file() or not arrays_path.is_file():
+    if not manifest_path.is_file():
         raise FileNotFoundError(f"Incomplete completed-mode artifact: {root}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") == COMPLETED_MODES_FORMAT and manifest.get("version") == 17:
+        from modal_gaussians.coefficient_preparation import load_mode_bank
+        return load_mode_bank(root)
+    if not arrays_path.is_file():
+        raise FileNotFoundError(f"Incomplete completed-mode artifact: {root}")
     if manifest.get("format") != COMPLETED_MODES_FORMAT:
         raise ValueError("Unsupported completed-mode format")
     version = manifest.get("version")

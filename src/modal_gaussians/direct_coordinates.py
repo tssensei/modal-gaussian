@@ -15,6 +15,7 @@ import tempfile
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from modal_gaussians.scene_store import resolve_path
 from modal_gaussians.progress import Progress, report_progress
 
 from modal_gaussians.numpy_io import save_named_arrays
@@ -296,7 +297,7 @@ def load_direct_modal_coordinates(
 ) -> DirectModalCoordinatesArtifact:
     """Load and strictly validate one direct modal-coordinate artifact."""
 
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest_path = root / "manifest.json"
     coordinates_path = root / COORDINATES_FILENAME
     diagnostics_path = root / DIAGNOSTICS_FILENAME
@@ -307,6 +308,9 @@ def load_direct_modal_coordinates(
     ):
         raise FileNotFoundError(f"Incomplete direct-coordinate artifact: {root}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") == DIRECT_COORDINATES_FORMAT and manifest.get("version") == 2:
+        from modal_gaussians.coefficient_preparation import load_initial_coordinates
+        return load_initial_coordinates(root)
     if manifest.get("format") != DIRECT_COORDINATES_FORMAT:
         raise ValueError("Unsupported direct-coordinate format")
     if manifest.get("version") != DIRECT_COORDINATES_VERSION:
@@ -486,6 +490,7 @@ def solve_direct_coordinates_view(
     fps_hz: float,
     frequencies_hz: np.ndarray,
     config: DirectCoordinateConfig | None = None,
+    evaluate: bool = True,
 ) -> tuple[np.ndarray, dict[str, np.ndarray | float | int]]:
     """Fit one view with one normalized Gram/Cholesky reused across all frames."""
 
@@ -608,6 +613,9 @@ def solve_direct_coordinates_view(
     coordinates = relative - np.mean(relative, axis=0, keepdims=True)
     coordinates = coordinates.astype(np.complex64).astype(np.complex128)
 
+    if not evaluate:
+        return coordinates.astype(np.complex64), {"mode_pair_scales": pair_scales}
+
     residual_sq = np.zeros(frame_count, dtype=np.float64)
     flow_sq = np.zeros(frame_count, dtype=np.float64)
     reference_coordinates = coordinates[reference_frame_index]
@@ -705,7 +713,7 @@ def _load_sources(
         if not label or design_view.get("index") != index or design_view.get("label") != label:
             raise ValueError("Direct-coordinate view order differs from rendered design")
         flow = load_flow_analysis_artifact(
-            Path(source.flow_artifact).expanduser().resolve(strict=True)
+            resolve_path(source.flow_artifact, strict=True)
         )
         identity = flow_artifact_identity(flow)
         if identity != design_view.get("flow_identity"):

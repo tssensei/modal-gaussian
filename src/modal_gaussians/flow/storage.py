@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 from typing import Any, Iterator
 
 import numpy as np
@@ -59,7 +60,7 @@ def create_array(path: Path, shape: tuple[int, ...], dtype: Any) -> zarr.Array:
 def open_array(path: Path) -> zarr.Array:
     """Open read-only; the artifact loader checks hashes and finite chunk contents."""
 
-    return zarr.open_array(str(path), mode="r", zarr_format=3)
+    return zarr.open_array(str(resolve_path(path)), mode="r", zarr_format=3)
 
 
 def array_blocks(array: DenseArray) -> Iterator[tuple[slice, ...]]:

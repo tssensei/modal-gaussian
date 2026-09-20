@@ -4,9 +4,12 @@ import copy
 from dataclasses import fields
 import json
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path, logical_path
+import time
 
 import numpy as np
 from modal_gaussians.iteration_cache import Timings, atomic_json, exclusive_work, identity, module_revision
+from modal_gaussians.progress import report_progress
 from modal_gaussians.motion.neural.prepared import load_prepared
 from modal_gaussians.motion.neural import neural_modes as nm, neural_field, geometry_graph
 from . import strategies
@@ -70,13 +73,13 @@ def resolve_mode_slots(modes, frequencies_hz):
 
 def training_revision(strategy_config):
     """Cache only code used by this representation, including artifact replay."""
-    from . import artifacts, prepared
+    from . import artifacts, continuation, control_propagation, prepared, shared_controls
     return module_revision(nm, neural_field, geometry_graph, projection, static,
-        camera_geometry, artifacts, prepared, strategies, *strategies.implementation_modules(strategy_config))
+        camera_geometry, artifacts, continuation, prepared, shared_controls, control_propagation, strategies, *strategies.implementation_modules(strategy_config))
 
 
 def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", frequencies_hz=None,
-                   refine_observations=False, refinement_config_path=None, geometry_graph_dir=None):
+                   refine_observations=False, refinement_config_path=None, geometry_graph_dir=None, continue_from=None):
     if stage not in ("modes", "preview", "full"):
         raise ValueError("Iteration stage must be modes, preview or full")
     refinement = None
@@ -86,7 +89,7 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
         from modal_gaussians.motion.legacy.neural.observation_refinement import ObservationRefinementConfig
         values = json.loads(Path(refinement_config_path).read_text()) if refinement_config_path else {}
         refinement = ObservationRefinementConfig.from_dict(values)
-    root = Path(output_dir).expanduser().resolve()
+    root = resolve_path(output_dir)
     timer = Timings()
     with timer.stage("prepared_load"):
         prepared = load_prepared(prepared_dir)
@@ -115,7 +118,7 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
         raise ValueError("Experiment must not overwrite prepared inputs")
     strategy_config = settings.training_fragment_config
     neural_revision = training_revision(strategy_config)
-    contract = {"version": 2, "prepared": str(prepared.path),
+    contract = {"version": 2, "prepared": str(logical_path(prepared.path)),
                 "prepared_identity": prepared.manifest["prepared_identity"],
                 "config": config, "neural_revision": neural_revision}
     if getattr(prepared, "external_geometry_contract", None) is not None:
@@ -125,6 +128,13 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
         contract["fragment_revision"] = module_revision(fp)
     if mode_slots is not None:
         contract["source_mode_slots"] = mode_slots
+    continuation = None
+    if continue_from is not None:
+        from .continuation import source_work
+        if resolve_path(continue_from) == root:
+            raise ValueError("Continuation requires a new experiment directory")
+        continuation = source_work(continue_from, contract)
+        contract["continuation"] = continuation
     if root.exists() and not (root / "iteration.json").is_file():
         raise FileExistsError(f"Existing directory is not a neural iteration: {root}")
     root.mkdir(parents=True, exist_ok=True)
@@ -136,7 +146,7 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
             atomic_json(root / "iteration.json", contract)
             atomic_json(root / "overrides.json", overrides)
         try:
-            result_root = _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slots, refinement)
+            result_root = _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slots, refinement, continuation)
         except BaseException:
             atomic_json(root / ("refinement_status.json" if refinement else "status.json"), {"status": "failed", "stage_requested": stage})
             raise
@@ -145,15 +155,37 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
     return result_root or root
 
 
-def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slots=None, refinement=None):
+def _build_modes_with_publication_retry(**kwargs):
+    """A final directory lock can retry publication using the completed checkpoints."""
+    destination = resolve_path(kwargs["output_dir"])
+    delays = (0.0, 0.25, 1.0)
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            return nm.build_neural_modes_artifact(**kwargs)
+        except OSError as error:
+            target = getattr(error, "filename2", None)
+            if (getattr(error, "winerror", None) not in {5, 32, 33}
+                    or target is None or resolve_path(target) != destination
+                    or not (Path(kwargs["work_dir"]) / "manifest.json").is_file()
+                    or attempt == len(delays) - 1):
+                raise
+            kwargs["resume"] = True
+            report_progress(f"neural publication: Windows file lock; retry {attempt + 1}/2 using saved checkpoints")
+
+
+def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slots=None, refinement=None, continuation=None):
     source = prepared.source
     model_contract = {"prepared": prepared.manifest["prepared_identity"], "config": config["neural"], "code": neural_revision}
     if getattr(prepared, "external_geometry_contract", None) is not None:
         model_contract["external_geometry_graph"] = prepared.external_geometry_contract
     if mode_slots is not None:
         model_contract["source_mode_slots"] = mode_slots
+    if continuation is not None:
+        model_contract["continuation"] = continuation
     model_key = identity(model_contract)
-    raw_path = prepared.cache_dir / "trained_modes" / model_key
+    raw_path = resolve_path(prepared.cache_dir / "trained_modes" / model_key)
     with timer.stage("training_stage"):
         with exclusive_work(prepared.cache_dir / "locks" / (model_key + ".lock")):
             hit = raw_path.exists()
@@ -165,13 +197,13 @@ def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slot
                 if nm._source_mode_slots(raw.manifest).tolist() != expected_slots:
                     raise ValueError("Cached neural frequency selection differs from experiment")
             else:
-                work = prepared.cache_dir / "neural_work" / model_key
-                raw = nm.build_neural_modes_artifact(
+                work = resolve_path(prepared.cache_dir / "neural_work" / model_key)
+                raw = _build_modes_with_publication_retry(
                     scene_dir=source["static_scene"], topology_dir=source["topology"], measurements_dir=source["measurements"],
                     graph_dir=source["observed_structure_graph"], alignment_from=source["alignment_from"],
                     work_dir=work, output_dir=raw_path, config=nm.NeuralModesConfig.from_dict(config["neural"]),
                     resume=(work / "manifest.json").exists(), prepared_inputs=prepared, timings=timer,
-                    mode_slots=mode_slots,
+                    mode_slots=mode_slots, continuation=continuation,
                     command=["motion", "iterate-neural", str(root)])
     timer.records[-1]["cache_hit"] = hit
     if config["neural"].get("training_fragment_config") is not None:

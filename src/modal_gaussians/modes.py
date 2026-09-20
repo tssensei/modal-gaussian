@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import shutil
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -148,7 +149,7 @@ def _validate_finite_modes(modes: np.ndarray, label: str) -> None:
 def load_complex_2d_modes(path: str | Path) -> Complex2DModesArtifact:
     """Load a dense-mode directory and retain each view as an mmap array."""
 
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     if not root.is_dir():
         raise FileNotFoundError(f"Complex mode artifact is not a directory: {root}")
     manifest_path = root / "manifest.json"
@@ -295,7 +296,7 @@ def build_complex_2d_modes_artifact(
 ) -> Complex2DModesArtifact:
     """Validate selection inputs and publish every selected dense complex field."""
 
-    destination = Path(output_dir).expanduser().resolve()
+    destination = resolve_path(output_dir)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"Complex mode output already exists: {destination}")
     selection = load_frequency_selection(selection_dir)

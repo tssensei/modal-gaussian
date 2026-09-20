@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 
 import numpy as np
 import torch
@@ -20,7 +21,7 @@ from modal_gaussians.vis.viewer import ModalViserViewer, ViewerCamera
 class SubjectSelectionData:
     def __init__(self, scene_dir, selection_path=None, device="cuda"):
         self.device = torch.device(device)
-        self.scene_path = Path(scene_dir).expanduser().resolve(strict=True)
+        self.scene_path = resolve_path(scene_dir, strict=True)
         self.scene = load_static_scene(self.scene_path, self.device).eval()
         self.scene.requires_grad_(False)
         self.active = self.scene._active_for("all")

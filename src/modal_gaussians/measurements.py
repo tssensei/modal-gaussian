@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import shutil
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -168,7 +169,7 @@ def _validate_finite(measurements: np.ndarray) -> None:
 def load_gaussian_measurements(path: str | Path) -> GaussianMeasurementsArtifact:
     """Load and fully validate a topology-aligned measurement bank."""
 
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     if not root.is_dir():
         raise FileNotFoundError(f"Measurement artifact is not a directory: {root}")
     manifest_path = root / "manifest.json"
@@ -304,7 +305,7 @@ def build_gaussian_measurements_artifact(
 ) -> GaussianMeasurementsArtifact:
     """Sample dense complex fields and atomically publish the measurement bank."""
 
-    destination = Path(output_dir).expanduser().resolve()
+    destination = resolve_path(output_dir)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(f"Measurement output already exists: {destination}")
     topology = load_observation_topology(topology_dir)

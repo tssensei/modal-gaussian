@@ -62,6 +62,14 @@ CLI export writes `bin_XXXX/view1` and other views directly inside `--output`.
 This copies cache slices; a missing or mismatched cache is an error, not permission
 to fall back to DFT. Frequency 0.225 Hz is bin 18 in this example.
 
+For requested uniform/greedy comparisons, use `spectrum select --input CACHE
+--method uniform --count 60 --output NEW_SELECTION_DIR`, or `--method greedy
+--topology EXISTING_TOPOLOGY`. Both produce `selection.json` for `spectrum export`.
+Greedy additionally saves its ordered gains and sufficient statistics, fitting
+SEA-RAFT targets on the existing topology samples without DFT. These fits are the
+selection objective, not an added validation pass. Uniform bins span `(0, Nyquist]`;
+resolve the actual frame rate from source metadata. Bush is 30 fps; Corn is 20 fps.
+
 ## Selected-modal preparation and matching graph
 
 The exported fields can introduce a frequency absent from the parent snapshot.
@@ -78,8 +86,28 @@ metadata. Do not substitute a pruned graph or another scene's cache. Keep baseli
 K=16/radius 0.08 and soft factors 1/0.05. Controls/support retain original
 geometric distances; soft propagation attenuates interpolation without increasing
 control count. [BASELINE.md](../../../BASELINE.md) records exact accepted paths
-and numerical settings. Current graphs remain frequency-specific; shared topology
-with per-frequency weights is a next direction, not an implemented shortcut.
+and numerical settings. Modal graph files remain frequency-specific, but prepared
+component-field training shares geometry independently of weights and observations.
+
+Before a batch, import compatible existing controls without sampling them again:
+
+```bat
+modal-gaussians motion prepare-shared-controls --prepared outputs\bush_neural_modal_similarity_0744_001\prepared --geometry-graph outputs\_cache\geometry\d8037d88fd6390382ad02ca899fb5f6ce7009e3a33814209164047b77be43126 --controls-from outputs\_cache\trained_modes\50a4e5e3a235247ed38405eeea55adbea7d811c0e6c5069db83cd556989fea32 --config configs\neural_component_field.json
+```
+
+This reads the existing KNN and v16 layout, fills material distances on saved
+supports once, and publishes `control_geometry` in the prepared cache directory.
+Alternatively, pass an existing compatible `control_geometry` directory through
+`--controls-from` to import both layout and support distances without recomputing
+them. This is useful after a code change; source cache identities remain intact.
+No network replay, training or validation occurs. Later `iterate-neural` calls
+reuse it automatically; only soft propagation/control weights are recomputed
+under `control_weights`, with observation-dependent donor roles kept separate.
+Without a compatible import/cache, layout construction runs once. Changing
+topology, geometry, control radius/budget or learning-component gates creates a
+different shared cache. Old completed artifacts and single-frequency inputs remain
+readable. A stopped run created before this code change needs a new experiment
+directory; preserve its checkpoint rather than rewriting its contract.
 
 An applied manual subject scene may be passed to preparation using `--scene`.
 It rebuilds observations using visible selected-Gaussian contributions, without
@@ -109,6 +137,71 @@ A preview does not imply that Viser was started or the result was visually teste
 Do not append `--stage full`, coordinate fitting, PNG exports or quality checks.
 
 ## Logs, failures and compatibility
+
+The current config sets `neural.max_iterations=5000`, counting all prior updates
+when resuming. For an iteration-cap increase, stop dispatch and let active work
+finish, then use a new batch output and `--continue-from OLD_BATCH` (not
+`--resume-from`, which skips completed frequencies). The same option on
+`motion iterate-neural` takes an old experiment directory. Only the cap may
+increase; data/graph/loss/optimizer settings must match. Published prepared
+inputs and graph caches are reused. Compatible checkpoints retain model,
+optimizer, RNG, history and patience; already-converged checkpoints need no
+additional updates. Missing/incompatible numerical-input checkpoints restart
+with a logged reason. Old results and their identities remain unchanged.
+
+For an explicitly authorized parallel batch from an already exported selection:
+
+```bat
+modal-gaussians --log-file outputs\bush_uniform60_modes_001\batch.log motion batch-neural --modal-images outputs\bush_uniform60_modes_001\modal_images --prepared outputs\bush_neural_modal_similarity_0744_001\prepared --geometry-graph outputs\_cache\geometry\d8037d88fd6390382ad02ca899fb5f6ce7009e3a33814209164047b77be43126 --config configs\neural_component_field.json --output outputs\bush_uniform60_modes_001 --cpu-workers 3 --gpu-workers 2 --threads-per-worker 2 --experiment-name experiment_shared_001
+```
+
+This separates CPU preparation from GPU training. CPU slots run selected-modal
+preparation, graph weighting and `motion prepare-control-weights`; the latter
+populates the same cache consumed by training, without loading a scene or GPU.
+A small `control_weights_ready.json` receipt is published after cache completion.
+GPU slots start only for ready frequencies while CPU slots prepare later ones.
+Completed pre-split modes are skipped without recomputing CPU work. It creates
+`batch_state.json`, `batch_workers.json` and five-second `gpu_usage.csv` samples.
+The initial counts are used only when the control file does not yet exist;
+change that file atomically to adjust the live limits, for example
+`{"cpu_workers":3,"gpu_workers":2}`. Zero pauses new launches in that queue,
+without interrupting active work. `batch_state.json` includes `active_cpu`,
+`active_gpu` and `ready_for_gpu`. A subprocess failure prevents further launches;
+existing children finish their current stages. The same command resumes matching
+artifacts/checkpoints without validation; changed model code/config requires a
+new batch contract/output. Use resource observations to choose concurrency, not
+scientific changes to iteration limits, resolution or modes. Do not restart an
+already active batch: its OS lock prevents duplicate scheduling.
+
+Soft propagation uses a separate CPU process pool per frequency. The batch flag
+`--propagation-workers 4` (default 4) parallelizes control-source searches while
+preserving exact adaptive Dijkstra distances, original support indices and final
+normalization. Each child receives the read-only graph once; no GPU computation
+or extra dependency is introduced. Three CPU preparation slots therefore use up to
+twelve propagation processes, separate from `--threads-per-worker` library
+thread limits. For a standalone single-frequency command, set the environment
+variable `MODAL_GAUSSIANS_PROPAGATION_WORKERS=4`; its default is serial.
+To adjust a running batch without discarding active work, add or update the
+positive integer `propagation_workers` in `batch_workers.json`, for example
+`{"cpu_workers":4,"gpu_workers":2,"propagation_workers":6}`. Each new CPU
+weight-preparation stage reads that file before creating its pool. Existing
+pools keep their previous count. Schedulers started before live pool settings
+were implemented still show their original pool default in `batch_state.json`;
+the control file and each child's `soft propagation: N CPU workers` log record
+the effective setting. No scientific cache identities change.
+
+To migrate an old unsplit scheduler, first set its control file to `{"workers":0}`,
+let its active frequencies finish, and stop that idle scheduler. Only then replace
+the file with the two queue limits. Scheduling-only changes preserve scientific
+identities and can resume the same batch directory.
+
+To continue after a model/geometry code change, first let active frequencies finish and stop the
+old scheduler. Use a new `--output` plus `--resume-from OLD_BATCH`. Matching
+completed modes are inherited through their original `result_dir`; there is no
+network replay or identity rewrite. Inputs, selected bins and scientific config
+must match. Unfinished frequencies run under the new code; import the existing
+shared geometry cache before launching if its code key changed. Subsequent
+resumes use the same complete command, including `--resume-from`.
 
 Place `--log-file PATH` before the subcommand, outside the new artifact directory.
 Keep the failing process's output/checkpoint, repair an actual failure and resume

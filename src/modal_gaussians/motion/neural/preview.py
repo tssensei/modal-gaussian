@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import tempfile
 from typing import Any
 
@@ -30,7 +31,7 @@ class ModalPreviewArtifact:
 
 
 def load_preview(path: str | Path, *, validate: bool = False) -> ModalPreviewArtifact:
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     m = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     if m.get("format") != FORMAT or m.get("version") != 1:
         raise ValueError("Unsupported modal preview")
@@ -66,19 +67,19 @@ def _validate_bindings(m, scene, completed, design, prepared):
 def build_preview(*, prepared_dir, scene_dir, completed_modes_dir, rendered_design_dir, output_dir,
                   prepared=None, completed=None, design=None):
     """Publish references to stage outputs without repeating validation."""
-    destination = Path(output_dir).expanduser().resolve()
+    destination = resolve_path(output_dir)
     if destination.exists():
         raise FileExistsError(destination)
     prepared = prepared if prepared is not None else load_prepared(prepared_dir)
     completed = completed if completed is not None else load_completed_modes(completed_modes_dir)
     design = design if design is not None else load_rendered_modal_design(rendered_design_dir)
     for artifact, path in ((prepared, prepared_dir), (completed, completed_modes_dir), (design, rendered_design_dir)):
-        if artifact.path.resolve() != Path(path).expanduser().resolve():
+        if artifact.path.resolve() != resolve_path(path):
             raise ValueError("Reused preview input belongs to a different path")
     scene = load_static_scene(scene_dir, "cpu")
     m = {"format": FORMAT, "version": 1, "prepared": str(prepared.path),
          "prepared_identity": prepared.manifest["prepared_identity"],
-         "scene": str(Path(scene_dir).resolve()), "static_scene_identity": completed.manifest["static_scene_identity"],
+         "scene": str(resolve_path(scene_dir)), "static_scene_identity": completed.manifest["static_scene_identity"],
          "completed_modes": str(completed.path), "completed_modes_identity": completed.manifest["completed_modes_identity"],
          "rendered_design": str(design.path), "rendered_design_identity": design.manifest["rendered_design_identity"],
          "modes": completed.manifest["modes"], "views": design.manifest["views"],

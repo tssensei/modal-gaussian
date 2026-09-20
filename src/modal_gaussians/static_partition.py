@@ -12,6 +12,7 @@ import json
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import shutil
 import tempfile
 from typing import Any, Sequence
@@ -249,7 +250,7 @@ def export_repartitioned_scene(scene: ForegroundBackgroundScene, output_dir: str
                                camera_groups: list[list[int]], source_path: str = "") -> Path:
     """Publish a v3 static scene and independently verifiable three-way evidence."""
     config.validate()
-    output = Path(output_dir).expanduser().resolve()
+    output = resolve_path(output_dir)
     if output.exists() or output.is_symlink():
         raise FileExistsError(output)
     cameras = cameras_from_scene_manifest(scene.manifest)
@@ -277,7 +278,7 @@ def export_repartitioned_scene(scene: ForegroundBackgroundScene, output_dir: str
 
 def _publish_partition(scene, output_dir, labels, arrays, partition_fields, source_path, summary_fields):
     """Publish a lossless full-scene reorder, without loading or validating it again."""
-    output = Path(output_dir).expanduser().resolve()
+    output = resolve_path(output_dir)
     if output.exists() or output.is_symlink():
         raise FileExistsError(output)
     subject = np.flatnonzero(labels == SUBJECT)
@@ -384,11 +385,11 @@ def apply_subject_selection(*, scene_dir: str | Path, selection_path: str | Path
     """Apply saved global indices as the motion subject; no rendering or mask reads."""
     from modal_gaussians.subject_selection import read_subject_selection
 
-    output = Path(output_dir).expanduser().resolve()
+    output = resolve_path(output_dir)
     if output.exists() or output.is_symlink():
         raise FileExistsError(output)
-    source = Path(scene_dir).expanduser().resolve(strict=True)
-    selection = Path(selection_path).expanduser().resolve(strict=True)
+    source = resolve_path(scene_dir, strict=True)
+    selection = resolve_path(selection_path, strict=True)
     scene = load_static_scene(source)
     selection_manifest, indices, box = read_subject_selection(selection, scene)
     labels = np.full(scene.count, BACKGROUND, np.uint8)
@@ -552,7 +553,7 @@ def repartition_static_scene(*, scene_dir: str | Path, output_dir: str | Path,
     """Classify an existing static scene; no training, control graph, PNG or Viewer."""
     settings = config or PartitionConfig()
     settings.validate()
-    output = Path(output_dir).expanduser().resolve()
+    output = resolve_path(output_dir)
     if output.exists() or output.is_symlink():
         raise FileExistsError(output)
     selected_device = "cuda" if device == "auto" and torch.cuda.is_available() else "cpu" if device == "auto" else device
@@ -560,7 +561,7 @@ def repartition_static_scene(*, scene_dir: str | Path, output_dir: str | Path,
     cameras = cameras_from_scene_manifest(scene.manifest)
     if not all(c.distortion_applied for c in cameras):
         raise ValueError("Repartition requires a distortion-aware static scene")
-    root = Path(dataset_root or scene.manifest["dataset"]["input_root"]).expanduser().resolve(strict=True)
+    root = resolve_path(dataset_root or scene.manifest["dataset"]["input_root"], strict=True)
     groups = group_camera_views(cameras, settings)
     evidence = EvidenceAccumulator(scene.count, settings)
     progress = Progress("static visibility repartition", len(cameras), unit="views")
@@ -574,4 +575,4 @@ def repartition_static_scene(*, scene_dir: str | Path, output_dir: str | Path,
             progress.update(completed, f"group={group_index + 1}/{len(groups)} camera={camera.name}")
         evidence.finish_group()
     return export_repartitioned_scene(scene, output, evidence.finalize(), settings, groups,
-                                      str(Path(scene_dir).expanduser().resolve()))
+                                      str(resolve_path(scene_dir)))

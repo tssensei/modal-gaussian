@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import shutil
 import struct
 import subprocess
@@ -952,7 +953,7 @@ def _role_png_names(root: Path, parent: str, role: str) -> set[str]:
 def load_static_dataset(root: str | Path) -> StaticDataset:
     """Validate one joint-COLMAP directory and materialize its static data contract."""
 
-    root = Path(root).expanduser().resolve(strict=True)
+    root = resolve_path(root, strict=True)
     cameras_path = root / "cameras.json"
     points_path = root / "sparse" / "0" / "points3D.bin"
     images_path = root / "sparse" / "0" / "images.bin"
@@ -1315,7 +1316,7 @@ def load_static_scene(
 ) -> ForegroundBackgroundScene:
     """Read a tensor scene; full provenance/partition checks require explicit validation."""
 
-    path = Path(path).expanduser().resolve(strict=True)
+    path = resolve_path(path, strict=True)
     manifest_path = path / "manifest.json"
     tensors_path = path / "tensors.pt"
     if not manifest_path.is_file() or not tensors_path.is_file():

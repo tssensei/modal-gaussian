@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+from modal_gaussians.scene_store import resolve_path
 import shutil
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -501,7 +502,7 @@ def _identity_payload(
 def load_frequency_selection(path: str | Path) -> FrequencySelectionArtifact:
     """Load and fully validate one automatic frequency-selection directory."""
 
-    root = Path(path).expanduser().resolve(strict=True)
+    root = resolve_path(path, strict=True)
     manifest_path, arrays_path = root / "manifest.json", root / ARRAY_FILENAME
     if not manifest_path.is_file() or not arrays_path.is_file():
         raise FileNotFoundError(f"Incomplete frequency selection artifact: {root}")
