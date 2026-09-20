@@ -10,5 +10,6 @@ outputs/
 scene_library/
 data/
 checkpoints/
-/tests/
+/tests/*
+!/tests/test_modal_projection.py
 /tmp/

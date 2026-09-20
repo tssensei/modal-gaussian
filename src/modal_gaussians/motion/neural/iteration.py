@@ -73,9 +73,11 @@ def resolve_mode_slots(modes, frequencies_hz):
 
 def training_revision(strategy_config):
     """Cache only code used by this representation, including artifact replay."""
-    from . import artifacts, continuation, control_propagation, prepared, shared_controls
+    from . import artifacts, continuation, control_propagation, prepared, shared_controls, modal_projection
+    from modal_gaussians import camera_rendering
     return module_revision(nm, neural_field, geometry_graph, projection, static,
-        camera_geometry, artifacts, continuation, prepared, shared_controls, control_propagation, strategies, *strategies.implementation_modules(strategy_config))
+        camera_geometry, camera_rendering, modal_projection, artifacts, continuation, prepared, shared_controls,
+        control_propagation, strategies, *strategies.implementation_modules(strategy_config))
 
 
 def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", frequencies_hz=None,

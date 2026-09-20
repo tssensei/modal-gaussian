@@ -137,7 +137,8 @@ class PreparedNeuralInputs:
                 lo, hi = arrays["view_sample_offsets"][index:index + 2]
                 projectors.append(nm.FrozenModalProjector(scene, camera,
                     torch.as_tensor(self.arrays[f"v{index}_jacobian"], device=device),
-                    arrays["sample_pixels_xy"][lo:hi], torch.as_tensor(arrays["sample_confidence"][lo:hi], device=device)))
+                    arrays["sample_pixels_xy"][lo:hi], torch.as_tensor(arrays["sample_confidence"][lo:hi], device=device),
+                    backend=config.modal_projection_backend))
                 cameras.append(camera)
                 depths.append(self.arrays[f"v{index}_depth"])
                 alphas.append(self.arrays[f"v{index}_alpha"])

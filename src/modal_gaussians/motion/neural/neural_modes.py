@@ -74,9 +74,12 @@ class NeuralModesConfig:
     checkpoint_every: int = 100
     device: str = "auto"
     graph_edge_filter: str = "depth"
+    modal_projection_backend: str = "dynamic"
     training_fragment_config: dict[str, Any] | None = None
 
     def validate(self) -> None:
+        if self.modal_projection_backend not in ("dynamic", "cached"):
+            raise ValueError("Neural modal_projection_backend must be dynamic or cached")
         for name in ("exclude_weak_gaussian_rigidity", "zero_weak_graph_weights"):
             if getattr(self, name) is not False:
                 raise ValueError(f"{name} has been removed; only false is supported")
@@ -115,6 +118,8 @@ class NeuralModesConfig:
     def to_dict(self) -> dict[str, Any]:
         self.validate()
         result = asdict(self)
+        if self.modal_projection_backend == "dynamic":
+            result.pop("modal_projection_backend")
         if self.graph_edge_filter == "depth":
             result.pop("graph_edge_filter")
         if self.training_fragment_config is None:
@@ -133,6 +138,8 @@ class NeuralModesConfig:
         result.validate()
         canonical = {key: item for key, item in value.items()
                      if key not in ("exclude_weak_gaussian_rigidity", "zero_weak_graph_weights")}
+        if canonical.get("modal_projection_backend") == "dynamic":
+            canonical.pop("modal_projection_backend")
         if result.to_dict() != canonical:
             raise ValueError("Neural configuration is not fully resolved")
         return result
@@ -310,13 +317,21 @@ class FrozenModalProjector:
     """Differentiable four-channel rasterization; all geometric tensors are fixed."""
 
     def __init__(self, scene: Any, camera: Any, jacobian: torch.Tensor,
-                 pixels: np.ndarray, foreground_alpha: torch.Tensor) -> None:
+                 pixels: np.ndarray, foreground_alpha: torch.Tensor, *, backend: str = "dynamic") -> None:
+        if backend not in ("dynamic", "cached"):
+            raise ValueError("Modal projection backend must be dynamic or cached")
         self.scene, self.camera, self.jacobian = scene, camera, jacobian.detach()
         self.x = torch.as_tensor(pixels[:, 0], device=jacobian.device, dtype=torch.long)
         self.y = torch.as_tensor(pixels[:, 1], device=jacobian.device, dtype=torch.long)
         self.alpha = foreground_alpha.detach()
+        self.cached = None
+        if backend == "cached":
+            from .modal_projection import CachedModalRasterizer
+            self.cached = CachedModalRasterizer(scene, camera, pixels)
 
     def sample_features(self, features: torch.Tensor) -> torch.Tensor:
+        if self.cached is not None:
+            return self.cached(features) / self.alpha[:, None]
         from modal_gaussians.motion.common.projection import render_motion_features
 
         image, _ = render_motion_features(self.scene, self.camera, features)
@@ -564,7 +579,8 @@ def _prepare_observation_arrays(scene: Any, source: Mapping[str, Any], dense: An
             confidence = frozen_arrays["sample_confidence"][lo:hi]
         jacobian, _ = projection_jacobian(points, camera.K.cpu().numpy(), camera.world_to_camera.cpu().numpy(), camera.radial_distortion)
         projector = FrozenModalProjector(scene, camera, torch.as_tensor(jacobian, device=device),
-                                         pixels, torch.as_tensor(confidence, device=device))
+                                         pixels, torch.as_tensor(confidence, device=device),
+                                         backend=config.modal_projection_backend)
         if frozen_arrays is None:
             masses.append(projector.contribution_mass().cpu().numpy())
             sensitivities.append(projector.projection_sensitivity().cpu().numpy())

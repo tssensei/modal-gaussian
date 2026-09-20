@@ -194,6 +194,37 @@ pauses new launches while active work finishes. See
 See [GPU alpha and geometry caching](docs/gpu-alpha.md) for the solver contract,
 timings and explicit `--alpha-backend cpu` compatibility option. Neither GPU backend
 silently falls back to CPU. Existing results retain their original alpha metadata.
+
+Fixed-geometry modal training can optionally cache gsplat projection and sorted
+tile intersections. In a **copy of your existing training config**, add
+`"modal_projection_backend": "cached"` inside `neural`, keeping the other settings.
+Pass that config to `motion iterate-neural` or `motion batch-neural` with `--config`.
+Set the value to `"dynamic"` to restore the original rendering path; omission in
+historical configs means dynamic. This option is recorded in the resolved training,
+batch and checkpoint contracts. Switching backends requires a new experiment;
+the existing continuation rule still allows only an increased iteration limit.
+
+The cache is in GPU memory for each scene/camera projector and is shared across
+its training steps/modes. It is rebuilt when a new training process starts, with
+no disk cache or changes to immutable scene data. It caches projection geometry,
+tile sorting and radial sampling coordinates; pixel compositing and feature
+backward still use gsplat. Foreground/background occlusion and alpha normalization
+are preserved. Geometry/camera updates, parameter replacement or enabled geometry
+gradients fail explicitly rather than using stale projection data. Rebuild the
+prepared observations/projector after geometry changes; use the dynamic renderer
+for future geometry optimization. The current neural trainer still freezes geometry
+with either setting. Do not mutate tensors through `.data`, which bypasses PyTorch
+version tracking. Original RGB/static rendering paths are unchanged.
+
+Synthetic CUDA checks compare forward values and feature gradients for pinhole,
+radial and occluded-subject rendering, verify reuse, and reject stale geometry:
+`python -m unittest discover -s tests -p test_modal_projection.py -v`.
+An authorized Bush comparison measured the three-view projection/image-loss and
+field-backward segment at 57.66 ms dynamic versus 12.02 ms cached (4.80x), with
+0.099 s cache construction and 56.9 MiB additional live memory. This excludes GNN,
+regularizers and optimizer work; full-training speedup remains unmeasured. See
+[the benchmark method and results](docs/modal-projection-benchmark-20260920.md).
+
 Failures stop further launches, preserving logs/checkpoints.
 Re-running the same command resumes matching work and skips published modes.
 New runs default to 5,000 total updates per frequency, retaining patience 50 and
