@@ -1,5 +1,14 @@
 # Current neural motion baseline
 
+GPU propagation promotion (2026-09-19): the user accepted CuPy float64 soft
+propagation as the new mainline. New prepared/iteration/batch runs default to
+`cupy`; a single persistent GPU weight worker finishes all requested weights
+before GNN starts. Controls, supports, losses and numerical conventions are
+unchanged. The CPU adaptive-Dijkstra implementation lives in
+`motion/legacy/neural/control_propagation.py` and is available only through an
+explicit `--propagation-backend cpu` for historical work/comparison. There is no
+automatic CPU fallback. See [GPU usage](docs/gpu-soft-propagation.md).
+
 Storage update (2026-09-19): the accepted results below now have physical entries
 in `scene_library/corn/experiments/baseline_0225` and
 `scene_library/bush/experiments/baseline_0744`. Their models, prepared inputs,

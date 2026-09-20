@@ -21,7 +21,7 @@ def increased_limit(previous, current):
 def model_contract(iteration):
     result = {"prepared": iteration["prepared_identity"], "config": iteration["config"]["neural"],
               "code": iteration["neural_revision"]}
-    result.update({k: iteration[k] for k in ("external_geometry_graph", "source_mode_slots", "continuation") if k in iteration})
+    result.update({k: iteration[k] for k in ("external_geometry_graph", "source_mode_slots", "continuation", "propagation") if k in iteration})
     return result
 
 

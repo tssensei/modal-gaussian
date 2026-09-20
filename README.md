@@ -173,22 +173,22 @@ its saved support distances are imported directly, without recomputation.
 For multiple exported frequencies, `motion batch-neural --modal-images EXPORT
 --prepared PARENT --geometry-graph KNN_CACHE --config CONFIG --output RUN_ROOT
 --cpu-workers 3 --gpu-workers 2` maintains separate preparation and training queues.
-CPU workers prepare observations, graph weights and the existing soft-propagation
-cache; GPU workers consume published caches through the same training command.
-CPU preparation of later frequencies can overlap GPU optimization. Each CPU worker
-defaults to two library threads and four separate soft-propagation
-processes (`--propagation-workers 4`). Control-source searches use the same exact
-shortest paths and fixed supports, with results placed at their original indices.
-Budget the product of CPU workers and propagation workers against CPU/RAM.
-Single-frequency calls can opt in with `MODAL_GAUSSIANS_PROPAGATION_WORKERS=4`.
-`batch_state.json` records progress, active CPU/GPU counts and the ready queue;
-`gpu_usage.csv` samples GPU resources every five seconds. Edit `batch_workers.json`
-atomically to change `cpu_workers` and `gpu_workers` independently (0–8 each).
-Zero pauses new launches in that queue while active processes finish.
-An optional positive `propagation_workers` in the same file overrides the CPU
-pool size for subsequently started soft-propagation stages; existing pools keep
-their size until completion. This can also update an already-running scheduler's
-new CPU children without restarting training.
+CPU workers prepare observations and modal graph weights. Soft propagation defaults
+to CuPy float64: one resident GPU worker consumes ready frequencies, reusing its
+topology and workspace. After all weights finish, that worker exits and the GNN
+queue starts. Use `--stage weights` to stop after weights; the same output with
+`--stage modes` then continues to training. Control placement and supports stay
+unchanged. Install `pip install -e ".[gpu-propagation]"` for the GPU mainline.
+The old CPU search is in `motion/legacy/neural/control_propagation.py`; explicit
+`--propagation-backend cpu` is for historical runs/comparisons only, with no
+automatic fallback. Its `--propagation-workers` setting has no effect on GPU.
+`batch_state.json` records progress; `gpu_weights.log` and
+`propagation_status.json` describe the resident worker. `gpu_usage.csv` samples
+resources every five seconds. Edit `batch_workers.json` atomically to change
+`cpu_workers` and `gpu_workers` independently (0–8 each). Any positive GPU count
+enables only one propagation worker; later it controls GNN concurrency. Zero
+pauses new launches while active work finishes. See
+[GPU usage and measurements](docs/gpu-soft-propagation.md).
 Failures stop further launches, preserving logs/checkpoints.
 Re-running the same command resumes matching work and skips published modes.
 New runs default to 5,000 total updates per frequency, retaining patience 50 and

@@ -24,6 +24,7 @@ dependencies = [
 modal-gaussians = "modal_gaussians.cli:main"
 
 [project.optional-dependencies]
+gpu-propagation = ["cupy-cuda12x>=14.2"]
 mask = [
   "gradio==6.21.0",
   "torchvision==0.22.1+cu128",

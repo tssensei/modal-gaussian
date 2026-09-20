@@ -335,7 +335,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("prepared", "geometry-graph", "controls-from"):
         prepare_controls.add_argument(f"--{name}", type=Path, required=True)
     prepare_controls.add_argument("--config", type=Path)
-    prepare_weights = motion_commands.add_parser("prepare-control-weights", help="Populate exact CPU soft weights before GPU training")
+    prepare_weights = motion_commands.add_parser("prepare-control-weights", help="Populate exact soft weights before GPU training")
     for name in ("prepared", "geometry-graph", "config", "output"):
         prepare_weights.add_argument(f"--{name}", type=Path, required=True)
     prepare_weights.add_argument("--frequency-hz", type=_positive_float, required=True)
@@ -344,11 +344,11 @@ def build_parser() -> argparse.ArgumentParser:
         batch_neural.add_argument(f"--{name}", type=Path, required=True)
     batch_neural.add_argument("--cpu-workers", "--workers", dest="cpu_workers", type=_positive_int, default=3,
                               help="Concurrent CPU preparation stages (--workers is a compatibility alias)")
-    batch_neural.add_argument("--gpu-workers", type=_positive_int, default=2,
+    batch_neural.add_argument("--gpu-workers", type=_non_negative_int, default=2,
                               help="Concurrent GPU training stages")
     batch_neural.add_argument("--threads-per-worker", type=_positive_int, default=2)
     batch_neural.add_argument("--propagation-workers", type=_positive_int, default=4,
-                              help="CPU processes per frequency for exact soft propagation")
+                              help="Legacy CPU backend only: processes per frequency (unused by default GPU propagation)")
     batch_neural.add_argument("--resume-from", type=Path,
                               help="Carry completed frequencies from a stopped batch into a new attempt")
     batch_neural.add_argument("--continue-from", type=Path,
@@ -370,6 +370,10 @@ def build_parser() -> argparse.ArgumentParser:
     iterate_neural.add_argument("--output", type=Path, required=True)
     iterate_neural.add_argument("--stage", choices=("modes", "preview", "full"), default="modes",
                                 help="Stop after final 3D modes by default; preview adds display data, full explicitly fits video coordinates")
+    for entry in (prepare_weights, batch_neural, iterate_neural):
+        entry.add_argument("--propagation-backend", choices=("cupy", "cpu"), default="cupy",
+                           help="GPU propagation by default; cpu explicitly selects the legacy implementation")
+    batch_neural.add_argument("--stage", choices=("weights", "modes"), default="modes")
     for name in ("scene", "topology", "measurements", "graph", "alignment-from", "work-dir", "output"):
         fit_neural.add_argument(f"--{name}", required=True, type=Path)
     for name, default in (
@@ -1029,14 +1033,16 @@ def _dispatch(
                 cpu_workers=args.cpu_workers, gpu_workers=args.gpu_workers, threads_per_worker=args.threads_per_worker,
                 propagation_workers=args.propagation_workers, resume_from=args.resume_from,
                 continue_from=args.continue_from,
+                propagation_backend=args.propagation_backend, stage=args.stage,
                 experiment_name=args.experiment_name)
-            print(f"Batch modes ready: {path}")
+            print(f"Batch {args.stage} ready: {path}")
             return 0
         if args.command == "motion" and args.motion_command == "prepare-control-weights":
             from modal_gaussians.motion.neural.control_preparation import prepare_control_weights
             path = prepare_control_weights(prepared_dir=args.prepared, geometry_graph_dir=args.geometry_graph,
-                config_path=args.config, frequency_hz=args.frequency_hz, output_path=args.output)
-            print(f"CPU control weights ready: {path}")
+                config_path=args.config, frequency_hz=args.frequency_hz, output_path=args.output,
+                backend=args.propagation_backend)
+            print(f"Control weights ready: {path}")
             return 0
         if args.command == "motion" and args.motion_command == "prepare-shared-controls":
             from modal_gaussians.motion.neural.shared_controls import prepare_shared_controls
@@ -1050,6 +1056,7 @@ def _dispatch(
                                   output_dir=args.output, stage=args.stage, frequencies_hz=args.frequency_hz,
                                   geometry_graph_dir=args.geometry_graph,
                                   continue_from=args.continue_from,
+                                  propagation_backend=args.propagation_backend,
                                   refine_observations=args.refine_observations, refinement_config_path=args.refinement_config)
             print(f"iteration: {root}")
             return 0

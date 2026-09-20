@@ -5,6 +5,7 @@ validation/replay. Current v16 training lives in `motion.neural.component_field`
 
 | File | Historical behavior |
 |---|---|
+| `control_propagation.py` | CPU adaptive Dijkstra/process pool; explicit `--propagation-backend cpu` or numerical comparisons only |
 | `fragment_propagation.py` | v9 post-training fragment attachment/transfer |
 | `training_fragments.py` | v10 fragment transfer compiled into interpolation |
 | `surface_attachments.py` | v11 surface-based attachment |

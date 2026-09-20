@@ -7,11 +7,13 @@ from modal_gaussians.scene_store import resolve_path, logical_path
 import subprocess
 import sys
 import time
+import uuid
 
 from modal_gaussians.iteration_cache import atomic_json, exclusive_work, identity
 from modal_gaussians.progress import report_progress
 from .iteration import resolve_config, training_revision
 from .control_preparation import ready as weights_ready, propagation_count
+from .control_propagation import backend_identity
 
 
 def _read(path):
@@ -69,7 +71,8 @@ def _published(job, stage, parent):
     name, marker, _ = stage
     if name == "weights":
         return weights_ready(marker, prepared_dir=job["prepared_dir"], graph_dir=job["graph_dir"],
-            frequency_hz=job["frequency_hz"], revision=job["revision"], config_identity=job["config_identity"])
+            frequency_hz=job["frequency_hz"], revision=job["revision"], config_identity=job["config_identity"],
+            backend=job.get("backend", "cpu"))
     if not marker.is_file():
         return False
     record = _read(marker)
@@ -105,6 +108,8 @@ def _gpu_sample(stream, active):
 def _completed_from(source, contract, jobs):
     """Explicitly carry completed modes across attempts; never rewrite old identities."""
     previous = _read(source / "batch_contract.json")
+    if previous.get("propagation", {"backend": "cpu"}) != contract.get("propagation", {"backend": "cpu"}):
+        raise ValueError("Resume source has a different propagation backend/kernel")
     keys = ("format", "version", "modal_images", "export_identity", "prepared", "prepared_identity",
             "geometry_graph", "geometry_identity", "config")
     if any(previous.get(key) != contract.get(key) for key in keys):
@@ -125,6 +130,8 @@ def _continued_from(source, contract, jobs):
     """Reuse published CPU inputs but revisit every mode under the increased cap."""
     from .continuation import increased_limit, model_contract
     previous = _read(source / "batch_contract.json")
+    if previous.get("propagation", {"backend": "cpu"}) != contract.get("propagation", {"backend": "cpu"}):
+        raise ValueError("Continuation source has a different propagation backend/kernel")
     keys = ("format", "version", "modal_images", "export_identity", "prepared", "prepared_identity",
             "geometry_graph", "geometry_identity")
     if (any(previous.get(key) != contract.get(key) for key in keys)
@@ -161,11 +168,23 @@ def _continued_from(source, contract, jobs):
                 job["stages"][index] = name, marker, arguments
 
 
+def training_barrier(jobs):
+    """Every required weight stage must be published before the first GPU train."""
+    return all(job["state"] == "complete" or all(name != "weights"
+        for name, _, _ in job["stages"][job["next"]:]) for job in jobs)
+
+
 def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, output_dir,
               cpu_workers=3, gpu_workers=2, threads_per_worker=2, propagation_workers=4,
-              experiment_name="experiment_shared_001", resume_from=None, continue_from=None):
-    if not (1 <= cpu_workers <= 8 and 1 <= gpu_workers <= 8) or threads_per_worker < 1 or propagation_workers < 1:
-        raise ValueError("Use 1–8 workers per queue and positive CPU thread/propagation counts")
+              experiment_name="experiment_shared_001", resume_from=None, continue_from=None,
+              propagation_backend="cupy", stage="modes"):
+    propagation = backend_identity(propagation_backend)
+    if stage not in ("weights", "modes"):
+        raise ValueError("Batch stage must be weights or modes")
+    if stage == "weights" and (continue_from is not None or resume_from is not None):
+        raise ValueError("Weights-only batches resume in their original output directory; omit continuation/resume source")
+    if not (1 <= cpu_workers <= 8 and 0 <= gpu_workers <= 8) or threads_per_worker < 1 or propagation_workers < 1:
+        raise ValueError("Use 1–8 CPU workers, 0–8 GPU workers and positive CPU thread/propagation counts")
     if not experiment_name or Path(experiment_name).name != experiment_name or experiment_name in (".", ".."):
         raise ValueError("Experiment name must be a single directory name")
     exported, prepared, graph, config = [resolve_path(p, strict=True) for p in
@@ -176,12 +195,20 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
     if resolved["fragment"].get("strategy") != "component_field":
         raise ValueError("This batch runner uses the component-field baseline")
     export, jobs = _jobs(exported, prepared, graph, config, root, experiment_name)
+    for job in jobs:
+        job["backend"] = propagation_backend
+        for name, _, arguments in job["stages"]:
+            if name in ("weights", "train"):
+                arguments.extend(["--propagation-backend", propagation_backend])
+        if stage == "weights":
+            job["stages"] = [s for s in job["stages"] if s[0] != "train"]
     contract = {"format": "modal_gaussians.neural_batch", "version": 1,
         "modal_images": str(logical_path(exported)), "export_identity": identity(export),
         "prepared": str(logical_path(prepared)), "prepared_identity": parent["prepared_identity"],
         "geometry_graph": str(logical_path(graph)), "geometry_identity": identity(_read(graph / "manifest.json")),
         "config": resolved, "revision": training_revision(resolved["fragment"]),
         "experiment_name": experiment_name, "threads_per_worker": threads_per_worker}
+    contract.update(propagation=propagation, stage=stage)
     for job in jobs:
         job.update(revision=contract["revision"], config_identity=identity(resolved))
     if continue_from is not None:
@@ -205,7 +232,11 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
     with exclusive_work(root / "batch.lock"):
         contract_file = root / "batch_contract.json"
         if contract_file.exists() and _read(contract_file) != contract:
-            raise ValueError("Batch inputs/configuration/code changed; use a new batch directory")
+            old = _read(contract_file)
+            if stage == "modes" and old.get("stage") == "weights" and {**old, "stage": "modes"} == contract:
+                atomic_json(contract_file, contract)
+            else:
+                raise ValueError("Batch inputs/configuration/code changed; use a new batch directory")
         if not contract_file.exists():
             if any(job["stages"][-1][1].parent.exists() for job in jobs):
                 raise FileExistsError("Use a fresh experiment name for the initial batch")
@@ -220,9 +251,21 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
             env[key] = str(threads_per_worker)
         cpu_env = dict(env, CUDA_VISIBLE_DEVICES="")
         active, failed = {}, False
+        weight_worker = None
+        weight_log = None
+        weight_request = None
+
+        def stop_weight_worker():
+            nonlocal weight_worker, weight_log
+            if weight_worker is not None:
+                if weight_worker.poll() is None:
+                    atomic_json(root / "propagation_request.json", {"id": uuid.uuid4().hex, "stop": True})
+                    weight_worker.wait(timeout=30)
+                weight_log.close()
+                weight_worker, weight_log = None, None
 
         def queue(stage):
-            return "gpu" if stage == "train" else "cpu"
+            return "gpu" if stage == "train" or (stage == "weights" and propagation_backend == "cupy") else "cpu"
 
         def counts():
             return {key: sum(queue(job["stage"]) == key for _, _, job in active.values()) for key in limits}
@@ -235,7 +278,9 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
                 "cpu_workers": limits["cpu"], "gpu_workers": limits["gpu"],
                 "active_cpu": running["cpu"], "active_gpu": running["gpu"],
                 "ready_for_gpu": sum(j["state"] == "pending" and j["stage"] == "train" for j in jobs),
-                "propagation_workers": propagation_workers,
+                "propagation_workers": propagation_workers if propagation_backend == "cpu" else None,
+                "propagation_backend": propagation_backend,
+                "phase": "weights" if propagation_backend == "cupy" and not training_barrier(jobs) else stage,
                 "jobs": [{**{k: job[k] for k in ("bin", "frequency_hz", "state", "stage", "pid")},
                           "queue": queue(job["stage"]) if job["state"] != "complete" else None,
                           "result_dir": job.get("result_dir", str(job["stages"][-1][1].parent))} for job in jobs]}
@@ -257,7 +302,8 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
             try:
                 while True:
                     control = _read(limit_file)
-                    requested_propagation = propagation_count(control, propagation_workers)
+                    requested_propagation = (propagation_count(control, propagation_workers)
+                                             if propagation_backend == "cpu" else propagation_workers)
                     if requested_propagation != propagation_workers:
                         report_progress(f"batch propagation workers {propagation_workers} -> {requested_propagation} (new pools only)")
                         propagation_workers = requested_propagation
@@ -271,9 +317,17 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
                     limits = requested
                     for pid, (process, log, job) in list(active.items()):
                         code = process.poll()
+                        resident = process is weight_worker
+                        if resident and code is None:
+                            status_path = root / "propagation_status.json"
+                            status = _read(status_path) if status_path.exists() else {}
+                            if status.get("id") != weight_request or status.get("status") == "running":
+                                continue
+                            code = 0 if status["status"] == "complete" else 1
                         if code is None:
                             continue
-                        log.close()
+                        if not resident:
+                            log.close()
                         del active[pid]
                         job["pid"] = None
                         if code != 0 or not _published(job, job["stages"][job["next"]], parent):
@@ -291,16 +345,42 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
                         while job["next"] < len(job["stages"]) and _published(job, job["stages"][job["next"]], parent):
                             job["next"] += 1
                         if job["next"] == len(job["stages"]):
-                            job["state"], job["stage"] = "complete", "modes_ready"
+                            job["state"], job["stage"] = "complete", "weights_ready" if stage == "weights" else "modes_ready"
                             report_progress(f"batch complete {sum(j['state'] == 'complete' for j in jobs)}/{len(jobs)} | {job['frequency_hz']:g} Hz")
                             continue
-                        stage, _, arguments = job["stages"][job["next"]]
-                        job["stage"] = stage
-                        resource = queue(stage)
+                        current_stage, _, arguments = job["stages"][job["next"]]
+                        job["stage"] = current_stage
+                        resource = queue(current_stage)
                         if failed or counts()[resource] >= limits[resource]:
                             continue
+                        if propagation_backend == "cupy":
+                            if current_stage == "train":
+                                if not training_barrier(jobs):
+                                    continue
+                                # Process exit releases the workspace and CUDA context before GNN.
+                                stop_weight_worker()
+                            elif current_stage == "weights":
+                                if any(j["stage"] == "weights" for _, _, j in active.values()):
+                                    continue
+                                weight_request = uuid.uuid4().hex
+                                atomic_json(root / "propagation_request.json", {"id": weight_request, "arguments": {
+                                    "prepared_dir": str(job["prepared_dir"]), "geometry_graph_dir": str(job["graph_dir"]),
+                                    "config_path": str(config), "frequency_hz": job["frequency_hz"],
+                                    "output_path": str(job["stages"][job["next"]][1])}})
+                                if weight_worker is None:
+                                    weight_log = (root / "gpu_weights.log").open("a", encoding="utf-8")
+                                    weight_worker = subprocess.Popen([sys.executable, "-m",
+                                        "modal_gaussians.motion.neural.control_preparation", str(root), str(os.getpid())],
+                                        stdout=weight_log, stderr=subprocess.STDOUT, env=env,
+                                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                                elif weight_worker.poll() is not None:
+                                    raise RuntimeError("Persistent GPU weight worker exited unexpectedly")
+                                job.update(state="running", stage="weights", pid=weight_worker.pid)
+                                active[weight_worker.pid] = weight_worker, weight_log, job
+                                report_progress(f"batch start {job['frequency_hz']:g} Hz | weights | GPU | pid={weight_worker.pid}; propagation_workers not applicable")
+                                continue
                         job["folder"].mkdir(parents=True, exist_ok=True)
-                        log = (job["folder"] / f"parallel_{stage}.log").open("a", encoding="utf-8")
+                        log = (job["folder"] / f"parallel_{current_stage}.log").open("a", encoding="utf-8")
                         try:
                             process = subprocess.Popen([sys.executable, "-m", "modal_gaussians.cli", *arguments],
                                 stdout=log, stderr=subprocess.STDOUT, env=cpu_env if resource == "cpu" else env,
@@ -308,15 +388,16 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
                         except BaseException:
                             log.close()
                             raise
-                        job.update(state="running", stage=stage, pid=process.pid)
+                        job.update(state="running", stage=current_stage, pid=process.pid)
                         active[process.pid] = process, log, job
-                        report_progress(f"batch start {job['frequency_hz']:g} Hz | {stage} | {resource.upper()} | pid={process.pid}")
+                        report_progress(f"batch start {job['frequency_hz']:g} Hz | {current_stage} | {resource.upper()} | pid={process.pid}")
                     if time.monotonic() - last_sample >= 5:
                         _gpu_sample(resource_log, active)
                         last_sample = time.monotonic()
                     done = all(job["state"] == "complete" for job in jobs)
                     save("complete" if done else "failed" if failed else "running")
                     if done or (failed and not active):
+                        stop_weight_worker()
                         break
                     time.sleep(1)
             except BaseException:
@@ -336,6 +417,11 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
                     log.close()
                     job.update(state="interrupted", pid=None)
                 active.clear()
+                if weight_worker is not None and weight_worker.poll() is None:
+                    weight_worker.terminate()
+                    weight_worker.wait(timeout=10)
+                if weight_log is not None:
+                    weight_log.close()
                 save("interrupted")
                 raise
         if failed:

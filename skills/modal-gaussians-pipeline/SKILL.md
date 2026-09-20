@@ -7,6 +7,15 @@ description: Run, debug, and resume this repository's SEA-RAFT/shared-FFT modal-
 
 ## Scene storage: look up reusable data first
 
+GPU soft propagation is the accepted mainline (2026-09-19). Default to CuPy
+float64 for control weights; do not select the legacy CPU backend or tune
+`propagation_workers` for ordinary experiments. CPU still prepares observations
+and modal graph evidence. One resident GPU worker computes all frequency weights,
+then exits before GNN training begins. `--stage weights` stops before training.
+Keep existing controls/supports and import saved shared geometry when code keys
+change; never recompute it merely to migrate the backend. See
+`references/commands.md` for the current commands. No automatic CPU fallback.
+
 Read `SCENE_STORAGE.md` and `scene_library/<scene>/catalog.json` before starting
 new Bush/Corn work. Use `modal-gaussians storage list --scene bush|corn` to find
 SEA-RAFT, shared FFT, prepared observations, KNN candidates, shared controls,

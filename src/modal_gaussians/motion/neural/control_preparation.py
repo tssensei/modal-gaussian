@@ -12,6 +12,7 @@ from .geometry_graph import GeometryGraph
 from .iteration import resolve_config, training_revision
 from .prepared import load_prepared
 from .shared_controls import weighted_geometry
+from .control_propagation import backend_identity
 
 
 FORMAT = "modal_gaussians.control_weights_ready"
@@ -28,7 +29,7 @@ def propagation_count(control, default):
     return workers
 
 
-def ready(path, *, prepared_dir, graph_dir, frequency_hz, revision, config_identity):
+def ready(path, *, prepared_dir, graph_dir, frequency_hz, revision, config_identity, backend="cupy"):
     """Inspect publication metadata only; never read back numerical cache payloads."""
     path = resolve_path(path)
     if not path.is_file():
@@ -39,17 +40,28 @@ def ready(path, *, prepared_dir, graph_dir, frequency_hz, revision, config_ident
         "frequency_hz": frequency_hz, "revision": revision, "config_identity": config_identity}
     if any(record.get(key) != value for key, value in expected.items()):
         raise ValueError(f"Control preparation differs: {path}")
+    if record.get("propagation", {"backend": "cpu"}) != backend_identity(backend):
+        raise ValueError(f"Control preparation backend/kernel differs: {path}")
     if (record["prepared_identity"] != _read(Path(prepared_dir) / "manifest.json")["prepared_identity"]
             or record["graph_identity"] != identity(_read(Path(graph_dir) / "manifest.json"))):
         raise ValueError(f"Control preparation inputs changed: {path}")
     caches = record.get("caches", {})
     if set(caches) != {"shared_control_geometry", "frequency_control_weights"}:
         raise ValueError(f"Control preparation is missing cache locations: {path}")
+    if "propagation" in record:
+        weight_path = resolve_path(caches["frequency_control_weights"])
+        if (weight_path / "manifest.json").is_file():
+            weight_contract = _read(weight_path / "manifest.json")["contract"]
+            if (weight_contract.get("propagation") != record["propagation"]
+                    or weight_path.name != identity(weight_contract)):
+                raise ValueError(f"Control weight cache identity differs: {path}")
     return all((resolve_path(cache) / "manifest.json").is_file() and (resolve_path(cache) / "arrays.npz").is_file()
                for cache in caches.values())
 
 
-def prepare_control_weights(*, prepared_dir, geometry_graph_dir, config_path, frequency_hz, output_path):
+def prepare_control_weights(*, prepared_dir, geometry_graph_dir, config_path, frequency_hz, output_path,
+                            backend="cupy", workspace=None):
+    propagation = backend_identity(backend)
     output = resolve_path(output_path)
     timer = Timings()
     with exclusive_work(output.with_suffix(".lock")):
@@ -59,7 +71,7 @@ def prepare_control_weights(*, prepared_dir, geometry_graph_dir, config_path, fr
         neural = nm.NeuralModesConfig.from_dict(config["neural"])
         external = prepared.external_geometry_contract
         if config["fragment"].get("strategy") != "component_field":
-            raise ValueError("CPU weight preparation requires the component-field baseline")
+            raise ValueError("Weight preparation requires the component-field baseline")
         if (len(prepared.source["modes"]) != 1
                 or not np.isclose(prepared.source["modes"][0]["frequency_hz"], frequency_hz, rtol=0, atol=1e-9)
                 or not np.isclose(external["frequency_hz"], frequency_hz, rtol=0, atol=1e-9)):
@@ -70,7 +82,7 @@ def prepare_control_weights(*, prepared_dir, geometry_graph_dir, config_path, fr
         revision, config_id = training_revision(config["fragment"]), identity(config)
         graph_dir = resolve_path(geometry_graph_dir)
         if ready(output, prepared_dir=prepared.path, graph_dir=graph_dir,
-                 frequency_hz=frequency_hz, revision=revision, config_identity=config_id):
+                 frequency_hz=frequency_hz, revision=revision, config_identity=config_id, backend=backend):
             return output
         # Each batch child reads the live setting once, before creating its pool.
         # Existing pools finish unchanged; standalone calls retain their environment setting.
@@ -79,12 +91,14 @@ def prepare_control_weights(*, prepared_dir, geometry_graph_dir, config_path, fr
         control = (_read(control_file) if control_file.is_file() and (batch_root / "batch_contract.json").is_file() else {})
         key = "MODAL_GAUSSIANS_PROPAGATION_WORKERS"
         previous = os.environ.get(key)
-        workers = propagation_count(control, int(previous or "1"))
+        workers = propagation_count(control, int(previous or "1")) if backend == "cpu" else None
         try:
-            os.environ[key] = str(workers)
+            if workers is not None:
+                os.environ[key] = str(workers)
             weighted_geometry(GeometryGraph.from_dict(prepared.external_geometry_graph),
                 geometry_config=nm._geometry_config(neural), fragment_config=config["fragment"],
-                scene_scale=float(prepared.arrays["o_scene_scale"]), cache_dir=prepared.cache_dir, timer=timer)
+                scene_scale=float(prepared.arrays["o_scene_scale"]), cache_dir=prepared.cache_dir, timer=timer,
+                backend=backend, workspace=workspace)
         finally:
             if previous is None:
                 os.environ.pop(key, None)
@@ -96,6 +110,67 @@ def prepare_control_weights(*, prepared_dir, geometry_graph_dir, config_path, fr
             "frequency_hz": frequency_hz, "revision": revision, "config_identity": config_id,
             "caches": {stage["stage"]: stage["cache_path"] for stage in timer.records
                        if stage["stage"] in ("shared_control_geometry", "frequency_control_weights")},
-            "timings": timer.records, "propagation_workers": workers}
+            "timings": timer.records, "propagation_workers": workers if backend == "cpu" else None,
+            "propagation": propagation}
         atomic_json(output, record)
     return output
+
+
+def run_gpu_worker(root, parent_pid):
+    """One private batch subprocess, a single atomic request at a time."""
+    import time
+    import traceback
+    from .control_propagation_gpu import Workspace
+    root = Path(root)
+    workspace = Workspace()
+    # A killed scheduler must not leave an idle CUDA context holding 20+ GiB.
+    if os.name == "nt":
+        import ctypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel.OpenProcess(0x00100000, 0, parent_pid)  # SYNCHRONIZE
+        if not handle:
+            raise OSError("Cannot monitor the owning batch process")
+
+    def parent_alive():
+        if os.name == "nt":
+            return kernel.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT
+        try:
+            os.kill(parent_pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    last = None
+    while parent_alive():
+        request_file = root / "propagation_request.json"
+        if not request_file.exists():
+            time.sleep(.2)
+            continue
+        request = _read(request_file)
+        if request["id"] == last:
+            time.sleep(.2)
+            continue
+        last = request["id"]
+        if request.get("stop"):
+            break
+        atomic_json(root / "propagation_status.json", {"id": last, "status": "running", "pid": os.getpid()})
+        try:
+            workspace.stats = {}
+            prepare_control_weights(**request["arguments"], backend="cupy", workspace=workspace)
+        except BaseException:
+            atomic_json(root / "propagation_status.json", {"id": last, "status": "failed", "error": traceback.format_exc()})
+            raise
+        atomic_json(root / "propagation_status.json", {"id": last, "status": "complete",
+            "propagation_workers": None, "gpu": workspace.stats})
+    workspace.close()
+    if os.name == "nt":
+        kernel.CloseHandle(handle)
+
+
+if __name__ == "__main__":
+    import sys
+    run_gpu_worker(sys.argv[1], int(sys.argv[2]))

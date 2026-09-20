@@ -42,6 +42,7 @@ class PreparedNeuralInputs:
     arrays: dict[str, np.ndarray]
     external_geometry_graph: dict[str, np.ndarray] | None = None
     external_geometry_contract: dict[str, Any] | None = None
+    propagation_backend: str = "cupy"
 
     @property
     def source(self):
@@ -200,6 +201,7 @@ class PreparedNeuralInputs:
                                          contribution_mass=arrays["contribution_mass"])
                 control_contract["component_inputs"] = nm._arrays_identity(attachment_inputs)
                 control_contract["shared_control_revision"] = module_revision(shared_controls, control_propagation)
+                control_contract["propagation"] = control_propagation.backend_identity(self.propagation_backend)
             control_contract.update(implementation="host_controls_with_training_fill_v1",
                 fragment_config=config.training_fragment_config,
                 attachment_code=module_revision(strategies, *strategies.implementation_modules(config.training_fragment_config)))
@@ -208,7 +210,7 @@ class PreparedNeuralInputs:
                 if config.training_fragment_config.get("strategy") == "component_field":
                     geometry_arrays = shared_controls.weighted_geometry(graph, geometry_config=settings,
                         fragment_config=config.training_fragment_config, scene_scale=float(arrays["scene_scale"]),
-                        cache_dir=self.cache_dir, timer=timer)
+                        cache_dir=self.cache_dir, timer=timer, backend=self.propagation_backend)
                 return strategies.build_training_controls(graph, geometry_config=settings,
                     fragment_config=config.training_fragment_config, scene_scale=float(arrays["scene_scale"]),
                     attachment_inputs=attachment_inputs, geometry_arrays=geometry_arrays)

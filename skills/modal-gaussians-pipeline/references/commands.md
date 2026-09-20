@@ -152,43 +152,31 @@ with a logged reason. Old results and their identities remain unchanged.
 For an explicitly authorized parallel batch from an already exported selection:
 
 ```bat
-modal-gaussians --log-file outputs\bush_uniform60_modes_001\batch.log motion batch-neural --modal-images outputs\bush_uniform60_modes_001\modal_images --prepared outputs\bush_neural_modal_similarity_0744_001\prepared --geometry-graph outputs\_cache\geometry\d8037d88fd6390382ad02ca899fb5f6ce7009e3a33814209164047b77be43126 --config configs\neural_component_field.json --output outputs\bush_uniform60_modes_001 --cpu-workers 3 --gpu-workers 2 --threads-per-worker 2 --experiment-name experiment_shared_001
+modal-gaussians storage run --scene bush -- motion batch-neural --modal-images @modal_images --prepared @prepared --geometry-graph @candidate_graph --config configs/neural_component_field.json --output @experiments/uniform60_cupy_001 --cpu-workers 3 --gpu-workers 2 --threads-per-worker 2 --stage modes
 ```
 
-This separates CPU preparation from GPU training. CPU slots run selected-modal
-preparation, graph weighting and `motion prepare-control-weights`; the latter
-populates the same cache consumed by training, without loading a scene or GPU.
-A small `control_weights_ready.json` receipt is published after cache completion.
-GPU slots start only for ready frequencies while CPU slots prepare later ones.
-Completed pre-split modes are skipped without recomputing CPU work. It creates
-`batch_state.json`, `batch_workers.json` and five-second `gpu_usage.csv` samples.
-The initial counts are used only when the control file does not yet exist;
-change that file atomically to adjust the live limits, for example
-`{"cpu_workers":3,"gpu_workers":2}`. Zero pauses new launches in that queue,
-without interrupting active work. `batch_state.json` includes `active_cpu`,
-`active_gpu` and `ready_for_gpu`. A subprocess failure prevents further launches;
-existing children finish their current stages. The same command resumes matching
-artifacts/checkpoints without validation; changed model code/config requires a
-new batch contract/output. Use resource observations to choose concurrency, not
-scientific changes to iteration limits, resolution or modes. Do not restart an
-already active batch: its OS lock prevents duplicate scheduling.
+CuPy float64 is the default (`--propagation-backend cupy` remains accepted).
+CPU slots prepare observations and modal graph evidence while one resident GPU
+worker computes frequency control weights. The worker reuses topology/workspace;
+all required weights finish before it exits and the GNN queue begins. Control
+layout and supports are unchanged. Import saved shared geometry first if source
+revision changes its cache key. Missing CuPy or a GPU error fails explicitly.
 
-Soft propagation uses a separate CPU process pool per frequency. The batch flag
-`--propagation-workers 4` (default 4) parallelizes control-source searches while
-preserving exact adaptive Dijkstra distances, original support indices and final
-normalization. Each child receives the read-only graph once; no GPU computation
-or extra dependency is introduced. Three CPU preparation slots therefore use up to
-twelve propagation processes, separate from `--threads-per-worker` library
-thread limits. For a standalone single-frequency command, set the environment
-variable `MODAL_GAUSSIANS_PROPAGATION_WORKERS=4`; its default is serial.
-To adjust a running batch without discarding active work, add or update the
-positive integer `propagation_workers` in `batch_workers.json`, for example
-`{"cpu_workers":4,"gpu_workers":2,"propagation_workers":6}`. Each new CPU
-weight-preparation stage reads that file before creating its pool. Existing
-pools keep their previous count. Schedulers started before live pool settings
-were implemented still show their original pool default in `batch_state.json`;
-the control file and each child's `soft propagation: N CPU workers` log record
-the effective setting. No scientific cache identities change.
+Use `--stage weights` to prepare weights only, then the same output/command with
+`--stage modes` to continue. Monitor `batch_state.json`, `gpu_weights.log`,
+`propagation_status.json` and five-second `gpu_usage.csv` samples. Change
+`batch_workers.json` atomically, for example `{"cpu_workers":3,"gpu_workers":2}`.
+Any positive GPU count enables one weight worker; it controls normal GNN
+concurrency after the weight phase. Zero pauses new frequencies while active
+work finishes. No ordinary experiment needs `propagation_workers`.
+
+The CPU adaptive-Dijkstra implementation lives under `motion/legacy/neural`.
+Only explicit historical comparisons use `--propagation-backend cpu`; that route
+retains `--propagation-workers` and the old CPU/GPU-overlap scheduler. A GPU cache
+cannot be substituted for a legacy CPU identity, or vice versa. Use a new output
+when changing backend or code, and preserve historical artifacts. Do not resume
+the stopped Bush batch without a user request. See `docs/gpu-soft-propagation.md`
+for installation, reuse and benchmark details.
 
 To migrate an old unsplit scheduler, first set its control file to `{"workers":0}`,
 let its active frequencies finish, and stop that idle scheduler. Only then replace

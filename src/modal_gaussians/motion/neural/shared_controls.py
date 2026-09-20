@@ -83,7 +83,7 @@ def shared_geometry(graph, *, geometry_config, fragment_config, scene_scale, cac
     return cached(root, contract, build, timer, "shared_control_geometry"), contract
 
 
-def reweight_geometry(graph, shared):
+def reweight_geometry(graph, shared, *, backend="cupy", workspace=None, propagated=None):
     """Exact existing attenuation on fixed supports; bounded searches retain shortest paths."""
     host = host_subgraph(graph, shared["t_host_gaussian_index"])
     support = _support_by_control(shared)
@@ -93,8 +93,9 @@ def reweight_geometry(graph, shared):
     if not np.array_equal(propagation, host.edge_length):
         adjacency = _adjacency(host, propagation)
         maximum_stretch = float(np.max(propagation / host.edge_length))
-        attenuation = control_propagation.attenuation(adjacency, shared["c_control_point_index"],
-                                                     support, distance, maximum_stretch)
+        attenuation = (control_propagation.attenuation(adjacency, shared["c_control_point_index"],
+            support, distance, maximum_stretch, backend=backend, workspace=workspace) if propagated is None
+            else np.divide(distance, propagated, out=np.ones_like(distance), where=propagated > 0))
     ratio = distance / (2 * float(shared["c_coverage_radius"]))
     weights = (1 - ratio) ** 4 * (4 * ratio + 1) * attenuation
     interpolation = csr_matrix((weights, shared["c_interpolation_indices"], shared["c_interpolation_indptr"]),
@@ -120,15 +121,20 @@ def reweight_geometry(graph, shared):
         "c_interpolation_weights": weights, "c_control_edge_weight": control_weights}
 
 
-def weighted_geometry(graph, *, geometry_config, fragment_config, scene_scale, cache_dir, timer):
-    shared, contract = shared_geometry(graph, geometry_config=geometry_config, fragment_config=fragment_config,
-        scene_scale=scene_scale, cache_dir=cache_dir, timer=timer)
-    weight_contract = {"implementation": "component_control_weights_v1", "geometry": identity(contract),
+def weight_contract(graph, geometry, backend="cupy"):
+    return {"implementation": "component_control_weights_v1", "geometry": identity(geometry),
         "propagation_code": module_revision(control_propagation),
+        "propagation": control_propagation.backend_identity(backend),
         "weights": nm._arrays_identity({"edge_weight": graph.edge_weight,
                                         "propagation_length": graph.propagation_lengths()})}
-    return cached(Path(cache_dir) / "control_weights", weight_contract,
-        lambda: reweight_geometry(graph, shared), timer, "frequency_control_weights")
+
+
+def weighted_geometry(graph, *, geometry_config, fragment_config, scene_scale, cache_dir, timer,
+                      backend="cupy", workspace=None):
+    shared, contract = shared_geometry(graph, geometry_config=geometry_config, fragment_config=fragment_config,
+        scene_scale=scene_scale, cache_dir=cache_dir, timer=timer)
+    return cached(Path(cache_dir) / "control_weights", weight_contract(graph, contract, backend),
+        lambda: reweight_geometry(graph, shared, backend=backend, workspace=workspace), timer, "frequency_control_weights")
 
 
 def prepare_shared_controls(*, prepared_dir, geometry_graph_dir, controls_from, config_path=None):

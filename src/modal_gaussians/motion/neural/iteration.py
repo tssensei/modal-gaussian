@@ -79,7 +79,10 @@ def training_revision(strategy_config):
 
 
 def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", frequencies_hz=None,
-                   refine_observations=False, refinement_config_path=None, geometry_graph_dir=None, continue_from=None):
+                   refine_observations=False, refinement_config_path=None, geometry_graph_dir=None, continue_from=None,
+                   propagation_backend="cupy"):
+    from .control_propagation import backend_identity
+    propagation = backend_identity(propagation_backend)
     if stage not in ("modes", "preview", "full"):
         raise ValueError("Iteration stage must be modes, preview or full")
     refinement = None
@@ -93,11 +96,14 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
     timer = Timings()
     with timer.stage("prepared_load"):
         prepared = load_prepared(prepared_dir)
+        prepared.propagation_backend = propagation_backend
         if geometry_graph_dir is not None:
             prepared.attach_geometry_graph(geometry_graph_dir)
         overrides = json.loads(Path(config_path).read_text(encoding="utf-8")) if config_path else baseline_overrides()
         config = resolve_config(prepared.manifest["defaults"], overrides)
         settings = nm.NeuralModesConfig.from_dict(config["neural"])
+        if propagation_backend == "cupy" and (settings.training_fragment_config or {}).get("strategy") != "component_field":
+            raise ValueError("CuPy propagation requires the component-field shared-control path")
         if refinement is not None and (settings.training_fragment_config or {}).get("strategy") == "component_field":
             raise ValueError("Observation refinement is disabled for component_field; omit --refine-observations")
         if refinement is not None and (settings.training_fragment_config or {}).get("strategy") not in ("pointwise", "guarded"):
@@ -121,6 +127,8 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
     contract = {"version": 2, "prepared": str(logical_path(prepared.path)),
                 "prepared_identity": prepared.manifest["prepared_identity"],
                 "config": config, "neural_revision": neural_revision}
+    if propagation_backend != "cpu":
+        contract["propagation"] = propagation
     if getattr(prepared, "external_geometry_contract", None) is not None:
         contract["external_geometry_graph"] = prepared.external_geometry_contract
     if strategy_config is None:
@@ -178,6 +186,9 @@ def _build_modes_with_publication_retry(**kwargs):
 def _run_stages(root, prepared, config, neural_revision, stage, timer, mode_slots=None, refinement=None, continuation=None):
     source = prepared.source
     model_contract = {"prepared": prepared.manifest["prepared_identity"], "config": config["neural"], "code": neural_revision}
+    if prepared.propagation_backend != "cpu":
+        from .control_propagation import backend_identity
+        model_contract["propagation"] = backend_identity(prepared.propagation_backend)
     if getattr(prepared, "external_geometry_contract", None) is not None:
         model_contract["external_geometry_graph"] = prepared.external_geometry_contract
     if mode_slots is not None:
