@@ -1180,7 +1180,7 @@ def build_rigid_modes_artifact(
                 sample_measurements=np.asarray(measurements.measurements[slot]),
                 view_labels=view_labels,
             )
-            alpha = solve_alpha_sync(prepared, alpha_settings)
+            alpha = solve_alpha_sync(prepared, alpha_settings, backend="cpu")
             rigid = solve_rigid_components(
                 prepared, alpha, graph.arrays, rigid_settings
             )

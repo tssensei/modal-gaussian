@@ -181,7 +181,8 @@ def _subject_topology(parent, source, scene, output_dir, final_dir, config):
     return topology, renders
 
 
-def prepare_selected_modal(*, prepared_dir, views, frequency_hz, output_dir, scene_dir=None):
+def prepare_selected_modal(*, prepared_dir, views, frequency_hz, output_dir, scene_dir=None,
+                           alpha_backend="cupy", alpha_workspace=None):
     """Publish one new observation snapshot, with no graph build or training."""
     if not math.isfinite(frequency_hz) or frequency_hz <= 0:
         raise ValueError("Selected modal frequency must be finite and positive")
@@ -190,10 +191,21 @@ def prepare_selected_modal(*, prepared_dir, views, frequency_hz, output_dir, sce
         raise FileExistsError(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}-writing-", dir=destination.parent))
+    owned = alpha_backend == "cupy" and alpha_workspace is None
     try:
+        if owned:
+            from modal_gaussians.synchronization_gpu import Workspace
+            alpha_workspace = Workspace()
+        if alpha_workspace is not None:
+            alpha_workspace.stats = {"cold_initialization_seconds":
+                0. if getattr(alpha_workspace, "initialization_reported", False) else alpha_workspace.initialization_seconds}
+            alpha_workspace.initialization_reported = True
         return _prepare_selected_modal(prepared_dir=prepared_dir, views=views, frequency_hz=frequency_hz,
-                                       destination=destination, temporary=temporary, scene_dir=scene_dir)
+                                       destination=destination, temporary=temporary, scene_dir=scene_dir,
+                                       alpha_backend=alpha_backend, alpha_workspace=alpha_workspace)
     finally:
+        if owned and alpha_workspace is not None:
+            alpha_workspace.close()
         if temporary.exists():
             resolved = temporary.resolve()
             if resolved.parent != destination.parent.resolve() or not resolved.name.startswith(f".{destination.name}-writing-"):
@@ -201,11 +213,13 @@ def prepare_selected_modal(*, prepared_dir, views, frequency_hz, output_dir, sce
             shutil.rmtree(resolved)
 
 
-def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, temporary, scene_dir):
-    from modal_gaussians.synchronization import AlphaSyncConfig, prepare_observations, solve_alpha_sync
+def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, temporary, scene_dir,
+                            alpha_backend, alpha_workspace):
+    from modal_gaussians.synchronization import AlphaSyncConfig, prepare_observations, solve_alpha_sync, backend_identity
     from modal_gaussians.topology import TopologyArrays, ARRAY_FILENAME, ARRAY_DTYPES
 
     timer = Timings()
+    alpha_contract = backend_identity(alpha_backend)
     with timer.stage("selected_modal_sources"):
         parent = load_prepared(prepared_dir)
         source = copy.deepcopy(parent.source)
@@ -285,12 +299,14 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
         report_progress("selected modal: estimating cross-view complex gains from selected observations")
         observations = prepare_observations(points=points, topology=topology,
             sample_measurements=_sample_fields(modal_fields, topology.sample_pixels_xy, topology.sample_view_index)[0],
-            view_labels=tuple(labels))
-        alpha = solve_alpha_sync(observations, alpha_config)
+            view_labels=tuple(labels), workspace=alpha_workspace,
+            topology_identity=source["topology_identity"], cache_dir=parent.cache_dir)
+        alpha = solve_alpha_sync(observations, alpha_config, backend=alpha_backend, workspace=alpha_workspace)
         alpha_arrays = {f.name: np.asarray(getattr(alpha, f.name)) for f in fields(alpha)}
         alignment = {"format": ALIGNMENT_FORMAT, "version": 1, "modes": [mode], "views": source["views"],
             "complex_2d_modes_identity": bundle["complex_2d_modes_identity"],
             "topology_identity": source["topology_identity"], "alpha_sync": alpha_config.to_dict(),
+            "alpha_backend": alpha_contract,
             "arrays_file": "arrays.npz", "arrays_identity": nm._arrays_identity(alpha_arrays)}
         alignment["alignment_identity"] = identity(alignment)
         for label, gain, usable, reason in zip(labels, alpha.alphas, alpha.identifiable_mask, alpha.exclusion_reason):
@@ -323,6 +339,7 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
                 "parent_prepared_identity": parent.manifest["prepared_identity"],
                 "complex_2d_modes_identity": bundle["complex_2d_modes_identity"],
                 "alignment_identity": alignment["alignment_identity"],
+                "alpha_backend": alpha_contract,
                 "inherited_source_roles": {"topology": ("rebuilt_for_selected_subject" if scene is not None else
                                                         "static_pixel_gaussian_correspondence"),
                     "measurements": "historical_provenance_not_training_targets",
@@ -343,4 +360,7 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
         atomic_json(temporary / "manifest.json", manifest)
         _publish_prepared(temporary, destination)
     timer.save(destination / "timings.json")
+    if alpha_workspace is not None:
+        alpha_workspace.stats["prepared_publish_seconds"] = timer.records[-1]["seconds"]
+        atomic_json(destination / "alpha_timings.json", alpha_workspace.stats)
     return PreparedNeuralInputs(destination, manifest, arrays)

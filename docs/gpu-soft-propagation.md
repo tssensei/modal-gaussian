@@ -1,5 +1,11 @@
 # Mainline float64 GPU soft propagation
 
+Update (2026-09-20): alpha preparation also defaults to GPU. A first resident
+alpha phase prepares all required frequencies, then releases its workspace before
+soft propagation begins. CPU graph building can overlap either preparation phase.
+See [GPU alpha](gpu-alpha.md); `--alpha-backend cpu` selects the explicit CPU
+compatibility path described by the older CPU-preparation discussion below.
+
 CuPy is the default on `motion prepare-control-weights`, `motion iterate-neural`,
 and `motion batch-neural`; `--propagation-backend cupy` is optional. No CPU fallback
 is performed on a CuPy error. The old CPU search lives in

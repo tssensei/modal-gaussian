@@ -37,6 +37,7 @@ mask = [
 
 [tool.setuptools]
 package-dir = { "" = "src" }
+license-files = ["LICENSE", "licenses/*.txt"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

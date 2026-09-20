@@ -374,6 +374,9 @@ def build_parser() -> argparse.ArgumentParser:
         entry.add_argument("--propagation-backend", choices=("cupy", "cpu"), default="cupy",
                            help="GPU propagation by default; cpu explicitly selects the legacy implementation")
     batch_neural.add_argument("--stage", choices=("weights", "modes"), default="modes")
+    for entry in (prepare_selected, batch_neural):
+        entry.add_argument("--alpha-backend", choices=("cupy", "cpu"), default="cupy",
+                           help="GPU alpha geometry and bounded TRF by default; cpu preserves the reference solver")
     for name in ("scene", "topology", "measurements", "graph", "alignment-from", "work-dir", "output"):
         fit_neural.add_argument(f"--{name}", required=True, type=Path)
     for name, default in (
@@ -1022,7 +1025,8 @@ def _dispatch(
         if args.command == "motion" and args.motion_command == "prepare-selected-modal":
             from modal_gaussians.motion.neural.selected_modal import prepare_selected_modal
             artifact = prepare_selected_modal(prepared_dir=args.prepared, views=args.view,
-                frequency_hz=args.frequency_hz, output_dir=args.output, scene_dir=args.scene)
+                frequency_hz=args.frequency_hz, output_dir=args.output, scene_dir=args.scene,
+                alpha_backend=args.alpha_backend)
             print(f"Selected-modal prepared: {artifact.path}")
             print(f"prepared_identity: {artifact.manifest['prepared_identity']}")
             return 0
@@ -1033,7 +1037,7 @@ def _dispatch(
                 cpu_workers=args.cpu_workers, gpu_workers=args.gpu_workers, threads_per_worker=args.threads_per_worker,
                 propagation_workers=args.propagation_workers, resume_from=args.resume_from,
                 continue_from=args.continue_from,
-                propagation_backend=args.propagation_backend, stage=args.stage,
+                propagation_backend=args.propagation_backend, alpha_backend=args.alpha_backend, stage=args.stage,
                 experiment_name=args.experiment_name)
             print(f"Batch {args.stage} ready: {path}")
             return 0

@@ -79,6 +79,7 @@ class PreparedObservations:
     obs_weights: np.ndarray
     rows_by_point: tuple[np.ndarray, ...]
     view_labels: tuple[str, ...]
+    geometry_key: str | None = None
 
     @property
     def num_views(self) -> int:
@@ -176,6 +177,7 @@ def prepare_observations(
     topology: TopologyArrays,
     sample_measurements: np.ndarray,
     view_labels: tuple[str, ...],
+    workspace=None, topology_identity: str | None = None, cache_dir=None,
 ) -> PreparedObservations:
     """Expand topology samples to contributor rows using the old weight convention."""
 
@@ -193,6 +195,9 @@ def prepare_observations(
         raise ValueError("Complex measurements contain NaN or Inf")
     if view_count == 0 or len(set(view_labels)) != view_count:
         raise ValueError("Alpha view labels must be non-empty and unique")
+    if workspace is not None:
+        return workspace.prepare(point_values, topology, measurements, view_labels,
+                                 topology_identity=topology_identity, cache_dir=cache_dir)
     contributor_count = np.diff(topology.sample_offsets)
     sample_index = np.repeat(
         np.arange(sample_count, dtype=np.int64), contributor_count
@@ -619,6 +624,8 @@ def _refine_candidate(
         initial,
         bounds=(lower, upper),
         loss="linear",
+        method="trf", jac="2-point", tr_solver="exact", x_scale=1.,
+        ftol=1e-8, xtol=1e-8, gtol=1e-8,
         max_nfev=500,
     )
     beta = _parameterized_beta(result.x, len(candidate_views), reference_local)
@@ -682,9 +689,38 @@ def _refine_candidate(
     )
 
 
-def solve_alpha_sync(
+def backend_identity(backend):
+    if backend == "cpu":
+        return {"backend": "cpu"}
+    if backend != "cupy":
+        raise ValueError(f"Unknown alpha backend: {backend}")
+    # Hash source without importing CuPy: old artifacts remain readable on CPU.
+    from pathlib import Path
+    from .iteration_cache import identity, sha256
+    root = Path(__file__).parent
+    return {"backend": "cupy", "algorithm": "scipy_1.17.1_trf_exact_2point_v1",
+            "revision": identity({name: sha256(root / name) for name in
+                                  ("synchronization.py", "synchronization_gpu.py", "_alpha_trf.py")})}
+
+
+def solve_alpha_sync(prepared, config=None, *, backend="cupy", workspace=None):
+    backend_identity(backend)
+    if backend == "cpu":
+        return _solve_alpha_sync(prepared, config)
+    from .synchronization_gpu import Workspace
+    owned = workspace is None
+    workspace = Workspace() if owned else workspace
+    try:
+        return _solve_alpha_sync(prepared, config, _engine=workspace)
+    finally:
+        if owned:
+            workspace.close()
+
+
+def _solve_alpha_sync(
     prepared: PreparedObservations,
     config: AlphaSyncConfig | None = None,
+    *, _engine=None,
 ) -> AlphaSyncResult:
     """Estimate identifiable per-view complex alpha values for one mode."""
 
@@ -708,9 +744,12 @@ def solve_alpha_sync(
     else:
         reasons[0] = "empty_reference"
 
-    graph_constraints = _build_constraints(prepared)
-    edge_counts, edge_information = _edge_statistics(graph_constraints, view_count)
-    raw_shared_counts = _raw_shared_counts(prepared)
+    build = _build_constraints if _engine is None else _engine.constraints
+    refine = _refine_candidate if _engine is None else _engine.refine
+    graph_constraints = build(prepared)
+    edge_counts, edge_information = (_edge_statistics(graph_constraints, view_count) if _engine is None
+                                     else _engine.edge_statistics(graph_constraints))
+    raw_shared_counts = (_raw_shared_counts(prepared) if _engine is None else _engine.raw_counts(prepared))
     adjacency = edge_counts >= settings.minimum_shared_points
     np.fill_diagonal(adjacency, False)
     connected_views = _reference_connected(
@@ -757,14 +796,14 @@ def solve_alpha_sync(
         else:
             allowed = np.zeros(view_count, dtype=bool)
             allowed[candidate_views] = True
-            constraints = _build_constraints(prepared, allowed)
+            constraints = build(prepared, allowed)
         if not constraints:
             removed = int(candidate_views[-1])
             reasons[removed] = "insufficient_information"
             candidate_views = candidate_views[candidate_views != removed]
             continue
 
-        solved = _refine_candidate(prepared, constraints, candidate_views, settings)
+        solved = refine(prepared, constraints, candidate_views, settings)
         parameter_count = 2 * (len(candidate_views) - 1)
         full_rank = len(solved.singular_values) == parameter_count and (
             parameter_count == 0 or solved.singular_values[-1] > EPSILON
@@ -837,10 +876,11 @@ def solve_alpha_sync(
         labels = [prepared.view_labels[index] for index in invalid.tolist()]
         raise ValueError(f"Unidentifiable alpha for observed views: {labels}")
     constraint_count = np.zeros(view_count, dtype=np.int32)
-    for constraint in final_constraints:
-        constraint_count[
-            np.linalg.norm(constraint.matrix, axis=0) > EPSILON
-        ] += 1
+    if _engine is not None and len(final_constraints):
+        constraint_count = _engine.constraint_counts(final_constraints)
+    else:
+        for constraint in final_constraints:
+            constraint_count[np.linalg.norm(constraint.matrix, axis=0) > EPSILON] += 1
     return AlphaSyncResult(
         alphas=alphas.astype(np.complex64),
         identifiable_mask=identifiable,

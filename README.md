@@ -173,8 +173,10 @@ its saved support distances are imported directly, without recomputation.
 For multiple exported frequencies, `motion batch-neural --modal-images EXPORT
 --prepared PARENT --geometry-graph KNN_CACHE --config CONFIG --output RUN_ROOT
 --cpu-workers 3 --gpu-workers 2` maintains separate preparation and training queues.
-CPU workers prepare observations and modal graph weights. Soft propagation defaults
-to CuPy float64: one resident GPU worker consumes ready frequencies, reusing its
+Alpha synchronization defaults to CuPy (`--alpha-backend cupy`), including geometry
+decomposition and the bounded TRF optimizer. One resident GPU worker prepares alpha
+for all required frequencies while CPU workers build ready modal graphs. It then
+releases alpha storage and performs CuPy float64 soft propagation, reusing its
 topology and workspace. After all weights finish, that worker exits and the GNN
 queue starts. Use `--stage weights` to stop after weights; the same output with
 `--stage modes` then continues to training. Control placement and supports stay
@@ -186,9 +188,12 @@ automatic fallback. Its `--propagation-workers` setting has no effect on GPU.
 `propagation_status.json` describe the resident worker. `gpu_usage.csv` samples
 resources every five seconds. Edit `batch_workers.json` atomically to change
 `cpu_workers` and `gpu_workers` independently (0–8 each). Any positive GPU count
-enables only one propagation worker; later it controls GNN concurrency. Zero
+enables only one alpha/propagation worker; later it controls GNN concurrency. Zero
 pauses new launches while active work finishes. See
 [GPU usage and measurements](docs/gpu-soft-propagation.md).
+See [GPU alpha and geometry caching](docs/gpu-alpha.md) for the solver contract,
+timings and explicit `--alpha-backend cpu` compatibility option. Neither GPU backend
+silently falls back to CPU. Existing results retain their original alpha metadata.
 Failures stop further launches, preserving logs/checkpoints.
 Re-running the same command resumes matching work and skips published modes.
 New runs default to 5,000 total updates per frequency, retaining patience 50 and

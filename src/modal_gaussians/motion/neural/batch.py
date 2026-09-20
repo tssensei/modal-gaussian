@@ -14,6 +14,7 @@ from modal_gaussians.progress import report_progress
 from .iteration import resolve_config, training_revision
 from .control_preparation import ready as weights_ready, propagation_count
 from .control_propagation import backend_identity
+from modal_gaussians.synchronization import backend_identity as alpha_backend_identity
 
 
 def _read(path):
@@ -63,6 +64,8 @@ def _jobs(export_dir, prepared, graph, config, output, experiment_name):
         ]
         jobs.append({"bin": index, "frequency_hz": frequency, "folder": folder, "stages": stages,
                      "prepared_dir": target, "graph_dir": weights,
+                     "prepare_arguments": {"prepared_dir": str(prepared), "frequency_hz": frequency,
+                         "views": [(views[i+1], views[i+2]) for i in range(0, len(views), 3)], "output_dir": str(target)},
                      "next": 0, "state": "pending", "pid": None, "stage": None})
     return manifest, jobs
 
@@ -82,6 +85,8 @@ def _published(job, stage, parent):
                 or [m["frequency_hz"] for m in source["modes"]] != [job["frequency_hz"]]
                 or source["selected_modal_supervision"]["parent_prepared_identity"] != parent["prepared_identity"]):
             raise ValueError(f"Existing preparation differs: {marker}")
+        if source["selected_modal_supervision"].get("alpha_backend", {"backend": "cpu"}) != job.get("alpha_contract", {"backend": "cpu"}):
+            raise ValueError(f"Existing alpha preparation backend/revision differs: {marker}; use a new experiment")
     elif name == "graph":
         if (record.get("format") != "modal_gaussians.modal_similarity_graph"
                 or record["frequency_hz"] != job["frequency_hz"]
@@ -108,6 +113,8 @@ def _gpu_sample(stream, active):
 def _completed_from(source, contract, jobs):
     """Explicitly carry completed modes across attempts; never rewrite old identities."""
     previous = _read(source / "batch_contract.json")
+    if previous.get("alpha_backend", {"backend": "cpu"}) != contract["alpha_backend"]:
+        raise ValueError("Resume source has a different alpha backend/revision")
     if previous.get("propagation", {"backend": "cpu"}) != contract.get("propagation", {"backend": "cpu"}):
         raise ValueError("Resume source has a different propagation backend/kernel")
     keys = ("format", "version", "modal_images", "export_identity", "prepared", "prepared_identity",
@@ -159,6 +166,9 @@ def _continued_from(source, contract, jobs):
         for key, path in inputs.items():
             if not (path / "manifest.json").is_file():
                 continue
+            if key == "prepared_dir":
+                job["alpha_contract"] = _read(path / "manifest.json").get("source", {}).get(
+                    "selected_modal_supervision", {}).get("alpha_backend", {"backend": "cpu"})
             old = job[key]
             job[key] = path
             for index, (name, marker, arguments) in enumerate(job["stages"]):
@@ -166,6 +176,11 @@ def _continued_from(source, contract, jobs):
                     marker = path / "manifest.json"
                 arguments[:] = [str(path) if value == str(old) else value for value in arguments]
                 job["stages"][index] = name, marker, arguments
+
+
+def preparation_barrier(jobs):
+    return all(job["state"] == "complete" or all(name != "prepare"
+        for name, _, _ in job["stages"][job["next"]:]) for job in jobs)
 
 
 def training_barrier(jobs):
@@ -177,8 +192,9 @@ def training_barrier(jobs):
 def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, output_dir,
               cpu_workers=3, gpu_workers=2, threads_per_worker=2, propagation_workers=4,
               experiment_name="experiment_shared_001", resume_from=None, continue_from=None,
-              propagation_backend="cupy", stage="modes"):
+              propagation_backend="cupy", alpha_backend="cupy", stage="modes"):
     propagation = backend_identity(propagation_backend)
+    alpha_contract = alpha_backend_identity(alpha_backend)
     if stage not in ("weights", "modes"):
         raise ValueError("Batch stage must be weights or modes")
     if stage == "weights" and (continue_from is not None or resume_from is not None):
@@ -197,7 +213,10 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
     export, jobs = _jobs(exported, prepared, graph, config, root, experiment_name)
     for job in jobs:
         job["backend"] = propagation_backend
+        job["alpha_contract"] = alpha_contract
         for name, _, arguments in job["stages"]:
+            if name == "prepare":
+                arguments.extend(["--alpha-backend", alpha_backend])
             if name in ("weights", "train"):
                 arguments.extend(["--propagation-backend", propagation_backend])
         if stage == "weights":
@@ -208,7 +227,7 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
         "geometry_graph": str(logical_path(graph)), "geometry_identity": identity(_read(graph / "manifest.json")),
         "config": resolved, "revision": training_revision(resolved["fragment"]),
         "experiment_name": experiment_name, "threads_per_worker": threads_per_worker}
-    contract.update(propagation=propagation, stage=stage)
+    contract.update(propagation=propagation, alpha_backend=alpha_contract, stage=stage)
     for job in jobs:
         job.update(revision=contract["revision"], config_identity=identity(resolved))
     if continue_from is not None:
@@ -265,7 +284,8 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
                 weight_worker, weight_log = None, None
 
         def queue(stage):
-            return "gpu" if stage == "train" or (stage == "weights" and propagation_backend == "cupy") else "cpu"
+            return "gpu" if (stage == "train" or (stage == "weights" and propagation_backend == "cupy")
+                             or (stage == "prepare" and alpha_backend == "cupy")) else "cpu"
 
         def counts():
             return {key: sum(queue(job["stage"]) == key for _, _, job in active.values()) for key in limits}
@@ -280,8 +300,11 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
                 "ready_for_gpu": sum(j["state"] == "pending" and j["stage"] == "train" for j in jobs),
                 "propagation_workers": propagation_workers if propagation_backend == "cpu" else None,
                 "propagation_backend": propagation_backend,
-                "phase": "weights" if propagation_backend == "cupy" and not training_barrier(jobs) else stage,
+                "alpha_backend": alpha_backend,
+                "phase": ("alpha" if alpha_backend == "cupy" and not preparation_barrier(jobs) else
+                          "weights" if not training_barrier(jobs) else stage),
                 "jobs": [{**{k: job[k] for k in ("bin", "frequency_hz", "state", "stage", "pid")},
+                          "alpha_backend": job["alpha_contract"],
                           "queue": queue(job["stage"]) if job["state"] != "complete" else None,
                           "result_dir": job.get("result_dir", str(job["stages"][-1][1].parent))} for job in jobs]}
             try:
@@ -353,32 +376,37 @@ def run_batch(*, modal_images, prepared_dir, geometry_graph_dir, config_path, ou
                         resource = queue(current_stage)
                         if failed or counts()[resource] >= limits[resource]:
                             continue
-                        if propagation_backend == "cupy":
-                            if current_stage == "train":
-                                if not training_barrier(jobs):
-                                    continue
-                                # Process exit releases the workspace and CUDA context before GNN.
-                                stop_weight_worker()
-                            elif current_stage == "weights":
-                                if any(j["stage"] == "weights" for _, _, j in active.values()):
-                                    continue
-                                weight_request = uuid.uuid4().hex
-                                atomic_json(root / "propagation_request.json", {"id": weight_request, "arguments": {
-                                    "prepared_dir": str(job["prepared_dir"]), "geometry_graph_dir": str(job["graph_dir"]),
-                                    "config_path": str(config), "frequency_hz": job["frequency_hz"],
-                                    "output_path": str(job["stages"][job["next"]][1])}})
-                                if weight_worker is None:
-                                    weight_log = (root / "gpu_weights.log").open("a", encoding="utf-8")
-                                    weight_worker = subprocess.Popen([sys.executable, "-m",
-                                        "modal_gaussians.motion.neural.control_preparation", str(root), str(os.getpid())],
-                                        stdout=weight_log, stderr=subprocess.STDOUT, env=env,
-                                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-                                elif weight_worker.poll() is not None:
-                                    raise RuntimeError("Persistent GPU weight worker exited unexpectedly")
-                                job.update(state="running", stage="weights", pid=weight_worker.pid)
-                                active[weight_worker.pid] = weight_worker, weight_log, job
-                                report_progress(f"batch start {job['frequency_hz']:g} Hz | weights | GPU | pid={weight_worker.pid}; propagation_workers not applicable")
+                        if current_stage == "weights" and alpha_backend == "cupy" and not preparation_barrier(jobs):
+                            continue
+                        if current_stage == "train" and (alpha_backend == "cupy" or propagation_backend == "cupy"):
+                            if not training_barrier(jobs):
                                 continue
+                            # Exit releases alpha/propagation storage before the first GNN.
+                            stop_weight_worker()
+                        resident_stage = ((current_stage == "prepare" and alpha_backend == "cupy")
+                                          or (current_stage == "weights" and propagation_backend == "cupy"))
+                        if resident_stage:
+                            if any(process is weight_worker for process, _, _ in active.values()):
+                                continue
+                            weight_request = uuid.uuid4().hex
+                            request_args = (job["prepare_arguments"] if current_stage == "prepare" else {
+                                "prepared_dir": str(job["prepared_dir"]), "geometry_graph_dir": str(job["graph_dir"]),
+                                "config_path": str(config), "frequency_hz": job["frequency_hz"],
+                                "output_path": str(job["stages"][job["next"]][1])})
+                            atomic_json(root / "propagation_request.json", {"id": weight_request,
+                                "operation": current_stage, "arguments": request_args})
+                            if weight_worker is None:
+                                weight_log = (root / "gpu_weights.log").open("a", encoding="utf-8")
+                                weight_worker = subprocess.Popen([sys.executable, "-m",
+                                    "modal_gaussians.motion.neural.control_preparation", str(root), str(os.getpid())],
+                                    stdout=weight_log, stderr=subprocess.STDOUT, env=env,
+                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                            elif weight_worker.poll() is not None:
+                                raise RuntimeError("Persistent GPU preparation worker exited unexpectedly")
+                            job.update(state="running", stage=current_stage, pid=weight_worker.pid)
+                            active[weight_worker.pid] = weight_worker, weight_log, job
+                            report_progress(f"batch start {job['frequency_hz']:g} Hz | {current_stage} | GPU | pid={weight_worker.pid}")
+                            continue
                         job["folder"].mkdir(parents=True, exist_ok=True)
                         log = (job["folder"] / f"parallel_{current_stage}.log").open("a", encoding="utf-8")
                         try:

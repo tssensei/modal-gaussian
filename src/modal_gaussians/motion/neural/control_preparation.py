@@ -122,7 +122,8 @@ def run_gpu_worker(root, parent_pid):
     import traceback
     from .control_propagation_gpu import Workspace
     root = Path(root)
-    workspace = Workspace()
+    workspace = None
+    operation = None
     # A killed scheduler must not leave an idle CUDA context holding 20+ GiB.
     if os.name == "nt":
         import ctypes
@@ -145,30 +146,54 @@ def run_gpu_worker(root, parent_pid):
             return False
 
     last = None
-    while parent_alive():
-        request_file = root / "propagation_request.json"
-        if not request_file.exists():
-            time.sleep(.2)
-            continue
-        request = _read(request_file)
-        if request["id"] == last:
-            time.sleep(.2)
-            continue
-        last = request["id"]
-        if request.get("stop"):
-            break
-        atomic_json(root / "propagation_status.json", {"id": last, "status": "running", "pid": os.getpid()})
-        try:
-            workspace.stats = {}
-            prepare_control_weights(**request["arguments"], backend="cupy", workspace=workspace)
-        except BaseException:
-            atomic_json(root / "propagation_status.json", {"id": last, "status": "failed", "error": traceback.format_exc()})
-            raise
-        atomic_json(root / "propagation_status.json", {"id": last, "status": "complete",
-            "propagation_workers": None, "gpu": workspace.stats})
-    workspace.close()
-    if os.name == "nt":
-        kernel.CloseHandle(handle)
+    try:
+        while parent_alive():
+            request_file = root / "propagation_request.json"
+            if not request_file.exists():
+                time.sleep(.2)
+                continue
+            request = _read(request_file)
+            if request["id"] == last:
+                time.sleep(.2)
+                continue
+            last = request["id"]
+            if request.get("stop"):
+                break
+            requested = request.get("operation", "weights")
+            atomic_json(root / "propagation_status.json", {"id": last, "operation": requested,
+                "status": "running", "pid": os.getpid()})
+            try:
+                if requested not in {"prepare", "weights"}:
+                    raise ValueError("Unknown GPU preparation operation")
+                if operation == "weights" and requested == "prepare":
+                    raise ValueError("Alpha preparation cannot restart after the weights barrier")
+                if requested != operation:
+                    if workspace is not None:
+                        workspace.close()
+                        workspace = None
+                    if requested == "prepare":
+                        from modal_gaussians.synchronization_gpu import Workspace as AlphaWorkspace
+                        workspace = AlphaWorkspace()
+                    else:
+                        workspace = Workspace()
+                    operation = requested
+                workspace.stats = {}
+                if operation == "prepare":
+                    from .selected_modal import prepare_selected_modal
+                    prepare_selected_modal(**request["arguments"], alpha_backend="cupy", alpha_workspace=workspace)
+                else:
+                    prepare_control_weights(**request["arguments"], backend="cupy", workspace=workspace)
+            except BaseException:
+                atomic_json(root / "propagation_status.json", {"id": last, "operation": requested,
+                    "status": "failed", "error": traceback.format_exc()})
+                raise
+            atomic_json(root / "propagation_status.json", {"id": last, "operation": operation,
+                "status": "complete", "propagation_workers": None, "gpu": workspace.stats})
+    finally:
+        if workspace is not None:
+            workspace.close()
+        if os.name == "nt":
+            kernel.CloseHandle(handle)
 
 
 if __name__ == "__main__":
