@@ -41,7 +41,8 @@ def load_model(repo, weights):
     return RAFT.from_pretrained(str(weights), args=config).cuda().eval()
 
 
-def compute_flow(*, images, reuse_stabilization, output_dir, sea_raft_repo, model_dir, command=None):
+def compute_flow(*, images, reuse_stabilization, output_dir, sea_raft_repo, model_dir, command=None,
+                 reference_selection=None):
     """Reuse timing/reference metadata and stabilized RGBs, never old flow or masks.
 
     The source is the existing geometry preparation's flow manifest. Its arrays
@@ -49,33 +50,26 @@ def compute_flow(*, images, reuse_stabilization, output_dir, sea_raft_repo, mode
     artifacts without running the legacy estimator or a frequency transform.
     """
     started = time.perf_counter()
-    previous, images = resolve_path(reuse_stabilization), resolve_path(images)
+    from modal_gaussians.flow.reference_selection import sequence_metadata, reference_binding, motion_reference
+
     output = resolve_path(output_dir)
     if output.exists():
         raise FileExistsError(f"Choose a new flow output directory: {output}")
-    source = json.loads((previous / "manifest.json").read_text(encoding="utf-8"))
-    if source.get("format") != "modal_gaussians.flow_analysis" or source.get("version") not in (6, 7):
-        raise ValueError("Expected an existing geometry preparation flow manifest")
-    if images != resolve_path(source["inputs"]["sequence"]["image_directory"]):
-        raise ValueError("Images differ from the recorded sequence")
-    names, fps = source["frame_names"], float(source["fps_hz"])
-    reference_index = source["reference_frame_index"]
-    if (len(names) < 3 or not np.isfinite(fps) or fps <= 0
-            or not isinstance(reference_index, int) or not 0 <= reference_index < len(names)
-            or names[reference_index] != source["reference_frame_name"]
-            or sorted(p.stem for p in images.glob("*.png")) != names):
-        raise ValueError("Invalid sequence timing, reference, or frame names")
-    image_dir = images
+    seq = sequence_metadata(reuse_stabilization, images)
+    source, previous, images = seq["source"], seq["root"], seq["images"]
+    names, fps, reference_index = seq["names"], seq["fps"], seq["reference"]
+    image_dir = seq["image_dir"]
     stable_record = source.get("stabilized_sequence")
-    if stable_record is not None:
-        stable_root = (previous / stable_record["path"]).resolve()
-        if not stable_root.is_relative_to(previous):
-            raise ValueError("Stabilized sequence must be inside its source artifact")
-        stable = json.loads((stable_root / "manifest.json").read_text(encoding="utf-8"))
-        if (names != stable["frames"] or stable["reference_frame"] != names[reference_index]
-                or float(stable["fps_hz"]) != fps):
-            raise ValueError("Stabilized sequence metadata differs from its source")
-        image_dir = stable_root / "images"
+    binding = None
+    if reference_selection is not None:
+        selection_path = resolve_path(reference_selection, strict=True)
+        selected = json.loads((selection_path / "manifest.json").read_text(encoding="utf-8"))
+        binding = reference_binding(selected)
+        contract = binding["contract"]
+        _, reference_index = motion_reference({
+            "reference_frame_name": contract["reference_frame_name"],
+            "reference_frame_index": contract["reference_frame_index"],
+            "reference_selection": binding}, source)
     reference_path = image_dir / (names[reference_index] + ".png")
     reference_cpu = read_image(reference_path)
     height, width = reference_cpu.shape[-2:]
@@ -100,6 +94,9 @@ def compute_flow(*, images, reuse_stabilization, output_dir, sea_raft_repo, mode
                   "repository": str(resolve_path(sea_raft_repo)),
                   "config": vars(model.args), "native_resolution": True},
     }
+    if binding is not None:
+        manifest["reference_selection"] = binding
+        manifest["reference_selection_path"] = str(selection_path)
     output.mkdir(parents=True, exist_ok=False)
     atomic_json(output / "manifest.json", manifest)
     flow = None

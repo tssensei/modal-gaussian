@@ -8,6 +8,7 @@ import numpy as np
 
 from modal_gaussians.flow.artifact import FlowAnalysisArtifact, flow_artifact_identity
 from modal_gaussians.flow.storage import open_array
+from modal_gaussians.flow.reference_selection import motion_reference
 from modal_gaussians.iteration_cache import identity, sha256
 from modal_gaussians.scene_store import resolve_path
 from modal_gaussians.spectrum_cache import _source
@@ -34,11 +35,10 @@ def load_coordinate_flow(path):
     metadata = json.loads((reference / "manifest.json").read_text(encoding="utf-8"))
     if metadata.get("format") != "modal_gaussians.flow_analysis" or metadata.get("version") not in (6, 7):
         raise ValueError("SEA-RAFT geometry reference must contain historical flow metadata")
-    for new, old in (("frames", "frame_names"), ("fps_hz", "fps_hz"),
-                     ("reference_frame_index", "reference_frame_index"),
-                     ("reference_frame_name", "reference_frame_name")):
+    for new, old in (("frames", "frame_names"), ("fps_hz", "fps_hz")):
         if source[new] != metadata[old]:
             raise ValueError(f"SEA-RAFT/reference {new} differs")
+    motion_reference(source, metadata)
     if source["flow_shape"] != metadata["arrays"]["flow"]["shape"]:
         raise ValueError("SEA-RAFT/reference flow shapes differ")
     names = source["frames"]
@@ -59,7 +59,7 @@ def load_coordinate_flow(path):
             raise ValueError("Stabilized RGB directory escapes its reference")
         saved = json.loads((stable_root / "manifest.json").read_text(encoding="utf-8"))
         if (saved["frames"] != names or saved["fps_hz"] != source["fps_hz"]
-                or saved["reference_frame"] != source["reference_frame_name"]):
+                or saved["reference_frame"] != metadata["reference_frame_name"]):
             raise ValueError("Stabilized RGB timing differs from SEA-RAFT")
         images = stable_root / "images"
     else:

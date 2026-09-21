@@ -30,9 +30,6 @@ import splines.quaternion
 import viser
 import viser.transforms as tf
 
-VISER_SCALE_RATIO = 10.0
-
-
 @dataclasses.dataclass
 class Keyframe:
     time: float
@@ -57,6 +54,23 @@ class Keyframe:
             override_transition_sec=None,
         )
 
+    def to_dict(self, default_fov: float) -> dict:
+        pose = tf.SE3.from_rotation_and_translation(tf.SO3(self.wxyz), self.position)
+        return {"time": self.time, "matrix": pose.as_matrix().flatten().tolist(),
+                "fov": float(np.rad2deg(self.override_fov_rad) if self.override_fov_enabled else default_fov),
+                "aspect": self.aspect, "override_fov_enabled": self.override_fov_enabled,
+                "override_transition_enabled": self.override_transition_enabled,
+                "override_transition_sec": self.override_transition_sec}
+
+    @classmethod
+    def from_dict(cls, frame: dict, default_fov: float) -> Keyframe:
+        pose = tf.SE3.from_matrix(np.asarray(frame["matrix"]).reshape(4, 4))
+        return cls(time=frame.get("time", 0.0), position=pose.translation(), wxyz=pose.rotation().wxyz,
+                   override_fov_enabled=frame.get("override_fov_enabled", abs(frame["fov"] - default_fov) > 1e-3),
+                   override_fov_rad=np.deg2rad(frame["fov"]), aspect=frame["aspect"],
+                   override_transition_enabled=frame.get("override_transition_enabled", False),
+                   override_transition_sec=frame.get("override_transition_sec"))
+
 
 class CameraPath:
     def __init__(
@@ -68,7 +82,7 @@ class CameraPath:
         self._spline_nodes: List[viser.SceneNodeHandle] = []
         self._camera_edit_panel: Optional[viser.Gui3dContainerHandle] = None
 
-        self._orientation_spline: Optional[splines.quaternion.KochanekBartels] = None
+        self._orientation_spline: splines.quaternion.KochanekBartels | splines.quaternion.PiecewiseSlerp | None = None
         self._position_spline: Optional[splines.KochanekBartels] = None
         self._fov_spline: Optional[splines.KochanekBartels] = None
         self._time_spline: Optional[splines.KochanekBartels] = None
@@ -101,9 +115,6 @@ class CameraPath:
             keyframe_index = self._keyframe_counter
             self._keyframe_counter += 1
 
-        print(
-            f"{keyframe.wxyz=} {keyframe.position=} {keyframe_index=} {keyframe.aspect=}"
-        )
         frustum_handle = server.scene.add_camera_frustum(
             f"/render_cameras/{keyframe_index}",
             fov=(
@@ -240,11 +251,9 @@ class CameraPath:
 
     def reset(self) -> None:
         for frame in self._keyframes.values():
-            print(f"removing {frame[1]}")
             frame[1].remove()
         self._keyframes.clear()
         self.update_spline()
-        print("camera path reset")
 
     def spline_t_from_t_sec(self, time: np.ndarray) -> np.ndarray:
         """From a time value in seconds, compute a t value for our geometric
@@ -337,15 +346,13 @@ class CameraPath:
 
         transition_times_cumsum = self.compute_transition_times_cumsum()
 
-        self._orientation_spline = splines.quaternion.KochanekBartels(
-            [
-                splines.quaternion.UnitQuaternion.from_unit_xyzw(
-                    np.roll(keyframe[0].wxyz, shift=-1)
-                )
-                for keyframe in keyframes
-            ],
-            tcb=(self.tension, 0.0, 0.0),
-            endconditions="closed" if self.loop else "natural",
+        quaternions = [splines.quaternion.UnitQuaternion.from_unit_xyzw(np.roll(frame.wxyz, -1))
+                       for frame, _ in keyframes]
+        # The two-keyframe natural curve is SLERP; avoid the library's empty-TCB branch.
+        self._orientation_spline = (
+            splines.quaternion.PiecewiseSlerp(quaternions) if len(keyframes) == 2 and not self.loop else
+            splines.quaternion.KochanekBartels(quaternions, tcb=(self.tension, 0.0, 0.0),
+                                             endconditions="closed" if self.loop else "natural")
         )
         self._position_spline = splines.KochanekBartels(
             [keyframe[0].position for keyframe in keyframes],
@@ -468,50 +475,18 @@ class CameraPath:
         for i in range(num_transitions_plus_1 - 1):
             make_transition_handle(i)
 
-        # for i in range(transition_times.shape[0])
-
     def compute_duration(self) -> float:
         """Compute the total duration of the trajectory."""
-        total = 0.0
-        for i, (keyframe, frustum) in enumerate(self._keyframes.values()):
-            if i == 0 and not self.loop:
-                continue
-            del frustum
-            total += (
-                keyframe.override_transition_sec
-                if keyframe.override_transition_enabled
-                and keyframe.override_transition_sec is not None
-                else self.default_transition_sec
-            )
-        return total
+        return float(self.compute_transition_times_cumsum()[-1])
 
     def compute_transition_times_cumsum(self) -> np.ndarray:
-        """Compute the total duration of the trajectory."""
-        total = 0.0
-        out = [0.0]
-        for i, (keyframe, frustum) in enumerate(self._keyframes.values()):
-            if i == 0:
-                continue
-            del frustum
-            total += (
-                keyframe.override_transition_sec
-                if keyframe.override_transition_enabled
-                and keyframe.override_transition_sec is not None
-                else self.default_transition_sec
-            )
-            out.append(total)
-
-        if self.loop:
-            keyframe = next(iter(self._keyframes.values()))[0]
-            total += (
-                keyframe.override_transition_sec
-                if keyframe.override_transition_enabled
-                and keyframe.override_transition_sec is not None
-                else self.default_transition_sec
-            )
-            out.append(total)
-
-        return np.array(out)
+        """Accumulate incoming transitions, ending at the first frame for loops."""
+        frames = [frame for frame, _ in self._keyframes.values()]
+        transitions = frames[1:] + (frames[:1] if self.loop else [])
+        durations = [frame.override_transition_sec
+                     if frame.override_transition_enabled and frame.override_transition_sec is not None
+                     else self.default_transition_sec for frame in transitions]
+        return np.concatenate(([0.0], np.cumsum(durations)))
 
 
 @dataclasses.dataclass
@@ -588,21 +563,10 @@ def populate_render_tab(
     def _(event: viser.GuiEvent) -> None:
         assert event.client_id is not None
         camera = server.get_clients()[event.client_id].camera
-        pose = tf.SE3.from_rotation_and_translation(
-            tf.SO3(camera.wxyz), camera.position
-        )
-        print(f"client {event.client_id} at {camera.position} {camera.wxyz}")
-        print(f"camera pose {pose.as_matrix()}")
-        if gui_timestep_handle is not None:
-            print(f"timestep {gui_timestep_handle.value}")
-
         # Add this camera to the path.
-        time = 0
-        if gui_timestep_handle is not None:
-            time = gui_timestep_handle.value
         camera_path.add_camera(
             Keyframe.from_camera(
-                time,
+                0 if gui_timestep_handle is None else gui_timestep_handle.value,
                 camera,
                 aspect=resolution.value[0] / resolution.value[1],
             ),
@@ -808,9 +772,8 @@ def populate_render_tab(
             gui_timestep_handle.value = int(time)
         return pose, fov_rad, time
 
-    def add_preview_frame_slider() -> Optional[viser.GuiInputHandle[int]]:
-        """Helper for creating the current frame # slider. This is removed and
-        re-added anytime the `max` value changes."""
+    def add_preview_frame_slider() -> viser.GuiInputHandle[int]:
+        """Create the slider and register its preview callback once."""
 
         with playback_folder:
             preview_frame_slider = server.gui.add_slider(
@@ -912,16 +875,10 @@ def populate_render_tab(
     def _(_) -> None:
         remove_preview_camera()  # Will be re-added when slider is updated.
 
-        nonlocal preview_frame_slider
-        old = preview_frame_slider
-        assert old is not None
-
-        preview_frame_slider = add_preview_frame_slider()
-        if preview_frame_slider is not None:
-            old.remove()
-        else:
-            preview_frame_slider = old
-
+        preview_frame_slider.max = get_max_frame_index()
+        preview_frame_slider.value = 0
+        preview_frame_slider.disabled = get_max_frame_index() == 1
+        play_button.disabled = preview_render_button.disabled = preview_frame_slider.disabled
         camera_path.framerate = framerate_number.value
         camera_path.update_spline()
 
@@ -957,7 +914,7 @@ def populate_render_tab(
     @load_camera_path_button.on_click
     def _(event: viser.GuiEvent) -> None:
         assert event.client is not None
-        camera_path_dir = datapath.parent
+        camera_path_dir = datapath
         camera_path_dir.mkdir(parents=True, exist_ok=True)
         preexisting_camera_paths = list(camera_path_dir.glob("*.json"))
         preexisting_camera_filenames = [p.name for p in preexisting_camera_paths]
@@ -981,44 +938,20 @@ def populate_render_tab(
                     with open(json_path, "r") as f:
                         json_data = json.load(f)
 
-                    keyframes = json_data["keyframes"]
                     camera_path.reset()
-                    for i in range(len(keyframes)):
-                        frame = keyframes[i]
-                        pose = tf.SE3.from_matrix(
-                            np.array(frame["matrix"]).reshape(4, 4)
-                        )
-                        # apply the x rotation by 180 deg
-                        pose = tf.SE3.from_rotation_and_translation(
-                            pose.rotation() @ tf.SO3.from_x_radians(np.pi),
-                            pose.translation(),
-                        )
-
-                        camera_path.add_camera(
-                            Keyframe(
-                                frame["time"],
-                                position=pose.translation(),
-                                wxyz=pose.rotation().wxyz,
-                                # There are some floating point conversions between degrees and radians, so the fov and
-                                # default_Fov values will not be exactly matched.
-                                override_fov_enabled=abs(
-                                    frame["fov"] - json_data.get("default_fov", 0.0)
-                                )
-                                > 1e-3,
-                                override_fov_rad=frame["fov"] / 180.0 * np.pi,
-                                aspect=frame["aspect"],
-                                override_transition_enabled=frame.get(
-                                    "override_transition_enabled", None
-                                ),
-                                override_transition_sec=frame.get(
-                                    "override_transition_sec", None
-                                ),
-                            )
-                        )
-
-                    transition_sec_number.value = json_data.get(
-                        "default_transition_sec", 0.5
-                    )
+                    for handle, key in ((fov_degrees, "default_fov"), (transition_sec_number, "default_transition_sec"),
+                                        (framerate_number, "fps"), (loop, "is_cycle"), (tension_slider, "smoothness_value")):
+                        handle.value = json_data.get(key, handle.value)
+                    resolution.value = (json_data.get("render_width", resolution.value[0]),
+                                        json_data.get("render_height", resolution.value[1]))
+                    camera_type.value = json_data.get("camera_type", camera_type.value).capitalize()
+                    camera_path.default_fov = np.deg2rad(fov_degrees.value)
+                    camera_path.default_transition_sec = transition_sec_number.value
+                    camera_path.framerate, camera_path.loop = framerate_number.value, loop.value
+                    camera_path.tension = tension_slider.value
+                    for frame in json_data["keyframes"]:
+                        camera_path.add_camera(Keyframe.from_dict(frame, fov_degrees.value))
+                    duration_number.value = camera_path.compute_duration()
 
                     # update the render name
                     camera_path_name.value = json_path.stem
@@ -1035,7 +968,7 @@ def populate_render_tab(
     now = datetime.datetime.now()
     camera_path_name = server.gui.add_text(
         "Camera path name",
-        initial_value=now.strftime("%Y-%m-%d %H:%M:%S"),
+        initial_value=now.strftime("%Y-%m-%d_%H-%M-%S"),
         hint="Name of the render",
     )
 
@@ -1065,44 +998,9 @@ def populate_render_tab(
         assert event.client is not None
         num_frames = int(framerate_number.value * duration_number.value)
         json_data = {}
-        # json data has the properties:
-        # keyframes: list of keyframes with
-        #     matrix : flattened 4x4 matrix
-        #     fov: float in degrees
-        #     aspect: float
-        # camera_type: string of camera type
-        # render_height: int
-        # render_width: int
-        # fps: int
-        # seconds: float
-        # is_cycle: bool
-        # smoothness_value: float
-        # camera_path: list of frames with properties
-        # camera_to_world: flattened 4x4 matrix
-        # fov: float in degrees
-        # aspect: float
-        # first populate the keyframes:
-        keyframes = []
-        for keyframe, dummy in camera_path._keyframes.values():
-            pose = tf.SE3.from_rotation_and_translation(
-                tf.SO3(keyframe.wxyz), keyframe.position
-            )
-            keyframes.append(
-                {
-                    "matrix": pose.as_matrix().flatten().tolist(),
-                    "fov": (
-                        np.rad2deg(keyframe.override_fov_rad)
-                        if keyframe.override_fov_enabled
-                        else fov_degrees.value
-                    ),
-                    "aspect": keyframe.aspect,
-                    "override_transition_enabled": keyframe.override_transition_enabled,
-                    "override_transition_sec": keyframe.override_transition_sec,
-                }
-            )
         json_data["default_fov"] = fov_degrees.value
         json_data["default_transition_sec"] = transition_sec_number.value
-        json_data["keyframes"] = keyframes
+        json_data["keyframes"] = [frame.to_dict(fov_degrees.value) for frame, _ in camera_path._keyframes.values()]
         json_data["camera_type"] = camera_type.value.lower()
         json_data["render_height"] = resolution.value[1]
         json_data["render_width"] = resolution.value[0]

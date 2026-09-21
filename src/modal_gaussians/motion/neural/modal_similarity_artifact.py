@@ -5,7 +5,6 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 import math
-import os
 from pathlib import Path
 from modal_gaussians.scene_store import resolve_path
 import tempfile
@@ -25,7 +24,7 @@ def _manifest(path):
     return json.loads((resolve_path(path) / "manifest.json").read_text(encoding="utf-8"))
 
 
-def _modal_view(path, flow, view, frequency, *, read_mask=True):
+def _modal_view(path, flow, view, frequency, *, read_mask=True, static_scene_identity=None):
     """Bind the experimental dense field to the prepared reference coordinates."""
     root = resolve_path(path, strict=True)
     manifest = _manifest(root)
@@ -41,11 +40,11 @@ def _modal_view(path, flow, view, frequency, *, read_mask=True):
     if (not math.isclose(float(manifest["frequency_hz"]), frequency, rel_tol=0, abs_tol=1e-9)
             or manifest["frames"] != frozen["frame_names"]
             or manifest["fps_hz"] != frozen["fps_hz"]
-            or manifest["reference_frame_name"] != frozen["reference_frame_name"]
-            or manifest["reference_frame_index"] != frozen["reference_frame_index"]
             or resolve_path(manifest["stabilization_source"]) != resolve_path(flow["path"])
             or resolve_path(manifest["images"]) != resolve_path(frozen["inputs"]["sequence"]["image_directory"])):
         raise ValueError(f"Modal image differs from prepared frequency/reference coordinates: {view['label']}")
+    from modal_gaussians.flow.reference_selection import motion_reference
+    reference_name, _ = motion_reference(manifest, frozen, view=view, static_scene_identity=static_scene_identity)
     if manifest["format"] == "modal_gaussians.spectrum_selected_frequency":
         spectrum = manifest.get("spectrum_source")
         if not isinstance(spectrum, dict):
@@ -70,7 +69,7 @@ def _modal_view(path, flow, view, frequency, *, read_mask=True):
         sequence = frozen["inputs"]["sequence"]
         image_dir = resolve_path(sequence["image_directory"])
         mask_dir = resolve_path(sequence["mask_directory"]) if read_mask else None
-    reference = frozen["reference_frame_name"] + ".png"
+    reference = reference_name + ".png"
     inference_images = manifest.get("inference_images") or manifest.get("stabilized_images")
     if (inference_images is None or resolve_path(inference_images) != image_dir.resolve()
             or resolve_path(manifest["reference_image"]) != (image_dir / reference).resolve()):
@@ -145,7 +144,11 @@ def build_modal_similarity_graph_artifact(*, prepared_dir, geometry_graph_dir, v
                 if camera.to_manifest_record()["camera_identity"] != view["camera_identity"]:
                     raise ValueError(f"Prepared camera differs: {view['label']}")
                 field, mask, record = _modal_view(requested[view["label"]],
-                    flows[view["flow_identity"]], view, frequency_hz, read_mask=not visible_subject)
+                    flows[view["flow_identity"]], view, frequency_hz, read_mask=not visible_subject,
+                    static_scene_identity=source["static_scene_identity"])
+                selected_reference = record["manifest"].get("reference_selection", {}).get("identity")
+                if selected_reference != view.get("motion_reference", {}).get("selection_identity"):
+                    raise ValueError("Graph modal reference differs from preparation; prepare these observations first")
                 if visible_subject:
                     key = f"v{view['index']}_subject_mask"
                     if key not in archive.files:
@@ -195,6 +198,7 @@ def build_modal_similarity_graph_artifact(*, prepared_dir, geometry_graph_dir, v
         save_named_arrays(temporary / "graph.npz", result.as_dict())
         save_named_arrays(temporary / "edge_evidence.npz", diagnostics)
         atomic_json(temporary / "manifest.json", manifest)
-        os.rename(temporary, output)
+        from modal_gaussians.iteration_cache import publish_directory
+        publish_directory(temporary, output)
     timer.save(output / "timings.json")
     return manifest

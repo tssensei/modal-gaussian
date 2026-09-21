@@ -16,7 +16,6 @@ from torch import Tensor
 import viser
 import viser.transforms as vtf
 
-from modal_gaussians.result import ModalResultArtifact, load_modal_result
 from modal_gaussians.motion.common.mode_mapping import resolve_source_mode_slots
 from modal_gaussians.motion.common.projection import projection_jacobian
 from modal_gaussians.motion.rigid.rigid import load_rigid_modes
@@ -28,6 +27,8 @@ from modal_gaussians.static import (
 from modal_gaussians.motion.rigid.structure_graph import load_observed_structure_graph
 from modal_gaussians.topology import load_observation_topology
 from modal_gaussians.vis.playback_panel import add_gui_playback_group
+from modal_gaussians.vis.inputs import ViewerInput, load_viewer_input
+from modal_gaussians.vis.projections import ViewerProjections
 from modal_gaussians.vis.render_panel import populate_render_tab
 from modal_gaussians.vis.spectrum import (
     ModalSpectrumPanel,
@@ -206,6 +207,15 @@ class ViewerCamera:
     fov: float
     aspect: float
 
+    @classmethod
+    def from_camera(cls, camera: Camera, label: str | None = None) -> ViewerCamera:
+        return cls(
+            label=camera.name if label is None else label, camera=camera,
+            c2w=np.linalg.inv(camera.world_to_camera.detach().cpu().numpy()).astype(np.float64),
+            fov=2.0 * math.atan(0.5 * camera.height / float(camera.K[1, 1])),
+            aspect=camera.width / camera.height,
+        )
+
 
 def _motion_fill_display_classes(arrays: dict[str, np.ndarray]) -> np.ndarray:
     """Map the final sequential-fill state to the three useful Viewer roles."""
@@ -344,7 +354,7 @@ def _hsv_to_rgb(hue: Tensor, value: Tensor) -> Tensor:
     return rgb
 
 
-def _viewer_cameras(result: ModalResultArtifact) -> tuple[ViewerCamera, ...]:
+def _viewer_cameras(result: ViewerInput) -> tuple[ViewerCamera, ...]:
     """Resolve the ordered result views to exact static-scene cameras."""
 
     if result.scene.manifest is None:
@@ -354,36 +364,24 @@ def _viewer_cameras(result: ModalResultArtifact) -> tuple[ViewerCamera, ...]:
         for camera in cameras_from_scene_manifest(result.scene.manifest)
     }
     cameras: list[ViewerCamera] = []
-    for view in result.rendered_design.manifest["views"]:
+    for view in result.views:
         name = str(view["camera_name"])
         camera = by_name.get(name)
         if camera is None:
             raise ValueError(f"Result camera {name!r} is absent from static scene")
-        c2w = np.linalg.inv(camera.world_to_camera.detach().cpu().numpy())
-        fy = float(camera.K[1, 1].item())
-        fov = 2.0 * math.atan(0.5 * float(camera.height) / fy)
-        cameras.append(
-            ViewerCamera(
-                label=str(view["label"]),
-                camera=camera,
-                c2w=c2w.astype(np.float64),
-                fov=fov,
-                aspect=float(camera.width) / float(camera.height),
-            )
-        )
+        cameras.append(ViewerCamera.from_camera(camera, str(view["label"])))
     if len({camera.label for camera in cameras}) != len(cameras):
         raise ValueError("Modal-result Viewer camera labels are not unique")
     return tuple(cameras)
 
 
-def _observation_counts(result: ModalResultArtifact) -> np.ndarray:
+def _observation_counts(completed, gaussian_count: int) -> np.ndarray:
     """Count unique topology views contributing to each foreground Gaussian."""
 
-    completed = result.completed_modes
     if completed.manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
         observed = np.asarray(completed.arrays["observation_view_mask"])
         expected = (
-            len(result.manifest["modes"]), result.scene.foreground.count,
+            len(completed.manifest["modes"]), gaussian_count,
             len(completed.manifest["views"]),
         )
         if observed.dtype != np.bool_ or observed.shape != expected:
@@ -397,12 +395,11 @@ def _observation_counts(result: ModalResultArtifact) -> np.ndarray:
     )
     contributors = topology.arrays.contributor_gaussian_index
     view_count = len(completed.manifest["views"])
-    gaussian_count = result.scene.foreground.count
     observed = np.zeros((gaussian_count, view_count), dtype=bool)
     observed[contributors, contributor_views] = True
     per_gaussian = np.asarray(observed.sum(axis=1), dtype=np.int16)
     return np.repeat(
-        per_gaussian[None], len(result.manifest["modes"]), axis=0
+        per_gaussian[None], len(completed.manifest["modes"]), axis=0
     )
 
 
@@ -448,103 +445,92 @@ def _control_point_gaussian_indices(arrays: dict[str, np.ndarray], gaussian_coun
 class ModalViewerData:
     """Hold strict result data and implement all scientific display transforms."""
 
-    def __init__(self, result_dir: str | Path, device: str = "cuda", *, preview: bool = False) -> None:
+    def __init__(self, result_dir: str | Path, device: str = "cuda", *, preview: bool = False,
+                 coordinates=None, work_dir=None) -> None:
         requested_device = torch.device(device)
         if requested_device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("Modal Gaussian Viser requires a CUDA device")
-        self.is_preview = preview
-        if preview:
-            from modal_gaussians.motion.neural.preview import load_preview
-            self.result = load_preview(result_dir)
-        else:
-            self.result = load_modal_result(result_dir)
+        self.result = load_viewer_input(result_dir, coordinates=coordinates)
         self.device = requested_device
         self.scene = self.result.scene.to(self.device)
+        self.result.scene = self.scene
         self.cameras = _viewer_cameras(self.result)
         self.camera_by_label = {camera.label: camera for camera in self.cameras}
-        self.frequencies_hz = np.asarray(
-            [mode["frequency_hz"] for mode in self.result.manifest["modes"]],
-            dtype=np.float64,
-        )
-        self.frequency_order = tuple(
-            int(index)
-            for index in np.argsort(self.frequencies_hz, kind="stable")
-        )
-        display_indices = np.empty(len(self.frequency_order), dtype=np.int64)
-        display_indices[np.asarray(self.frequency_order)] = np.arange(
-            len(self.frequency_order)
-        )
-        self.display_indices = tuple(int(value) for value in display_indices)
-        self.phi = torch.from_numpy(
-            np.asarray(self.result.completed_modes.arrays["phi"])
-        ).to(self.device)
-        rotation = self.result.completed_modes.rotation
+        modes = self.result.modes
+        self.frequencies_hz = np.asarray([m.frequency for m in modes], dtype=np.float64)
+        self.phi = torch.from_numpy(np.stack([m.artifact.arrays["phi"][m.slot] for m in modes])).to(self.device)
         self.rotation = None
-        if rotation is not None:
-            if (rotation.dtype != np.complex64 or rotation.shape != tuple(self.phi.shape)
-                    or not np.isfinite(rotation).all()):
-                raise ValueError("Viewer rotation modes must be finite complex64 [K,G,3]")
+        if all(m.artifact.rotation is not None for m in modes):
+            rotation = np.stack([m.artifact.rotation[m.slot] for m in modes])
+            if rotation.dtype != np.complex64 or rotation.shape != tuple(self.phi.shape):
+                raise ValueError("Viewer rotation mode domain differs")
             self.rotation = torch.from_numpy(rotation).to(self.device)
-        self.coordinates = None if preview else np.asarray(
-            self.result.coordinates.coordinates, dtype=np.complex64
-        )
-        (
-            self.display_class,
-            self.support_display_names,
-            self.support_legend,
-        ) = _completed_mode_display_roles(
-            self.result.completed_modes.manifest,
-            self.result.completed_modes.arrays,
-        )
-        self.observation_counts = _observation_counts(self.result)
-        self.control_point_gaussian_index = _control_point_gaussian_indices(
-            self.result.completed_modes.arrays, self.scene.foreground.count,
-        )
-        self.control_point_colors = (
-            _component_colors(self.result.completed_modes.arrays["g_component_index"][self.control_point_gaussian_index])
-            if len(self.control_point_gaussian_index) else np.empty((0, 3), dtype=np.float32)
-        )
-        self.control_displacement = self.result.completed_modes.control_displacement
-        self.control_positions = np.asarray(self.result.completed_modes.arrays.get(
-            "c_positions", np.empty((0, 3), dtype=np.float32)))
-        if self.control_displacement is not None:
-            expected = (len(self.frequencies_hz), len(self.control_point_gaussian_index), 3)
-            if (self.control_displacement.dtype != np.complex64
-                    or self.control_displacement.shape != expected
-                    or self.control_positions.shape != expected[1:]
-                    or not np.isfinite(self.control_displacement).all()):
-                raise ValueError("Viewer control displacement must be finite complex64 [K,C,3]")
-        self._load_graph_display()
-        # The new panel binds each bank frequency to its saved shared-FFT source.
-        # Legacy artifacts still render in 3D, without the removed legacy spectrum loader.
-        self.spectrum = (SpectrumComparisonController(self.result)
-                         if self.result.completed_modes.manifest.get("version") == 17 else None)
+        elif any(m.artifact.rotation is not None for m in modes):
+            raise ValueError("Viewer modes have incompatible rotation capabilities")
+        fitted = self.result.coordinates
+        self.coordinates = None if fitted is None else np.asarray(
+            fitted.coordinates[:, self.result.coordinate_columns], dtype=np.complex64)
+        roles, counts = [], []
+        for mode in modes:
+            artifact = mode.artifact
+            display, names, legend = _completed_mode_display_roles(artifact.manifest, artifact.arrays)
+            if roles and names != self.support_display_names:
+                raise ValueError("Viewer support roles differ across modes")
+            self.support_display_names, self.support_legend = names, legend
+            roles.append(display[mode.slot])
+            counts.append(_observation_counts(artifact, self.scene.foreground.count)[mode.slot])
+        self.display_class, self.observation_counts = np.stack(roles), np.stack(counts)
+        self.select_mode(0)
+        self._load_graph_display(0)
+        self.projections = None
+        self.spectrum = None
+        if all("selected_modal_supervision" in m.artifact.manifest for m in modes):
+            self.projections = ViewerProjections(self.result, work_dir)
+            self.spectrum = SpectrumComparisonController(self.result, projections=self.projections)
+        self.gpu_lock = self.projections.gpu_lock if self.projections else threading.RLock()
 
-    def _load_graph_display(self) -> None:
+    def select_mode(self, index):
+        """Select diagnostics without assuming shared control-point layouts."""
+        mode = self.result.modes[index]
+        arrays = mode.artifact.arrays
+        self.control_point_gaussian_index = _control_point_gaussian_indices(arrays, self.scene.foreground.count)
+        self.control_point_colors = (_component_colors(arrays["g_component_index"][self.control_point_gaussian_index])
+            if len(self.control_point_gaussian_index) else np.empty((0, 3), np.float32))
+        self.control_positions = np.asarray(arrays.get("c_positions", np.empty((0, 3), np.float32)))
+        self.control_displacement = mode.artifact.control_displacement
+        self._control_slot = mode.slot
+        if self.control_displacement is not None and (
+                self.control_displacement[mode.slot].shape != self.control_positions.shape
+                or self.control_positions.shape != (len(self.control_point_gaussian_index), 3)):
+            raise ValueError("Viewer control displacement domain differs")
+
+    def has_coordinates(self, view_index):
+        return self.result.views[view_index]["label"] in self.result.coordinate_views
+
+    def _load_graph_display(self, mode_index: int | None = None) -> None:
         """Select geometry diagnostics belonging to the completed-mode method."""
 
-        if self.result.completed_modes.manifest.get("version") == 17:
-            self.structure_graph = None
-            self.graph_edge_gaussian_index = np.empty((0, 2), dtype=np.int64)
-            self.graph_edge_colors = np.empty((0, 3), dtype=np.uint8)
-            self.graph_edge_colors_by_mode = None
-            self.graph_legend = "Frequency-specific graphs remain in the original single-mode artifacts."
-            return
-        if self.result.completed_modes.manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16):
+        mode_index = 0 if mode_index is None else mode_index
+        completed = self.result.modes[mode_index].artifact
+        version = completed.manifest.get("version")
+        arrays = completed.arrays
+        if version in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
             self.structure_graph = None
             self.graph_edge_gaussian_index, self.graph_edge_colors = _neural_graph_display(
-                self.result.completed_modes.arrays, self.scene.foreground.count,
+                arrays, self.scene.foreground.count,
             )
+            self.graph_mode_index = mode_index
             self.graph_edge_colors_by_mode = None
             self.graph_legend = (
                 "**Geometry graph:** distinct colors = connected geometry components. "
                 "Colors indicate connectivity, not rigid trust or observation support."
             )
             return
-        graph_path = self.result.completed_modes.manifest.get(
+        self.graph_mode_index = mode_index
+        graph_path = completed.manifest.get(
             "observed_structure_graph"
         )
-        graph_identity = self.result.completed_modes.manifest.get(
+        graph_identity = completed.manifest.get(
             "observed_structure_graph_identity"
         )
         if not isinstance(graph_path, str) or not graph_path:
@@ -559,9 +545,9 @@ class ModalViewerData:
             raise ValueError("Completed modes identify a different observed graph")
         if (
             self.structure_graph.manifest["static_scene_identity"]
-            != self.result.manifest["static_scene_identity"]
+            != self.scene.manifest["static_scene_identity"]
             or self.structure_graph.manifest["foreground_identity"]
-            != self.result.manifest["foreground_identity"]
+            != self.scene.manifest["foreground_identity"]
         ):
             raise ValueError("Observed graph does not belong to the Viewer scene")
         graph_arrays = self.structure_graph.arrays
@@ -571,7 +557,7 @@ class ModalViewerData:
         edge_components = graph_arrays.component_index[
             graph_arrays.edge_index[:, 0]
         ]
-        completed_manifest = self.result.completed_modes.manifest
+        completed_manifest = completed.manifest
         rigid = load_rigid_modes(completed_manifest["rigid_modes"])
         for identity in (
             "rigid_modes_identity",
@@ -582,7 +568,7 @@ class ModalViewerData:
             if rigid.manifest[identity] != completed_manifest[identity]:
                 raise ValueError(f"Component graph rigid source differs: {identity}")
         self.graph_edge_colors, self.graph_edge_colors_by_mode = _component_graph_color_frames(
-            edge_components, completed_manifest, self.result.completed_modes.arrays,
+            edge_components, completed_manifest, completed.arrays,
             rigid.manifest, rigid.arrays,
         )
         self.graph_legend = (
@@ -599,7 +585,10 @@ class ModalViewerData:
 
         if self.coordinates is None:
             raise ValueError("This preview has no video coordinates; use the manual oscillator")
-        view = self.result.manifest["views"][view_index]
+        label = self.result.views[view_index]["label"]
+        if label not in self.result.coordinate_views:
+            raise ValueError(f"View {label!r} has no fitted coordinates")
+        view = self.result.coordinate_views[label]
         frame_count = int(view["frame_count"])
         if not 0 <= local_frame < frame_count:
             raise ValueError("Viewer local frame index is outside its view")
@@ -710,7 +699,8 @@ class ModalViewerData:
         """
         if self.control_displacement is None:
             raise ValueError("This artifact has no runtime control displacement")
-        if not 0 <= mode_index < len(self.control_displacement) or component_index not in (0, 1):
+        slot = getattr(self, "_control_slot", mode_index)
+        if not 0 <= slot < len(self.control_displacement) or component_index not in (0, 1):
             raise ValueError("Control modal mode/component is out of range")
         alpha, magnitude_hi = 1.0 + 0.0j, None
         if camera is None:
@@ -723,7 +713,7 @@ class ModalViewerData:
             self.control_positions, camera.K.detach().cpu().numpy(),
             camera.world_to_camera.detach().cpu().numpy(), camera.radial_distortion)
         projected = alpha * np.einsum(
-            "cj,cj->c", jacobian[:, component_index], self.control_displacement[mode_index])
+            "cj,cj->c", jacobian[:, component_index], self.control_displacement[slot])
         if magnitude_hi is None:
             magnitude_hi = float(np.percentile(np.abs(projected[projectable]), 99)) if projectable.any() else 1.0
         return _hsv_rgb(projected, magnitude_hi)
@@ -801,7 +791,7 @@ class ModalViserViewer:
     def views(self) -> list[dict[str, Any]]:
         """Return the validated ordered playback-view records."""
 
-        return self.data.result.manifest["views"]
+        return self.data.result.views
 
     def _active_view_index(self) -> int:
         """Resolve the current playback label to its result view index."""
@@ -815,7 +805,9 @@ class ModalViserViewer:
     def _active_frame_count(self) -> int:
         """Return the frame count of the selected playback view."""
 
-        return 1800 if self.data.is_preview else int(self.views[self._active_view_index()]["frame_count"])
+        label = self.views[self._active_view_index()]["label"]
+        view = self.data.result.coordinate_views.get(label)
+        return 1800 if view is None else int(view["frame_count"])
 
     def _build_gui(self) -> None:
         """Build every accepted control group from the old modal Viewer."""
@@ -832,17 +824,17 @@ class ModalViserViewer:
             self.viewer_resolution.on_update(self.request_render)
 
         with self.server.gui.add_folder("Time"):
-            if self.data.is_preview:
+            if self.data.coordinates is None:
                 self.server.gui.add_markdown("**Mode preview — manual oscillation. Video coordinates have not been fitted.**")
             self.playback_view = self.server.gui.add_dropdown(
                 "Playback view",
                 options=tuple(str(view["label"]) for view in self.views),
-                initial_value=str(self.views[0]["label"]),
+                initial_value=next(iter(self.data.result.coordinate_views), str(self.views[0]["label"])),
             )
             self.playback = add_gui_playback_group(
                 self.server,
                 num_frames=self._active_frame_count(),
-                initial_fps=30.0 if self.data.is_preview else 15.0,
+                initial_fps=30.0 if self.data.coordinates is None else 15.0,
                 num_frames_getter=self._active_frame_count,
             )
             self.timestep = self.playback[0]
@@ -882,6 +874,10 @@ class ModalViserViewer:
     def _on_playback_view(self, event: Any) -> None:
         """Clamp the local frame slider after changing playback view."""
 
+        available = self.data.has_coordinates(self._active_view_index())
+        self.drive.options = (DRIVE_FLOW, DRIVE_MANUAL) if available else (DRIVE_MANUAL,)
+        if not available:
+            self.drive.value = DRIVE_MANUAL
         maximum = self._active_frame_count() - 1
         if hasattr(self.timestep, "max"):
             self.timestep.max = maximum
@@ -914,8 +910,8 @@ class ModalViserViewer:
         with self.server.gui.add_folder("Modal playback"):
             self.drive = self.server.gui.add_dropdown(
                 "Drive",
-                options=(DRIVE_MANUAL,) if self.data.is_preview else (DRIVE_FLOW, DRIVE_MANUAL),
-                initial_value=DRIVE_MANUAL if self.data.is_preview else DRIVE_FLOW,
+                options=(DRIVE_FLOW, DRIVE_MANUAL) if self.data.has_coordinates(self._active_view_index()) else (DRIVE_MANUAL,),
+                initial_value=DRIVE_FLOW if self.data.has_coordinates(self._active_view_index()) else DRIVE_MANUAL,
             )
             self.motion_scale = self.server.gui.add_slider(
                 "Motion scale",
@@ -930,39 +926,34 @@ class ModalViserViewer:
             )
             self.rotate_ellipsoids.on_update(self.request_render)
             disable_all = self.server.gui.add_button("Turn off all modes")
-            modes_by_index: dict[int, dict[str, Any]] = {}
-            for display_index, mode_index in enumerate(self.data.frequency_order):
-                frequency = float(self.data.frequencies_hz[mode_index])
+            self.mode_controls = []
+            for mode_index, frequency in enumerate(self.data.frequencies_hz):
                 enabled = self.server.gui.add_checkbox(
-                    f"Mode {display_index} ({frequency:.3f} Hz) enable", True
+                    f"Mode {mode_index} ({frequency:.3f} Hz) enable", True
                 )
                 gain = self.server.gui.add_slider(
-                    f"Mode {display_index} gain",
+                    f"Mode {mode_index} gain",
                     min=0.0,
                     max=5.0,
                     step=0.01,
                     initial_value=1.0,
                 )
                 phase = self.server.gui.add_slider(
-                    f"Mode {display_index} phase",
+                    f"Mode {mode_index} phase",
                     min=-math.pi,
                     max=math.pi,
                     step=0.01,
                     initial_value=0.0,
                 )
-                modes_by_index[mode_index] = {
+                self.mode_controls.append({
                     "enabled": enabled,
                     "gain": gain,
                     "phase": phase,
-                    "frequency": frequency,
-                }
+                    "frequency": float(frequency),
+                })
                 enabled.on_update(self._on_mode_enabled)
                 gain.on_update(self.request_render)
                 phase.on_update(self.request_render)
-            self.mode_controls = tuple(
-                modes_by_index[index]
-                for index in range(len(self.data.frequencies_hz))
-            )
             disable_all.on_click(self._disable_all_modes)
             self.drive.on_update(self.request_render)
             self.motion_scale.on_update(self.request_render)
@@ -1047,30 +1038,22 @@ class ModalViserViewer:
                 min=0,
                 max=len(self.data.frequencies_hz) - 1,
                 step=1,
-                initial_value=self.data.display_indices[0],
+                initial_value=0,
             )
             self.phase_frequency = self.server.gui.add_number(
                 "Selected frequency (Hz)",
                 initial_value=float(self.data.frequencies_hz[0]),
                 disabled=True,
             )
-            self.observation_mode = self.server.gui.add_slider(
-                "Obs count mode index",
-                min=0,
-                max=len(self.data.frequencies_hz) - 1,
-                step=1,
-                initial_value=0,
-            )
         self.color_mode.on_update(self.request_render)
         self.phase_mode.on_update(self._on_phase_mode)
         self.phase_component.on_update(self._on_phase_component)
         self.phase_normalization.on_update(self._on_phase_normalization)
-        self.observation_mode.on_update(self.request_render)
 
     def _on_phase_mode(self, event: Any) -> None:
-        """Translate sorted display index back to immutable greedy mode slot."""
+        """Use the selected input mode for every diagnostic panel."""
 
-        mode_index = self.data.frequency_order[int(self.phase_mode.value)]
+        mode_index = int(self.phase_mode.value)
         self._set_selected_mode(mode_index, event)
 
     def _on_phase_component(self, event: Any) -> None:
@@ -1084,7 +1067,7 @@ class ModalViserViewer:
         self._set_selected_normalization(str(self.phase_normalization.value), event)
 
     def _set_selected_mode(self, mode_index: int, event: Any = None) -> None:
-        """Synchronize one greedy mode between all phase displays."""
+        """Synchronize the selected mode between all displays."""
 
         index = int(mode_index)
         if not 0 <= index < len(self.data.frequencies_hz):
@@ -1093,14 +1076,20 @@ class ModalViserViewer:
             return
         self._selection_sync = True
         try:
-            display_index = self.data.display_indices[index]
-            if int(self.phase_mode.value) != display_index:
-                self.phase_mode.value = display_index
+            with self.data.gpu_lock:
+                self.data.select_mode(index)
+            self._remove_control_cloud()
+            if getattr(self, "show_controls_only", None) is not None:
+                self.show_controls_only.disabled = not len(self.data.control_point_gaussian_index)
+                if self.show_controls_only.disabled:
+                    self.show_controls_only.value = False
+                self.control_color_mode.disabled = self.data.control_displacement is None
+                self.control_projection.disabled = self.data.control_displacement is None
+            if int(self.phase_mode.value) != index:
+                self.phase_mode.value = index
             self.phase_frequency.value = float(self.data.frequencies_hz[index])
             if hasattr(self, "spectrum_panel"):
                 self.spectrum_panel.set_mode_index(index)
-            if getattr(self, "support_mode", None) is not None:
-                self.support_mode.value = self.support_mode_labels[index]
         finally:
             self._selection_sync = False
         self.request_render(event)
@@ -1148,7 +1137,6 @@ class ModalViserViewer:
 
         if self.data.spectrum.view_id != str(label):
             raise ValueError("Spectrum panel did not apply its selected view")
-        self._set_selected_normalization(self.data.spectrum.amplitude_normalization)
         self.request_render(None)
 
     def _current_foreground_colors(self) -> Tensor | None:
@@ -1158,11 +1146,10 @@ class ModalViserViewer:
         if mode == COLOR_RGB:
             return None
         if mode == COLOR_OBSERVATIONS:
-            return self.data.observation_colors(int(self.observation_mode.value))
+            return self.data.observation_colors(int(self.phase_mode.value))
         if mode != COLOR_PHASE:
             raise ValueError(f"Unknown Viewer color mode: {mode!r}")
-        display_index = int(self.phase_mode.value)
-        mode_index = self.data.frequency_order[display_index]
+        mode_index = int(self.phase_mode.value)
         component = 0 if str(self.phase_component.value) == "u" else 1
         return self.data.phase_colors(
             mode_index, component, str(self.phase_normalization.value)
@@ -1177,38 +1164,21 @@ class ModalViserViewer:
         graph_edge_step = max(graph_edge_count // 200, 1)
         with self.server.gui.add_folder("Debug points"):
             control_count = len(self.data.control_point_gaussian_index)
-            self.show_controls_only = (
-                self.server.gui.add_checkbox("Show control points only", False)
-                if control_count else None
-            )
-            self.control_point_size = (
-                self.server.gui.add_slider("Control point size", min=0.0002, max=0.008,
-                                           step=0.0001, initial_value=0.002)
-                if control_count else None
-            )
             has_control_modes = self.data.control_displacement is not None
-            self.control_color_mode = (
-                self.server.gui.add_dropdown(
-                    "Control point color", options=("geometry component", "modal shape"),
-                    initial_value="modal shape" if has_control_modes else "geometry component",
-                    disabled=not has_control_modes)
-                if control_count else None
-            )
-            self.control_projection = (
-                self.server.gui.add_dropdown(
-                    "Control projection", options=("current camera", "spectrum view"),
-                    initial_value="current camera", disabled=not has_control_modes)
-                if control_count else None
-            )
-            if control_count:
-                self.server.gui.add_markdown(
-                    f"**Control points:** {control_count:,}. Modal shape shows learned control translations "
-                    "before interpolation. Select frequency and **U/V** in Spectrum. Hue = phase; brightness = amplitude. "
-                    "**Current camera** follows the orbit view, using basis phase and control-amplitude p99. "
-                    "**Spectrum view** shares the input modal image's phase and brightness scale. "
-                    "Colors describe the mode, independent of playback time/gain. "
-                    "Use **Canonical** for static positions. All controls are shown, including hidden ones."
-                )
+            self.show_controls_only = self.server.gui.add_checkbox(
+                "Show control points only", False, disabled=not control_count)
+            self.control_point_size = self.server.gui.add_slider(
+                "Control point size", min=0.0002, max=0.008, step=0.0001, initial_value=0.002)
+            self.control_color_mode = self.server.gui.add_dropdown(
+                "Control point color", options=("geometry component", "modal shape"),
+                initial_value="modal shape" if has_control_modes else "geometry component",
+                disabled=not has_control_modes)
+            self.control_projection = self.server.gui.add_dropdown(
+                "Control projection", options=("current camera", "spectrum view"),
+                initial_value="current camera", disabled=not has_control_modes)
+            self.server.gui.add_markdown(
+                "Control points and their colors follow the selected frequency's original model. "
+                "Current camera uses control-amplitude p99; Spectrum view uses saved alpha and image brightness.")
             self.hide_render = self.server.gui.add_checkbox(
                 "Hide Gaussian render", False
             )
@@ -1236,21 +1206,8 @@ class ModalViserViewer:
             )
             self.server.gui.add_markdown(self.data.support_legend)
             self.server.gui.add_markdown(
-                "Role colors describe **Modal role mode** only. Solo playback selects the same role frequency; "
+                "All diagnostics use **Selected frequency (Hz)**. Solo playback selects the same frequency; "
                 "when multiple modes are enabled, displayed motion is their sum."
-            )
-            self.support_mode_labels = tuple(
-                f"Mode {index}: {frequency:.3f} Hz"
-                for index, frequency in enumerate(self.data.frequencies_hz)
-            )
-            self.support_mode = (
-                self.server.gui.add_dropdown(
-                    "Modal role mode",
-                    options=self.support_mode_labels,
-                    initial_value=self.support_mode_labels[self.data.frequency_order[int(self.phase_mode.value)]],
-                )
-                if len(self.support_mode_labels) > 1
-                else None
             )
             self.support_filters = tuple(
                 self.server.gui.add_checkbox(name.capitalize(), True)
@@ -1284,7 +1241,6 @@ class ModalViserViewer:
             self.show_support,
             self.support_count,
             self.support_size,
-            self.support_mode,
             *self.support_filters,
             self.show_component_graph,
             self.component_graph_edge_count,
@@ -1321,7 +1277,7 @@ class ModalViserViewer:
         colors = self.data.control_point_colors
         if self.control_color_mode.value == "modal shape":
             colors = self.data.control_phase_colors(
-                self.data.frequency_order[int(self.phase_mode.value)],
+                int(self.phase_mode.value),
                 0 if self.phase_component.value == "u" else 1,
                 str(self.phase_normalization.value),
                 camera if self.control_projection.value == "current camera" else None)
@@ -1356,21 +1312,35 @@ class ModalViserViewer:
 
         if not bool(self.show_component_graph.value):
             return
+        index = int(self.phase_mode.value)
+        if index != self.data.graph_mode_index:
+            self.data._load_graph_display(index)
+            edge_count = len(self.data.graph_edge_gaussian_index)
+            self.component_graph_edge_count.max = max(edge_count, 1)
+            self.component_graph_edge_count.step = max(edge_count // 200, 1)
+            self.component_graph_edge_count.value = min(int(self.component_graph_edge_count.value), edge_count)
+            self._remove_component_graph()
         edge_count = len(self.data.graph_edge_gaussian_index)
         selected = _stable_uniform_indices(
             edge_count, max(int(self.component_graph_edge_count.value), 0)
         )
+        mode_index = None
+        colors = self.data.graph_edge_colors
+        if self.data.graph_edge_colors_by_mode is not None:
+            mode_index = int(self.phase_mode.value)
+            source_slot = self.data.result.modes[mode_index].slot
+            colors = self.data.graph_edge_colors_by_mode[source_slot]
+        self._display_graph_edges(means, selected, colors, mode_index)
+
+    def _display_graph_edges(self, means: Tensor, selected: np.ndarray,
+                             colors: np.ndarray, mode_index: int | None = None) -> None:
+        """Update the shared edge overlay after each viewer selects its edges/colors."""
         if len(selected) == 0:
             self._remove_component_graph()
             return
         gaussian_edges = self.data.graph_edge_gaussian_index[selected]
         points = means[torch.as_tensor(gaussian_edges, device=means.device)]
         points_numpy = points.detach().cpu().numpy()
-        mode_index = None
-        colors = self.data.graph_edge_colors
-        if self.data.graph_edge_colors_by_mode is not None:
-            mode_index = self.data.frequency_order[int(self.phase_mode.value)]
-            colors = self.data.graph_edge_colors_by_mode[mode_index]
         if (
             self._component_graph_handle is None
             or not np.array_equal(selected, self._component_graph_edge_indices)
@@ -1400,11 +1370,7 @@ class ModalViserViewer:
 
         if not bool(self.show_support.value):
             return
-        mode_index = (
-            self.support_mode_labels.index(str(self.support_mode.value))
-            if self.support_mode is not None
-            else 0
-        )
+        mode_index = int(self.phase_mode.value)
         classes = self.data.display_class[mode_index]
         enabled = np.asarray(
             [bool(handle.value) for handle in self.support_filters], dtype=bool
@@ -1575,7 +1541,8 @@ class ModalViserViewer:
                 time.sleep(0.01)
                 continue
             try:
-                image = self._render(client)
+                with getattr(self.data, "gpu_lock", self._render_lock):
+                    image = self._render(client)
                 self.server.scene.set_background_image(
                     image, format="jpeg", jpeg_quality=90
                 )
@@ -1623,6 +1590,10 @@ class ModalViserViewer:
             while True:
                 time.sleep(1.0)
         except KeyboardInterrupt:
+            pass
+        finally:
+            if getattr(self.data, "spectrum", None) is not None:
+                self.data.spectrum.close()
             self.server.stop()
 
 
@@ -1634,13 +1605,14 @@ def run_modal_viewer(
     port: int = 8080,
     viewer_resolution: int = 2048,
     preview: bool = False,
+    coordinates: str | Path | None = None,
 ) -> None:
     """Load one complete modal result and run its full Viser interface."""
 
     # Load the CUDA backend synchronously. Deferring this to a render worker
     # leaves a connected but blank Viewer when compiler activation fails.
     _load_gsplat_rasterization()
-    data = ModalViewerData(result_dir, preview=preview)
+    data = ModalViewerData(result_dir, preview=preview, coordinates=coordinates, work_dir=work_dir)
     viewer = ModalViserViewer(
         data,
         work_dir=work_dir,
@@ -1648,6 +1620,11 @@ def run_modal_viewer(
         port=port,
         viewer_resolution=viewer_resolution,
     )
+    if data.spectrum is not None:
+        def projection_updated():
+            viewer.spectrum_panel._refresh()
+            viewer.request_render()
+        data.spectrum.start(projection_updated)
     viewer.wait()
 
 

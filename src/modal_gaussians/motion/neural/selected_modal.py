@@ -4,17 +4,15 @@ from __future__ import annotations
 from dataclasses import fields
 import copy
 import math
-import os
 from pathlib import Path
 from modal_gaussians.scene_store import resolve_path
 import shutil
 import tempfile
-import time
 
 import numpy as np
 import torch
 
-from modal_gaussians.iteration_cache import Timings, atomic_json, identity, sha256
+from modal_gaussians.iteration_cache import Timings, atomic_json, identity, sha256, publish_directory as _publish_prepared
 from modal_gaussians.modes import Complex2DModesArtifact, TRANSFORM_CONVENTION, _validate_mode_records
 from modal_gaussians.numpy_io import save_named_arrays
 from modal_gaussians.progress import report_progress
@@ -24,23 +22,6 @@ from . import neural_modes as nm
 
 FORMAT = "modal_gaussians.selected_complex_2d_modes"
 ALIGNMENT_FORMAT = "modal_gaussians.selected_modal_alignment"
-
-
-def _publish_prepared(temporary, destination):
-    # Windows scanners can briefly hold a just-written directory. Retry the
-    # atomic rename only, preserving the expensive computed arrays in place.
-    delays = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
-    for attempt in range(len(delays) + 1):
-        if destination.exists() or destination.is_symlink():
-            raise FileExistsError(destination)
-        try:
-            os.rename(temporary, destination)
-            return
-        except OSError as error:
-            if (os.name != "nt" or getattr(error, "winerror", None) not in {5, 32, 33}
-                    or attempt == len(delays)):
-                raise
-            time.sleep(delays[attempt])
 
 
 def load_selected_modal_bundle(path, manifest=None):
@@ -237,12 +218,20 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
         modal_fields, records = [], []
         for view, flow in zip(source["views"], parent.manifest["flows"]):
             field, _, record = _modal_view(requested[view["label"]], flow, view, frequency_hz,
-                                         read_mask=not visible_subject)
+                                         read_mask=not visible_subject,
+                                         static_scene_identity=source["static_scene_identity"])
+            exported = record["manifest"]
+            if "reference_selection" in exported:
+                view["motion_reference"] = {"reference_frame_name": exported["reference_frame_name"],
+                    "reference_frame_index": exported["reference_frame_index"],
+                    "selection_identity": exported["reference_selection"]["identity"]}
+            else:
+                view.pop("motion_reference", None)
             modal_fields.append(field)
             records.append({**view, "flow_artifact": flow["path"], "flow_role": "geometry_reference_only",
                 "frame_count": len(flow["manifest"]["frame_names"]), "fps_hz": flow["manifest"]["fps_hz"],
-                "reference_frame_name": flow["manifest"]["reference_frame_name"],
-                "reference_frame_index": flow["manifest"]["reference_frame_index"],
+                "reference_frame_name": exported["reference_frame_name"],
+                "reference_frame_index": exported["reference_frame_index"],
                 "modes_file": str(Path(record["path"]) / "modal_image.npy"),
                 "modes_file_sha256": sha256(Path(record["path"]) / "modal_image.npy"),
                 "modes_dtype": "complex64", "modes_shape": [1, *view["shape_hw"], 2],

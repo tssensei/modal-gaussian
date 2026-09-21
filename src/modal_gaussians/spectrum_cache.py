@@ -323,6 +323,8 @@ def export_selection(cache, selection_path, output_dir):
                 "images", "stabilization_source", "stabilized_images", "inference_images", "reference_image",
                 "reference_frame_name", "reference_frame_index", "fps_hz", "frames", "flow_units",
                 "flow_direction", "smoothing", "transform")}
+            if "reference_selection" in source:
+                manifest["reference_selection"] = source["reference_selection"]
             manifest.update(format=EXPORT_FORMAT, version=1, status="complete", frequency_hz=frequency,
                             modes_file="modal_image.npy", modes_shape=[1, *view["shape_hw"], 2],
                             modes_dtype="complex64", full_spectrum=False, validation=False,

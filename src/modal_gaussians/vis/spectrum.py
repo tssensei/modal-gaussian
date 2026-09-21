@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import math
-from typing import Any, Callable
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -14,12 +15,13 @@ import viser.uplot
 from modal_gaussians.iteration_cache import identity
 from modal_gaussians.scene_store import resolve_path
 from modal_gaussians.spectrum_cache import load_spectrum, read_curves, read_region
+from modal_gaussians.vis.projections import ViewerProjections
 
 PREVIEW_PERCENTILE = 99.0
 NORMALIZATIONS = ("per mode", "all saved modes")
 
 
-@dataclass(frozen=True)
+@dataclass
 class SpectrumViewState:
     index: int
     label: str
@@ -33,10 +35,7 @@ class SpectrumViewState:
     frequency_limits: tuple[float, float]
     selection_pixels_xy: np.ndarray
     magnitude_hi: np.ndarray
-
-
-def _json(path):
-    return json.loads(resolve_path(path, strict=True).read_text(encoding="utf-8"))
+    display_pixels_xy: np.ndarray
 
 
 def _hsv_rgb(values: np.ndarray, magnitude_hi: float) -> np.ndarray:
@@ -65,15 +64,19 @@ def _hsv_rgb(values: np.ndarray, magnitude_hi: float) -> np.ndarray:
 
 
 class SpectrumComparisonController:
-    """Display a fixed mode bank using its exact exported bins and training alphas."""
+    """Display saved modal images and projections with their training alphas."""
 
-    def __init__(self, result):
+    def __init__(self, result, *, projections=None):
         self.result = result
-        bank = result.completed_modes.manifest
-        if bank.get("version") != 17:
-            raise ValueError("The shared-spectrum panel requires a fixed-frequency mode bank (v17)")
-        self.frequencies_hz = np.asarray([m["frequency_hz"] for m in bank["modes"]])
-        self.design_views = result.rendered_design.manifest["views"]
+        self.projections = projections or ViewerProjections(result)
+        self.frequencies_hz = np.asarray([m.frequency for m in result.modes], np.float64)
+        self.design_views = result.views
+        self._lock = threading.RLock()
+        self._executor = None
+        self._pending = set()
+        self._errors = {}
+        self._on_update = None
+        self._closed = False
         self.available_view_ids = tuple(v["label"] for v in self.design_views)
         if len(set(self.available_view_ids)) != len(self.available_view_ids):
             raise ValueError("Spectrum view labels must be unique")
@@ -81,29 +84,12 @@ class SpectrumComparisonController:
         self._alphas = np.zeros((len(self.frequencies_hz), len(self.design_views)), np.complex64)
         self._identifiable = np.zeros(self._alphas.shape, bool)
         self.cache = None
-        if len(bank["sources"]) != len(self.frequencies_hz):
-            raise ValueError("Mode bank source count differs from modes")
-        for k, source in enumerate(bank["sources"]):
-            root = resolve_path(source["path"], strict=True)
-            model = _json(root / "manifest.json")
-            slot = source["slot"]
-            if (model["completed_modes_identity"] != source["identity"]
-                    or model["static_scene_identity"] != bank["static_scene_identity"]
-                    or model["foreground_identity"] != bank["foreground_identity"]
-                    or model["modes"][slot]["frequency_hz"] != self.frequencies_hz[k]):
-                raise ValueError("Mode bank source identity/frequency differs")
-            dense = _json(resolve_path(model["complex_2d_modes"]) / "manifest.json")
-            if dense["complex_2d_modes_identity"] != model["complex_2d_modes_identity"]:
-                raise ValueError("Saved modal image source identity differs")
-            dense_views = {v["label"]: v for v in dense["views"]}
+        self._reference_images = {}
+        for k, mode in enumerate(result.modes):
+            model, slot, arrays = mode.artifact.manifest, mode.slot, mode.artifact.arrays
+            alphas, identifiable = arrays["alphas"][slot], arrays["alpha_identifiable_mask"][slot]
+            dense_views = mode.modal_views
             model_views = {v["label"]: i for i, v in enumerate(model["views"])}
-            array_path = (root / model["arrays_file"]).resolve(strict=True)
-            if not array_path.is_relative_to(root):
-                raise ValueError("Saved alignment must remain inside its model artifact")
-            # Read only tiny saved alignment arrays, never the network or baked Phi again.
-            with np.load(array_path, allow_pickle=False) as arrays:
-                alphas = arrays["alphas"][slot]
-                identifiable = arrays["alpha_identifiable_mask"][slot]
             for v, design_view in enumerate(self.design_views):
                 label = design_view["label"]
                 view = dense_views[label]
@@ -111,32 +97,46 @@ class SpectrumComparisonController:
                         or view["shape_hw"] != design_view["shape_hw"]):
                     raise ValueError("Modal image camera/shape differs from rendered design")
                 selected = view["selected_source"]
-                exported = _json(resolve_path(selected["path"]) / "manifest.json")
+                exported = mode.exports[label]
                 if (identity(exported) != selected["manifest_identity"]
-                        or exported.get("format") != "modal_gaussians.spectrum_selected_frequency"
+                        or exported.get("format") not in ("modal_gaussians.spectrum_selected_frequency",
+                            "modal_gaussians.sea_raft_selected_frequency_experiment")
                         or exported.get("status") != "complete"):
-                    raise ValueError("Modal image must bind a complete cached-bin export")
-                grid = exported["spectrum_source"]
-                if self.cache is None:
-                    self.cache = load_spectrum(grid["path"])
-                if (grid["identity"] != self.cache.manifest["spectrum_identity"]
-                        or resolve_path(grid["path"]) != self.cache.path
-                        or grid["fft_length"] != self.cache.manifest["fft_length"]):
-                    raise ValueError("Modal images must share the exact saved FFT cache")
-                index = grid["bin_index"]
-                if (type(index) is not int or not 0 <= index < len(self.cache.frequencies)
-                        or not math.isclose(self.cache.frequencies[index], self.frequencies_hz[k], rel_tol=0, abs_tol=1e-9)
-                        or exported["frequency_hz"] != self.frequencies_hz[k]):
-                    raise ValueError("Modal frequency is not its exact shared FFT bin")
-                cache_view = next(item for item in self.cache.manifest["views"] if item["label"] == label)
-                timing = cache_view["source_manifest"]
-                if (resolve_path(exported["source_flow_path"]) != resolve_path(cache_view["source_path"])
-                        or exported["reference_frame_name"] != design_view["flow_reference_frame_name"]
-                        or exported["reference_frame_index"] != design_view["flow_reference_frame_index"]
-                        or exported["frames"] != timing["frames"]
+                    raise ValueError("Modal image must bind a complete selected-frequency export")
+                motion_reference = design_view.get("motion_reference", {
+                    "reference_frame_name": design_view["flow_reference_frame_name"],
+                    "reference_frame_index": design_view["flow_reference_frame_index"]})
+                if (not math.isclose(exported["frequency_hz"], self.frequencies_hz[k], rel_tol=0, abs_tol=1e-9)
+                        or exported["reference_frame_name"] != motion_reference["reference_frame_name"]
+                        or exported["reference_frame_index"] != motion_reference["reference_frame_index"]
+                        or exported.get("reference_selection", {}).get("identity") != motion_reference.get("selection_identity")
                         or exported["fps_hz"] != design_view["fps_hz"]
                         or exported["modes_shape"] != [1, *design_view["shape_hw"], 2]):
-                    raise ValueError("Spectrum/export reference timing or source differs")
+                    raise ValueError("Modal export frequency, reference timing or shape differs")
+                if exported["format"] == "modal_gaussians.spectrum_selected_frequency":
+                    if self._reference_images:
+                        raise ValueError("Cannot mix shared FFT and selected-only sources")
+                    grid = exported["spectrum_source"]
+                    if self.cache is None:
+                        self.cache = load_spectrum(grid["path"])
+                    if (grid["identity"] != self.cache.manifest["spectrum_identity"]
+                            or resolve_path(grid["path"]) != self.cache.path
+                            or grid["fft_length"] != self.cache.manifest["fft_length"]):
+                        raise ValueError("Modal images must share the exact saved FFT cache")
+                    index = grid["bin_index"]
+                    if (type(index) is not int or not 0 <= index < len(self.cache.frequencies)
+                            or not math.isclose(self.cache.frequencies[index], self.frequencies_hz[k], rel_tol=0, abs_tol=1e-9)):
+                        raise ValueError("Modal frequency is not its exact shared FFT bin")
+                    cache_view = next(item for item in self.cache.manifest["views"] if item["label"] == label)
+                    if (resolve_path(exported["source_flow_path"]) != resolve_path(cache_view["source_path"])
+                            or exported["frames"] != cache_view["source_manifest"]["frames"]):
+                        raise ValueError("Spectrum/export reference timing or source differs")
+                else:
+                    if self.cache is not None:
+                        raise ValueError("Cannot mix shared FFT and selected-only sources")
+                    reference = resolve_path(exported["reference_image"], strict=True)
+                    if self._reference_images.setdefault(label, reference) != reference:
+                        raise ValueError("Selected modal reference images differ")
                 image_path = resolve_path(view["modes_file"], strict=True)
                 if image_path != resolve_path(selected["path"]) / exported["modes_file"]:
                     raise ValueError("Modal image path differs from its export")
@@ -148,7 +148,10 @@ class SpectrumComparisonController:
         self._states = {}
         self.component_index = self.reconstructed_index = 0
         self.amplitude_normalization = "per mode"
-        self.original_image_region = "Cached region"
+        self.full_spectrum_available = self.cache is not None
+        self.image_regions = (("Cached region", "Model support") if self.full_spectrum_available
+                              else ("Model support", "Full image"))
+        self.original_image_region = self.image_regions[0]
         self.select_view(self.available_view_ids[0])
 
     def _raw(self, label, k, pixels):
@@ -162,75 +165,146 @@ class SpectrumComparisonController:
             field._mmap.close()
 
     def _projection(self, v, k):
-        design = self.result.rendered_design
-        lo, hi = design.samples["view_sample_offsets"][v:v + 2]
-        matrix = design.design[lo:hi]
-        if not self._identifiable[k, v]:
-            return np.zeros((hi - lo, 2), np.complex64)
-        return self._alphas[k, v] * (matrix[:, :, 2*k] - 1j * matrix[:, :, 2*k+1])
+        value = self._available(k, self.available_view_ids[v])
+        if value is None:
+            return None
+        return (self._alphas[k, v] * value.values if self._identifiable[k, v]
+                else np.zeros_like(value.values))
+
+    def _record_projection(self, label, k):
+        state = self._states[label]
+        if np.isfinite(state.reconstructed_power[k]):
+            return
+        value = self._available(k, label)
+        if value is None:
+            return
+        raw = self._raw(label, k, value.pixels)
+        projected = self._projection(state.index, k)
+        state.reconstructed_power[k] = np.linalg.norm(projected, axis=1).mean()
+        if not self.full_spectrum_available:
+            state.raw_power[k] = np.linalg.norm(raw, axis=1).mean()
+        state.magnitude_hi[:] = np.maximum(state.magnitude_hi,
+            np.percentile(np.concatenate((np.abs(raw), np.abs(projected))), PREVIEW_PERCENTILE, axis=0))
 
     def _prepare_view(self, label):
         v = self.available_view_ids.index(label)
-        cache_index = next(i for i, item in enumerate(self.cache.manifest["views"]) if item["label"] == label)
-        record = self.cache.manifest["views"][cache_index]
-        design = self.result.rendered_design
-        lo, hi = design.samples["view_sample_offsets"][v:v + 2]
-        pixels = np.asarray(design.samples["sample_pixels_xy"][lo:hi], dtype=np.int64)
-        h, w = record["shape_hw"]
-        if len(pixels) == 0 or np.any(pixels < 0) or np.any(pixels >= [w, h]):
-            raise ValueError("Spectrum model-support pixels are empty or invalid")
-        region = read_region(self.cache, cache_index, "selected_box")
-        y, x = np.nonzero(region)
-        selection = np.column_stack((x, y))
-        reference = cv2.imread(str(resolve_path(self.cache.path / record["reference_image"], strict=True)))
+        h, w = self.design_views[v]["shape_hw"]
+        if self.full_spectrum_available:
+            cache_index = next(i for i, item in enumerate(self.cache.manifest["views"]) if item["label"] == label)
+            record = self.cache.manifest["views"][cache_index]
+            y, x = np.nonzero(read_region(self.cache, cache_index, "selected_box"))
+            selection = np.column_stack((x, y))
+            reference_path = resolve_path(self.cache.path / record["reference_image"], strict=True)
+        else:
+            selection = np.empty((0, 2), np.int64)
+            reference_path = self._reference_images[label]
+        reference = cv2.imread(str(reference_path))
         if reference is None or reference.shape != (h, w, 3):
             raise ValueError("Cached spectrum reference image has invalid dimensions")
-        power = np.zeros(len(self.frequencies_hz), np.float32)
-        maximum = np.zeros(2)
-        for k in range(len(self.frequencies_hz)):
-            raw, projected = self._raw(label, k, pixels), self._projection(v, k)
-            power[k] = np.linalg.norm(projected, axis=1).mean()
-            maximum = np.maximum(maximum, np.percentile(np.concatenate((np.abs(raw), np.abs(projected))),
-                                                         PREVIEW_PERCENTILE, axis=0))
-        f = self.cache.frequencies
-        margin = 0.05 * max(float(np.ptp(self.frequencies_hz)), float(f[1] - f[0]))
-        return SpectrumViewState(v, label, pixels, cv2.cvtColor(reference, cv2.COLOR_BGR2RGB), f,
-            read_curves(self.cache, cache_index)["selected_box"], power, self._alphas[:, v],
-            self._identifiable[:, v], (max(float(f[0]), float(self.frequencies_hz.min()) - margin),
-            min(float(f[-1]), float(self.frequencies_hz.max()) + margin)), selection,
-            np.where(maximum > 0, maximum, 1.0))
+        f = self.cache.frequencies if self.full_spectrum_available else self.frequencies_hz
+        spacing = float(np.min(np.diff(np.sort(f)))) if len(f) > 1 else max(float(abs(f[0])), 1e-3)
+        margin = 0.05 * max(float(np.ptp(self.frequencies_hz)), spacing)
+        limits = (max(0., float(self.frequencies_hz.min()) - margin), float(self.frequencies_hz.max()) + margin)
+        raw_power = np.full(len(f), np.nan, np.float32)
+        if self.full_spectrum_available:
+            raw_power = read_curves(self.cache, cache_index)["selected_box"]
+            limits = (max(float(f[0]), limits[0]), min(float(f[-1]), limits[1]))
+        empty = np.empty((0, 2), np.int64)
+        return SpectrumViewState(v, label, empty, cv2.cvtColor(reference, cv2.COLOR_BGR2RGB), f,
+            raw_power, np.full(len(self.frequencies_hz), np.nan, np.float32), self._alphas[:, v],
+            self._identifiable[:, v], limits, selection, np.zeros(2), empty)
+
+    def start(self, on_update):
+        """Start only after the 3D viewer and panel handles exist."""
+        self._on_update = on_update
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="modal-projection")
+        self._refresh_products()
+
+    def close(self):
+        self._closed = True
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+        self._pending.clear()
+
+    def _available(self, k, label):
+        try:
+            return self.projections.get(k, label)
+        except (OSError, ValueError, KeyError) as error:
+            self._errors[k, label] = str(error)
+            return None
+
+    def _request(self, k, label):
+        key = k, label
+        if self._closed or self._executor is None or key in self._pending or key in self._errors:
+            return
+        self._pending.add(key)
+        def compute():
+            try:
+                self.projections.get(k, label, compute=True)
+            except Exception as error:
+                self._errors[key] = str(error)
+            finally:
+                with self._lock:
+                    self._pending.discard(key)
+                    if not self._closed:
+                        if key not in self._errors:
+                            self._record_projection(label, k)
+                        # Read current selection here; an old job never restores it.
+                        self._refresh_products()
+                        if self._on_update is not None:
+                            self._on_update()
+        self._executor.submit(compute)
+
+    def complete_view(self):
+        with self._lock:
+            for k in range(len(self.frequencies_hz)):
+                self._errors.pop((k, self.view_id), None)
+                if self._available(k, self.view_id) is None:
+                    self._request(k, self.view_id)
+            self._refresh_products()
 
     def select_view(self, label):
-        if label not in self.available_view_ids:
-            raise ValueError(f"Unknown spectrum view: {label!r}")
-        if label not in self._states:
-            self._states[label] = self._prepare_view(label)
-        self.view_id, self.state = label, self._states[label]
-        self._refresh_products()
+        with self._lock:
+            if label not in self.available_view_ids:
+                raise ValueError(f"Unknown spectrum view: {label!r}")
+            if label not in self._states:
+                self._states[label] = self._prepare_view(label)
+                for k in range(len(self.frequencies_hz)):
+                    self._record_projection(label, k)
+            self.view_id, self.state = label, self._states[label]
+            if self.amplitude_normalization == "all saved modes":
+                self.complete_view()
+            self._refresh_products()
 
     def select_mode(self, index):
-        if not 0 <= int(index) < len(self.frequencies_hz):
-            raise ValueError("Mode index is outside the saved bank")
-        self.reconstructed_index = int(index)
-        self._refresh_products()
+        with self._lock:
+            if not 0 <= int(index) < len(self.frequencies_hz):
+                raise ValueError("Mode index is outside the saved bank")
+            self.reconstructed_index = int(index)
+            self._refresh_products()
 
     def select_component(self, component):
-        if component.upper() not in ("U", "V"):
-            raise ValueError("Modal component must be U or V")
-        self.component_index = 0 if component.upper() == "U" else 1
-        self._refresh_products()
+        with self._lock:
+            if component.upper() not in ("U", "V"):
+                raise ValueError("Modal component must be U or V")
+            self.component_index = 0 if component.upper() == "U" else 1
+            self._refresh_products()
 
     def select_amplitude_normalization(self, normalization):
-        if normalization not in NORMALIZATIONS:
-            raise ValueError("Unknown modal image normalization")
-        self.amplitude_normalization = normalization
-        self._refresh_products()
+        with self._lock:
+            if normalization not in NORMALIZATIONS:
+                raise ValueError("Unknown modal image normalization")
+            self.amplitude_normalization = normalization
+            if normalization == "all saved modes":
+                self.complete_view()
+            self._refresh_products()
 
     def select_original_image_region(self, region):
-        if region not in ("Model support", "Cached region"):
-            raise ValueError("Unknown modal image region")
-        self.original_image_region = region
-        self._refresh_products()
+        with self._lock:
+            if region not in self.image_regions:
+                raise ValueError("Unknown modal image region")
+            self.original_image_region = region
+            self._refresh_products()
 
     def _modal_image(self, values, high, pixels, radius=0):
         output = 0.35 * self.state.reference_rgb.astype(np.float32) / 255
@@ -243,29 +317,56 @@ class SpectrumComparisonController:
         return np.clip(np.rint(output * 255), 0, 255).astype(np.uint8)
 
     def _refresh_products(self):
+        with self._lock:
+            self._refresh_current()
+
+    def _refresh_current(self):
         k, c = self.reconstructed_index, self.component_index
-        pixels = self.state.pixels_xy
-        raw = self._raw(self.view_id, k, pixels)[:, c]
-        projected = self._projection(self.state.index, k)[:, c]
-        high = (float(np.percentile(np.concatenate((np.abs(raw), np.abs(projected))), PREVIEW_PERCENTILE))
-                if self.amplitude_normalization == "per mode" else float(self.state.magnitude_hi[c]))
+        value = self._available(k, self.view_id)
+        ready = value is not None
+        if ready:
+            pixels = value.pixels
+            self._record_projection(self.view_id, k)
+            projected = self._projection(self.state.index, k)[:, c]
+            raw = self._raw(self.view_id, k, pixels)[:, c]
+            all_ready = np.isfinite(self.state.reconstructed_power).all()
+            high = (float(self.state.magnitude_hi[c]) if self.amplitude_normalization == "all saved modes" and all_ready
+                    else float(np.percentile(np.concatenate((np.abs(raw), np.abs(projected))), PREVIEW_PERCENTILE)))
+            h, w = self.design_views[self.state.index]["shape_hw"]
+            support = np.zeros((h, w), np.uint8)
+            support[pixels[:, 1], pixels[:, 0]] = 1
+            y, x = np.nonzero(cv2.dilate(support, np.ones((3, 3), np.uint8)))
+            self.state.pixels_xy = pixels
+            self.state.display_pixels_xy = np.column_stack((x, y))
+        else:
+            pixels = np.empty((0, 2), np.int64)
+            projected = np.empty(0, np.complex64)
+            high = 1.0
+            self._request(k, self.view_id)
         self.modal_image_magnitude_hi = high if math.isfinite(high) and high > 0 else 1.0
         if self.original_image_region == "Cached region":
             original_pixels = self.state.selection_pixels_xy
-            raw = self._raw(self.view_id, k, original_pixels)[:, c]
+        elif self.original_image_region == "Full image" or not ready:
+            y, x = np.indices(self.state.reference_rgb.shape[:2])
+            original_pixels = np.column_stack((x.ravel(), y.ravel()))
         else:
-            original_pixels = pixels
+            original_pixels = self.state.display_pixels_xy
+        raw = self._raw(self.view_id, k, original_pixels)[:, c]
         self.raw_modal_image = self._modal_image(raw, self.modal_image_magnitude_hi, original_pixels)
         self.reconstructed_modal_image = self._modal_image(projected, self.modal_image_magnitude_hi, pixels, radius=1)
+        count = int(np.isfinite(self.state.reconstructed_power).sum())
+        error = self._errors.get((k, self.view_id))
         self.status = (
             f"**View:** {self.view_id} · **Frequency:** {self.frequencies_hz[k]:.6f} Hz · "
             f"**Component:** {'U' if c == 0 else 'V'}  \n"
-            "**Source:** saved SEA-RAFT shared FFT and exact exported bin.  \n"
+            f"**Projections available:** {count}/{len(self.frequencies_hz)}. Missing frequencies are gaps.  \n"
             "**Projection:** fixed 3D mode with saved training view alignment; no display refit.  \n"
-            "**Curve regions:** input = cached analysis region; projection = model-support samples. "
-            "Their spatial averaging domains differ.  \n"
-            "**Image brightness:** shared model-support percentile; pixels outside displayed support are dim reference RGB."
+            + ("**Curve regions:** input = cached analysis region; projection = per-mode model-support samples.  \n"
+               if self.full_spectrum_available else "**Curve regions:** input and projection use each mode's support samples.  \n")
+            + (f"**Projection failed:** {error}" if error else ("" if ready else "**Projection pending.**"))
             + ("" if self.state.alpha_identifiable[k] else "  \n**Projection unavailable:** saved view alignment is unidentifiable.")
+            + ("  \n**Shared brightness pending:** waiting for all frequencies." if
+               self.amplitude_normalization == "all saved modes" and count < len(self.frequencies_hz) else "")
         )
 
     @property
@@ -282,7 +383,8 @@ class SpectrumComparisonController:
                 or amplitude_normalization != self.amplitude_normalization):
             raise ValueError("3D phase controls and spectrum panel are not synchronized")
         return (self.view_id, complex(self.state.alphas[mode_index]),
-                bool(self.state.alpha_identifiable[mode_index]), self.modal_image_magnitude_hi)
+                bool(self.state.alpha_identifiable[mode_index]) and self._available(mode_index, self.view_id) is not None,
+                self.modal_image_magnitude_hi)
 
 
 def _spectrum_plot_data(
@@ -325,12 +427,6 @@ class ModalSpectrumPanel:
     ) -> None:
         self.controller = controller
         self._updating = False
-        self._frequency_order = tuple(
-            int(value) for value in np.argsort(controller.frequencies_hz, kind="stable")
-        )
-        display = np.empty(len(self._frequency_order), dtype=np.int64)
-        display[np.asarray(self._frequency_order)] = np.arange(len(display))
-        self._display_indices = tuple(int(value) for value in display)
         self.view = server.gui.add_dropdown(
             "Spectrum view",
             options=controller.available_view_ids,
@@ -338,8 +434,8 @@ class ModalSpectrumPanel:
         )
         self.frequency_range = server.gui.add_dropdown(
             "Frequency range",
-            options=("full spectrum", "selected modes"),
-            initial_value="full spectrum",
+            options=(("full spectrum", "selected modes") if controller.full_spectrum_available else ("selected modes",)),
+            initial_value="full spectrum" if controller.full_spectrum_available else "selected modes",
         )
         self.component = server.gui.add_dropdown(
             "Modal image component",
@@ -353,15 +449,15 @@ class ModalSpectrumPanel:
         )
         self.original_region = server.gui.add_dropdown(
             "Original image region",
-            options=("Cached region", "Model support"),
+            options=controller.image_regions,
             initial_value=controller.original_image_region,
         )
         self.mode = server.gui.add_slider(
             "Selected mode",
             min=0,
-            max=len(display) - 1,
+            max=len(controller.frequencies_hz) - 1,
             step=1,
-            initial_value=self._display_indices[controller.reconstructed_index],
+            initial_value=controller.reconstructed_index,
         )
         self.frequency = server.gui.add_number(
             "Selected frequency (Hz)",
@@ -370,38 +466,28 @@ class ModalSpectrumPanel:
         )
         solo = server.gui.add_button("Solo selected mode")
         enable_all = server.gui.add_button("Enable all modes")
+        complete = server.gui.add_button("Complete projections for this view")
+        @complete.on_click
+        def _(_):
+            controller.complete_view()
+            self._refresh()
         self.status = server.gui.add_markdown(controller.status)
         server.gui.add_markdown(
             "Input: saved full FFT curve over its cached analysis region. "
             "Projection: saved frequencies on model-support pixels, with training alignment. "
             "This is a modal projection, not a coefficient-video FFT."
+            if controller.full_spectrum_available else
+            "Only saved input frequencies are shown. Input and projection curves share model-support pixels. "
+            "The images use saved training alignment; no full spectrum is computed."
         )
+        self._raw_title = "Original spectrum" if controller.full_spectrum_available else "Saved input frequencies"
         maximum = self._shared_power_max()
-        self.raw_plot = server.gui.add_uplot(
-            data=_spectrum_plot_data(
-                controller.raw_frequencies_hz,
-                controller.raw_power,
-                float(controller.frequencies_hz[controller.reconstructed_index]),
-                maximum,
-            ),
-            series=self._series("Cached-region mean amplitude", "#4c9aff"),
-            title=f"Original {controller.view_id} spectrum",
-            scales=self._scales(maximum),
-            legend=viser.uplot.Legend(show=True),
-            height=260,
-        )
-        self.reconstructed_plot = server.gui.add_uplot(
-            data=_spectrum_plot_data(
-                controller.frequencies_hz,
-                controller.reconstructed_power,
-                float(controller.frequencies_hz[controller.reconstructed_index]),
-                maximum,
-            ),
-            series=self._series("Model-support projected amplitude", "#ff9f43"),
-            title=f"Projected modes {controller.view_id} spectrum",
-            scales=self._scales(maximum),
-            legend=viser.uplot.Legend(show=True),
-            height=260,
+        frequency = float(controller.frequencies_hz[controller.reconstructed_index])
+        self.raw_plot, self.reconstructed_plot = (
+            server.gui.add_uplot(data=_spectrum_plot_data(frequencies, power, frequency, maximum),
+                series=self._series(label, color), title=title, scales=self._scales(maximum),
+                legend=viser.uplot.Legend(show=True), height=260)
+            for frequencies, power, label, color, title in self._curves()
         )
         self.raw_image = server.gui.add_image(
             controller.raw_modal_image,
@@ -447,11 +533,11 @@ class ModalSpectrumPanel:
         @self.mode.on_update
         def _(_) -> None:
             if not self._updating:
-                on_mode_selected(self._frequency_order[int(self.mode.value)])
+                on_mode_selected(int(self.mode.value))
 
         @solo.on_click
         def _(_) -> None:
-            on_solo_selected(self._frequency_order[int(self.mode.value)])
+            on_solo_selected(int(self.mode.value))
 
         @enable_all.on_click
         def _(_) -> None:
@@ -461,7 +547,7 @@ class ModalSpectrumPanel:
     def _series(label: str, color: str) -> tuple[viser.uplot.Series, ...]:
         return (
             viser.uplot.Series(label="Frequency (Hz)"),
-            viser.uplot.Series(label=label, stroke=color, width=2),
+            viser.uplot.Series(label=label, stroke=color, width=2, spanGaps=False),
             viser.uplot.Series(label="Selected frequency", stroke="#ff3b30", width=1),
         )
 
@@ -471,28 +557,21 @@ class ModalSpectrumPanel:
             return float(frequencies[0]), float(frequencies[-1])
         return self.controller.frequency_limits
 
+    def _curves(self):
+        """Keep plot creation, scaling and refresh on the same two curve definitions."""
+        c = self.controller
+        return (
+            (c.raw_frequencies_hz, c.raw_power,
+             "Cached-region mean amplitude" if c.full_spectrum_available else "Model-support input amplitude",
+             "#4c9aff", f"{self._raw_title} · {c.view_id}"),
+            (c.frequencies_hz, c.reconstructed_power, "Model-support projected amplitude",
+             "#ff9f43", f"Projected modes {c.view_id} spectrum"),
+        )
+
     def _shared_power_max(self) -> float:
         lower, upper = self._frequency_limits()
-        raw_visible = (
-            (self.controller.raw_frequencies_hz >= lower)
-            & (self.controller.raw_frequencies_hz <= upper)
-        )
-        reconstructed_visible = (
-            (self.controller.frequencies_hz >= lower)
-            & (self.controller.frequencies_hz <= upper)
-        )
-        maxima = [0.0]
-        if np.any(raw_visible):
-            maxima.append(float(np.max(self.controller.raw_power[raw_visible])))
-        if np.any(reconstructed_visible):
-            maxima.append(
-                float(
-                    np.max(
-                        self.controller.reconstructed_power[reconstructed_visible]
-                    )
-                )
-            )
-        maximum = max(maxima)
+        maximum = max(float(np.max(power[(frequencies >= lower) & (frequencies <= upper) & np.isfinite(power)], initial=0.))
+                      for frequencies, power, *_ in self._curves())
         return 1.05 * maximum if maximum > 0.0 else 1.0
 
     def _scales(self, maximum: float) -> dict[str, viser.uplot.Scale]:
@@ -509,7 +588,7 @@ class ModalSpectrumPanel:
         maximum = self._shared_power_max()
         self._updating = True
         try:
-            self.mode.value = self._display_indices[index]
+            self.mode.value = index
             self.frequency.value = frequency
             self.view.value = self.controller.view_id
             self.component.value = "U" if self.controller.component_index == 0 else "V"
@@ -518,24 +597,10 @@ class ModalSpectrumPanel:
         finally:
             self._updating = False
         self.status.content = self.controller.status
-        self.raw_plot.data = _spectrum_plot_data(
-            self.controller.raw_frequencies_hz,
-            self.controller.raw_power,
-            frequency,
-            maximum,
-        )
-        self.raw_plot.title = f"Original {self.controller.view_id} spectrum"
-        self.raw_plot.scales = self._scales(maximum)
-        self.reconstructed_plot.data = _spectrum_plot_data(
-            self.controller.frequencies_hz,
-            self.controller.reconstructed_power,
-            frequency,
-            maximum,
-        )
-        self.reconstructed_plot.title = (
-            f"Projected modes {self.controller.view_id} spectrum"
-        )
-        self.reconstructed_plot.scales = self._scales(maximum)
+        for plot, (frequencies, power, _, _, title) in zip((self.raw_plot, self.reconstructed_plot), self._curves()):
+            plot.data = _spectrum_plot_data(frequencies, power, frequency, maximum)
+            plot.title = title
+            plot.scales = self._scales(maximum)
         self.raw_image.image = self.controller.raw_modal_image
         self.reconstructed_image.image = self.controller.reconstructed_modal_image
 

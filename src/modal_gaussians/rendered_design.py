@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 from modal_gaussians.motion.common.projection import (
-    RenderedDesignConfig, projection_jacobian as _projection_jacobian,
-    candidate_observation_pixels as _candidate_observation_pixels,
-    render_motion_features, uses_visible_subject, sample_feature_render as _sample_feature_render,
+    RenderedDesignConfig, uses_visible_subject,
+    prepare_modal_projection, project_modal_features,
 )
 
 from dataclasses import dataclass
@@ -20,7 +19,6 @@ import shutil
 import tempfile
 from typing import Any, Mapping, Sequence
 
-import cv2
 import numpy as np
 from modal_gaussians.progress import Progress
 import torch
@@ -472,6 +470,8 @@ def _load_sources(
                 ),
                 "frame_count": int(flow.arrays.flow.shape[0]),
                 "fps_hz": float(flow.manifest["fps_hz"]),
+                **({"motion_reference": completed_view["motion_reference"]}
+                   if "motion_reference" in completed_view else {}),
             }
         )
     return (
@@ -529,37 +529,17 @@ def build_rendered_modal_design_artifact(
         raise ValueError("Completed modes do not match the static foreground")
 
     scene.eval()
-    means = (
-        scene.foreground.active()["means"]
-        .detach()
-        .cpu()
-        .numpy()
-        .astype(np.float32)
-    )
     pixels_by_view: list[np.ndarray] = []
     alpha_by_view: list[np.ndarray] = []
     jacobian_by_view: list[np.ndarray] = []
     sample_offsets = [0]
-    dummy = torch.zeros((foreground_count, 1), device=device, dtype=torch.float32)
     with torch.no_grad():
         for camera, flow, record in zip(cameras, flows, view_records):
-            _, alpha_tensor = render_motion_features(scene, camera, dummy)
-            alpha_image = alpha_tensor.detach().cpu().float().numpy()
-            pixels, sampled_alpha = _candidate_observation_pixels(
-                scene, flow.arrays.mask_union, alpha_image, settings
-            )
-            K = camera.K.detach().cpu().numpy().astype(np.float64)
-            w2c = (
-                camera.world_to_camera.detach().cpu().numpy().astype(np.float64)
-            )
-            jacobian, visible = _projection_jacobian(means, K, w2c, camera.radial_distortion)
-            if not np.any(visible):
-                raise ValueError(
-                    f"All foreground Gaussians lie behind view {record['label']!r}"
-                )
+            pixels, sampled_alpha, jacobian, visible_count = prepare_modal_projection(
+                scene, camera, flow.arrays.mask_union, settings)
             record["sample_offset"] = sample_offsets[-1]
             record["sample_count"] = len(pixels)
-            record["foreground_gaussians_in_front"] = int(np.count_nonzero(visible))
+            record["foreground_gaussians_in_front"] = visible_count
             sample_offsets.append(sample_offsets[-1] + len(pixels))
             pixels_by_view.append(pixels)
             alpha_by_view.append(sampled_alpha)
@@ -603,52 +583,10 @@ def build_rendered_modal_design_artifact(
                 zip(cameras, pixels_by_view, alpha_by_view, jacobian_by_view)
             ):
                 lower, upper = sample_offsets[view_index : view_index + 2]
-                jacobian_tensor = torch.as_tensor(
-                    jacobian, device=device, dtype=torch.float32
-                )
                 for start in range(0, mode_count, settings.modes_per_batch):
                     stop = min(start + settings.modes_per_batch, mode_count)
-                    phi_real = torch.as_tensor(
-                        np.ascontiguousarray(np.real(phi[start:stop])),
-                        device=device,
-                        dtype=torch.float32,
-                    )
-                    phi_imag = torch.as_tensor(
-                        np.ascontiguousarray(np.imag(phi[start:stop])),
-                        device=device,
-                        dtype=torch.float32,
-                    )
-                    projected_real = torch.einsum(
-                        "gij,kgj->kgi", jacobian_tensor, phi_real
-                    )
-                    projected_imag = torch.einsum(
-                        "gij,kgj->kgi", jacobian_tensor, phi_imag
-                    )
-                    features = torch.stack(
-                        (
-                            projected_real[..., 0],
-                            projected_real[..., 1],
-                            -projected_imag[..., 0],
-                            -projected_imag[..., 1],
-                        ),
-                        dim=-1,
-                    ).permute(1, 0, 2).reshape(foreground_count, -1).contiguous()
-                    values = _sample_feature_render(
-                        scene, camera, features, pixels, sampled_alpha
-                    ).reshape(len(pixels), stop - start, 4)
-                    for local_mode, mode_slot in enumerate(range(start, stop)):
-                        design[lower:upper, 0, 2 * mode_slot] = values[
-                            :, local_mode, 0
-                        ]
-                        design[lower:upper, 1, 2 * mode_slot] = values[
-                            :, local_mode, 1
-                        ]
-                        design[lower:upper, 0, 2 * mode_slot + 1] = values[
-                            :, local_mode, 2
-                        ]
-                        design[lower:upper, 1, 2 * mode_slot + 1] = values[
-                            :, local_mode, 3
-                        ]
+                    design[lower:upper, :, 2*start:2*stop] = project_modal_features(
+                        scene, camera, phi[start:stop], pixels, sampled_alpha, jacobian)
                     progress.update(
                         view_index * mode_count + stop,
                         f"camera={camera.name} modes={stop}/{mode_count}",

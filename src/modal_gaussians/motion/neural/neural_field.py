@@ -29,6 +29,7 @@ class NeuralFieldConfig:
     relative_tolerance: float = 1.0e-6
     checkpoint_every: int = 100
     huber_delta: float = 1.0
+    data_loss_normalization: str = "view_rms"
     deformation_weight: float = 1.0
     rotation_weight: float = 0.1
     rotation_length_fraction: float = 0.05
@@ -40,6 +41,8 @@ class NeuralFieldConfig:
         return self.deformation_weight
 
     def validate(self) -> None:
+        if self.data_loss_normalization not in ("view_rms", "none"):
+            raise ValueError("data_loss_normalization must be view_rms or none")
         if self.exclude_weak_gaussian_rigidity is not False:
             raise ValueError("exclude_weak_gaussian_rigidity has been removed; only false is supported")
         for name in ("hidden_dim", "message_layers", "max_iterations",
@@ -63,6 +66,8 @@ class NeuralFieldConfig:
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
+        if self.data_loss_normalization == "view_rms":
+            result.pop("data_loss_normalization")
         # Keep coordinate-only checkpoint contracts byte-compatible.
         if self.local_feature_dim == 0:
             result.pop("local_feature_dim")
@@ -625,7 +630,9 @@ def _objective(model: PerFrequencyModalGNN, geometry: NeuralFieldGeometry,
             prediction = observation.project(leaves.field)
             if prediction.shape != target.shape:
                 raise ValueError(f"Projection shape differs from target for {observation.name!r}")
-            residual = (alpha * prediction - target) / scale
+            residual = alpha * prediction - target
+            if settings.data_loss_normalization == "view_rms":
+                residual = residual / scale
             term = (confidence * radial_huber(residual, settings.huber_delta)).sum() / len(prepared)
             view_losses.append(term.detach())
             if backward:

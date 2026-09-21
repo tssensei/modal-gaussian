@@ -59,6 +59,7 @@ class NeuralModesConfig:
     mask_erosion_iterations: int = 1
     energy_floor_fraction: float = 0.05
     huber_delta: float = 1.0
+    data_loss_normalization: str = "view_rms"
     deformation_weight: float = 1.0
     rotation_weight: float = 0.1
     rotation_length_fraction: float = 0.05
@@ -78,6 +79,8 @@ class NeuralModesConfig:
     training_fragment_config: dict[str, Any] | None = None
 
     def validate(self) -> None:
+        if self.data_loss_normalization not in ("view_rms", "none"):
+            raise ValueError("Neural data_loss_normalization must be view_rms or none")
         if self.modal_projection_backend not in ("dynamic", "cached"):
             raise ValueError("Neural modal_projection_backend must be dynamic or cached")
         for name in ("exclude_weak_gaussian_rigidity", "zero_weak_graph_weights"):
@@ -118,6 +121,8 @@ class NeuralModesConfig:
     def to_dict(self) -> dict[str, Any]:
         self.validate()
         result = asdict(self)
+        if self.data_loss_normalization == "view_rms":
+            result.pop("data_loss_normalization")
         if self.modal_projection_backend == "dynamic":
             result.pop("modal_projection_backend")
         if self.graph_edge_filter == "depth":
@@ -140,6 +145,8 @@ class NeuralModesConfig:
                      if key not in ("exclude_weak_gaussian_rigidity", "zero_weak_graph_weights")}
         if canonical.get("modal_projection_backend") == "dynamic":
             canonical.pop("modal_projection_backend")
+        if canonical.get("data_loss_normalization") == "view_rms":
+            canonical.pop("data_loss_normalization")
         if result.to_dict() != canonical:
             raise ValueError("Neural configuration is not fully resolved")
         return result
@@ -211,6 +218,7 @@ def _field_config(config: NeuralModesConfig, mode: int = 0) -> Any:
         gradient_clip=config.gradient_clip, seed=config.seed + mode,
         convergence_patience=config.convergence_patience, relative_tolerance=config.relative_tolerance,
         checkpoint_every=config.checkpoint_every, huber_delta=config.huber_delta,
+        data_loss_normalization=config.data_loss_normalization,
         deformation_weight=config.deformation_weight, rotation_weight=config.rotation_weight,
         rotation_length_fraction=config.rotation_length_fraction,
     )

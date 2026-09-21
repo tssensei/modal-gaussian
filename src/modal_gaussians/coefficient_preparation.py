@@ -126,6 +126,17 @@ def _bank_contract(sources, scene_manifest, flows):
     views = []
     for view, flow in zip(first["views"], flows):
         camera = cameras[view["label"]]
+        binding = flow.manifest.get("reference_selection")
+        if binding is not None:
+            expected = {"selection_identity": binding["identity"],
+                        "reference_frame_name": flow.manifest["reference_frame_name"],
+                        "reference_frame_index": flow.manifest["reference_frame_index"]}
+            if (view.get("motion_reference") != expected
+                    or binding["contract"]["static_scene_identity"] != scene_manifest["static_scene_identity"]
+                    or any(binding["contract"][k] != view[k] for k in ("label", "camera_identity", "shape_hw"))):
+                raise ValueError("SEA-RAFT motion reference differs from the fixed spatial modes")
+        elif view.get("motion_reference") is not None:
+            raise ValueError("Fixed spatial modes require their selected SEA-RAFT motion reference")
         if (view["flow_identity"] != flow.reference_identity
                 or view["camera_identity"] != camera.to_manifest_record()["camera_identity"]
                 or view["shape_hw"] != [camera.height, camera.width]

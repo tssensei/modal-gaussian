@@ -12,4 +12,12 @@ data/
 checkpoints/
 /tests/*
 !/tests/test_modal_projection.py
+!/tests/test_modal_loss_normalization.py
+!/tests/test_selected_modal_panel.py
+!/tests/test_mode_bank_graph_display.py
+!/tests/test_coefficient_rgb_spectrum.py
+!/tests/test_vis_refactor.py
+!/tests/test_viewer_inputs.py
+!/tests/test_graph_viewer.py
+!/tests/test_reference_selection.py
 /tmp/

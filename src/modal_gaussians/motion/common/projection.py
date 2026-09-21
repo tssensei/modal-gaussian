@@ -54,6 +54,39 @@ class RenderedDesignConfig:
         }
 
 
+@torch.no_grad()
+def prepare_modal_projection(scene, camera, mask, config):
+    """Prepare one view using the shared sampling and projection convention."""
+    means = scene.foreground.active()["means"]
+    dummy = means.new_zeros((len(means), 1))
+    _, alpha = render_motion_features(scene, camera, dummy)
+    pixels, sampled_alpha = candidate_observation_pixels(
+        scene, mask, alpha.detach().cpu().float().numpy(), config)
+    jacobian, visible = projection_jacobian(
+        means.detach().cpu().numpy().astype(np.float32),
+        camera.K.detach().cpu().numpy().astype(np.float64),
+        camera.world_to_camera.detach().cpu().numpy().astype(np.float64),
+        camera.radial_distortion)
+    if not np.any(visible):
+        raise ValueError(f"All foreground Gaussians lie behind view {camera.label!r}")
+    return pixels, sampled_alpha, jacobian, int(np.count_nonzero(visible))
+
+
+@torch.no_grad()
+def project_modal_features(scene, camera, phi, pixels, sampled_alpha, jacobian):
+    """Return [pixels, UV, real/-imag pairs] before saved view alignment."""
+    device = camera.K.device
+    jacobian = torch.as_tensor(jacobian, device=device, dtype=torch.float32)
+    real = torch.as_tensor(np.ascontiguousarray(np.real(phi)), device=device, dtype=torch.float32)
+    imag = torch.as_tensor(np.ascontiguousarray(np.imag(phi)), device=device, dtype=torch.float32)
+    real = torch.einsum("gij,kgj->kgi", jacobian, real)
+    imag = torch.einsum("gij,kgj->kgi", jacobian, imag)
+    features = torch.stack((real[..., 0], real[..., 1], -imag[..., 0], -imag[..., 1]),
+                           dim=-1).permute(1, 0, 2).reshape(phi.shape[1], -1).contiguous()
+    sampled = sample_feature_render(scene, camera, features, pixels, sampled_alpha)
+    return sampled.reshape(len(pixels), len(phi), 2, 2).transpose(0, 3, 1, 2).reshape(len(pixels), 2, 2 * len(phi))
+
+
 def projection_jacobian(
     points: np.ndarray, K: np.ndarray, world_to_camera: np.ndarray, radial_k: float = 0.0
 ) -> tuple[np.ndarray, np.ndarray]:

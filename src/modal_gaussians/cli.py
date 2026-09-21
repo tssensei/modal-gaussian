@@ -109,13 +109,24 @@ def build_parser() -> argparse.ArgumentParser:
     spectrum_select.add_argument("--topology", type=Path, help="Existing sampling topology; required for greedy")
     spectrum_select.add_argument("--output", required=True, type=Path)
     flow_commands = flow_parser.add_subparsers(dest="flow_command", required=True)
+    flow_select = flow_commands.add_parser("select-reference", help="Choose a motion reference after static geometry; save overlays")
+    flow_select.add_argument("--scene", required=True, type=Path)
+    flow_select.add_argument("--view-label", required=True)
+    flow_select.add_argument("--reuse-stabilization", required=True, type=Path)
+    flow_select.add_argument("--target-mask", choices=("alpha", "green"), default="alpha",
+                             help="Selection silhouette only; green reproduces the reviewed Corn recipe")
+    flow_select.add_argument("--workers", type=_positive_int, default=6)
+    flow_select.add_argument("--output", required=True, type=Path)
     flow_compute = flow_commands.add_parser("compute", help="Compute full-frame SEA-RAFT flow using local M weights")
     flow_compute.add_argument("--images", required=True, type=Path)
     flow_compute.add_argument("--reuse-stabilization", required=True, type=Path,
                               help="Existing preparation manifest: reuse timing, reference and stabilized RGBs only")
     flow_compute.add_argument("--output", required=True, type=Path)
-    flow_compute.add_argument("--sea-raft-repo", type=Path, default=Path("outputs/third_party/SEA-RAFT"))
-    flow_compute.add_argument("--model-dir", type=Path, default=Path("outputs/models/sea-raft-M"))
+    flow_compute.add_argument("--reference-selection", type=Path,
+                              help="Reviewed select-reference output; omitted preserves the historical reference")
+    from modal_gaussians.scene_store import library_root
+    flow_compute.add_argument("--sea-raft-repo", type=Path, default=library_root() / "_shared/tools/third_party/SEA-RAFT")
+    flow_compute.add_argument("--model-dir", type=Path, default=library_root() / "_shared/tools/models/sea-raft-M")
     colmap_parser = command_parsers.add_parser(
         "colmap", help="Joint COLMAP preparation for static Gaussian training"
     )
@@ -680,6 +691,8 @@ def build_parser() -> argparse.ArgumentParser:
         "viewer", help="Inspect modal results, geometry graphs, or select a 3D subject in Viser"
     )
     viewer_input = viewer.add_mutually_exclusive_group(required=True)
+    viewer_input.add_argument("--input", type=Path, help="Model, batch index, mode bank, preview or result")
+    viewer.add_argument("--coordinates", type=Path, help="Optional fitted coordinates for --input or --preview")
     viewer_input.add_argument("--result", type=Path)
     viewer_input.add_argument("--preview", type=Path)
     viewer_input.add_argument("--scene", type=Path, help="Inspect static geometry without modal results")
@@ -745,11 +758,19 @@ def _dispatch(
         for name, value in vars(args).items():
             if isinstance(value, Path):
                 setattr(args, name, resolve_path(value))
+        if args.command == "flow" and args.flow_command == "select-reference":
+            from modal_gaussians.flow.reference_selection import select_reference
+            output = select_reference(scene_dir=args.scene, label=args.view_label,
+                reuse_stabilization=args.reuse_stabilization, output_dir=args.output,
+                target_mask=args.target_mask, workers=args.workers, command=[parser.prog, *arguments])
+            print(f"Motion reference selection: {output}")
+            return 0
         if args.command == "flow" and args.flow_command == "compute":
             from modal_gaussians.flow.sea_raft import compute_flow
             output = compute_flow(images=args.images, reuse_stabilization=args.reuse_stabilization,
                                   output_dir=args.output, sea_raft_repo=args.sea_raft_repo,
-                                  model_dir=args.model_dir, command=[parser.prog, *arguments])
+                                  model_dir=args.model_dir, command=[parser.prog, *arguments],
+                                  reference_selection=args.reference_selection)
             print(f"SEA-RAFT flow: {output}")
             return 0
         if args.command == "legacy":
@@ -1478,6 +1499,8 @@ def _dispatch(
             print(f"comparison video: {video}")
             return 0
         if args.command == "viewer":
+            if args.coordinates is not None and args.scene is not None:
+                parser.error("--coordinates requires modal input")
             if args.selection is not None and not args.select_subject:
                 parser.error("--selection requires --select-subject")
             if args.select_subject:
@@ -1505,12 +1528,13 @@ def _dispatch(
             from modal_gaussians.vis.viewer import run_modal_viewer
 
             run_modal_viewer(
-                result_dir=args.preview or args.result,
+                result_dir=args.input or args.preview or args.result,
                 work_dir=args.work_dir,
                 host=str(args.host),
                 port=int(args.port),
                 viewer_resolution=int(args.viewer_res),
                 preview=args.preview is not None,
+                coordinates=args.coordinates,
             )
             return 0
         parser.error("unsupported command")

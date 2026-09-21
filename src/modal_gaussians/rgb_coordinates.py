@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from functools import lru_cache
 import hashlib
 import json
-import os
 from pathlib import Path
 from modal_gaussians.scene_store import resolve_path
 import tempfile
@@ -20,6 +19,7 @@ import torch
 from modal_gaussians import __version__
 from modal_gaussians.direct_coordinates import _canonical_json, _sha256_file, _validate_modes
 from modal_gaussians.progress import Progress
+from modal_gaussians.iteration_cache import publish_directory
 from modal_gaussians.rgb_fitting import RGBFitConfig, solve_rgb_coordinates_view
 from modal_gaussians.rgb_rendering import make_rgb_renderer, resize_rgb
 from modal_gaussians.static import cameras_from_scene_manifest
@@ -260,6 +260,6 @@ def build_rgb_modal_coordinates_artifact(
         (work / "manifest.json").write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n", encoding="utf-8")
         if destination.exists():
             raise FileExistsError(f"RGB-coordinate output appeared during fitting: {destination}")
-        os.rename(work, destination)
+        publish_directory(work, destination)
     # Do not rerender, replay fields, or run an evaluation/readback scan after fitting.
     return RGBModalCoordinatesArtifact(destination, manifest, coordinates)

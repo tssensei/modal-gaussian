@@ -6,6 +6,7 @@
     "message_layers": 3,
     "control_radius_fraction": 0.015,
     "max_controls": 32768,
+    "data_loss_normalization": "view_rms",
     "deformation_weight": 0.03,
     "rotation_weight": 0.0,
     "graph_neighbors": 16,

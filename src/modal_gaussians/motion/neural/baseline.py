@@ -12,6 +12,7 @@ NEURAL_OVERRIDES = {
     "graph_neighbors": 16,
     "graph_max_distance": 0.08,
     "graph_edge_filter": "none",
+    "data_loss_normalization": "view_rms",
     "deformation_weight": 0.03,
     "rotation_weight": 0.0,
 }

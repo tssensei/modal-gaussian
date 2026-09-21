@@ -1,8 +1,9 @@
 # Modal Gaussians
 
 Reconstruct frequency-specific 3D Gaussian motion from asynchronous fixed-view
-videos. The current input pipeline is **SEA-RAFT reference-to-frame flow → shared
-FFT cache → manual frequency selection → cached modal-image export**. Training
+videos. For new inputs, the pipeline is **static Gaussian → motion-reference
+selection and overlays → SEA-RAFT flow → shared FFT → manual frequency selection
+→ cached modal-image export**. Training
 uses complex U/V modal images, soft graph weights, and a neural component field.
 
 The accepted **Corn 0.225 Hz** and **Bush 0.744 Hz** results, exact source paths,
@@ -31,11 +32,57 @@ conda activate modal-gaussian
 The environment uses Python 3.11, PyTorch CUDA 12.8, gsplat 1.5.3 and Viser 1.1.0.
 SEA-RAFT inference additionally uses the locally installed upstream repository
 and downloaded Hugging Face weights. The existing locations are
-`outputs/third_party/SEA-RAFT` and `outputs/models/sea-raft-M`; inference does not
+`scene_library/_shared/tools/third_party/SEA-RAFT` and
+`scene_library/_shared/tools/models/sea-raft-M`; inference does not
 download a model. The first gsplat render may compile its CUDA extension.
 The standalone spectrum GUI does not load Gaussian weights or render with CUDA.
 
-## 1. Reuse or compute SEA-RAFT flow
+## 1. Select a motion reference, then reuse or compute SEA-RAFT flow
+
+For new flow datasets, finish static geometry first, then choose the video frame
+whose subject silhouette best matches each fixed-camera render. The original
+**geometry reference** remains immutable; the **motion reference** is independent.
+Existing completed flows/spectra keep their references and remain reusable.
+
+```bat
+modal-gaussians flow select-reference --scene scene_library\corn\geometry\static --view-label view1 --reuse-stabilization scene_library\corn\references\view1 --target-mask green --output scene_library\corn\experiments\reference_selection_trial\view1
+```
+
+Repeat for each view. This scans existing per-frame masks, ranks symmetric mean
+boundary distance in native pixels (IoU breaks ties), and saves `scores.csv`,
+`selected_reference.png`, `comparison_subject.png`, `comparison_full.png` and
+`contours.png`. Old/new references use identical 50/50 Gaussian overlays without
+warping. Contours: green = Gaussian, magenta = video mask, white = overlap.
+Review the candidate before passing it to flow computation. Selection alone
+does not start flow, FFT, training or Viser.
+
+`--target-mask green` reproduces the reviewed Corn recipe: visible subject alpha
+at least 0.05, green-minus-red/blue at least 3, excess green at least 12, 3×3 closing
+and components of at least 50 pixels. This excludes soil in the manual Gaussian
+selection. The default `alpha` uses visible foreground coverage without a color
+assumption and is suitable for flowers/non-green subjects. Masks affect **ranking
+only**, never flow/FFT clipping or training supervision. A lower average boundary
+distance does not guarantee that every leaf improves.
+
+Corn's reviewed selections on 2026-09-20 are **view1 `00103` (5.10 s)** and
+**view2 `00078` (3.85 s)**, registered as `motion_reference1`/`motion_reference2`:
+
+```bat
+modal-gaussians storage path --scene corn --asset motion_reference1
+modal-gaussians storage run --scene corn -- flow compute --images data\prepared\images\corn1 --reuse-stabilization @reference1 --reference-selection @motion_reference1 --output @experiments/new_reference_flow/view1
+```
+
+The contract binds original sequence metadata, FPS, frame order, camera, geometry,
+pixel shape and chosen frame. Geometry changes require selecting again. Stabilized
+sequences use their existing RGB/masks and coordinate grid, without re-anchoring
+stabilization. Preserve the sequence time origin; different views may select
+different times and still require frequency-specific alpha alignment.
+
+A new reference requires new flow/FFT/modal exports, preparation, alpha and soft
+graphs in new experiment directories. `prepare-selected-modal` reuses compatible
+frozen geometry and carries the new reference through training and spectrum
+preview; unbound reference changes are rejected. KNN/control geometry remains
+reusable under matching contracts. Existing baselines/results are unchanged.
 
 Reuse completed SEA-RAFT flow whenever the frames, reference and inference
 settings are unchanged. Corn already has complete flows at
@@ -47,7 +94,8 @@ For a new flow computation with an existing reference/timing artifact:
 modal-gaussians flow compute --images data\prepared\images\corn1 --reuse-stabilization outputs\corn_local_001\flow\view1 --output outputs\corn1_sea_raft_flow_trial_001
 ```
 
-`--reuse-stabilization` supplies frame order, sample rate, reference frame and
+Omitting `--reference-selection` preserves the historical reference for compatibility.
+`--reuse-stabilization` supplies frame order, sample rate and
 already stabilized images when present. It does not read the old Farneback flow
 or spectrum. `--sea-raft-repo` and `--model-dir` override the local locations above.
 The output is full-image reference-to-frame flow without fine-mask clipping,
@@ -152,10 +200,36 @@ adding controls. Gaussian rigidity is 0.03 and control-rotation loss is 0.
 Local rotations and Viewer ellipsoid rotation remain active. See
 [BASELINE.md](BASELINE.md) for the remaining parameters and accepted graphs.
 
-Use `--stage preview` only when a manual-oscillator preview is requested, then
-launch it separately with `modal-gaussians viewer --preview ... --work-dir ...`.
+Open one model or an entire completed batch directly with
+`modal-gaussians viewer --input MODEL_OR_RESULTS_INDEX --work-dir VIEWER_DIR`.
+The same input accepts existing previews, results and mode banks; `--preview`
+and `--result` remain compatible aliases. No combined mode bank or preview needs
+to be published for multi-frequency viewing. Add `--coordinates COORDINATES_DIR`
+to attach fitted playback; a result already binds its coordinates and cannot
+be overridden. Unfitted views retain manual oscillation.
+Modes are sorted once at loading. The selected frequency drives Spectrum,
+phase colors, observation counts, support roles, controls and the KNN graph.
+
+The floating modal panel reuses each model's saved projection and alpha. Missing
+view/mode projections are generated on demand after startup and cached under
+the scene's `cache/viewer_projection/` (or `work-dir/cache/viewer_projection/`
+outside the library). `Complete projections for this view` fills the remaining
+frequency points; `all saved modes` brightness requests the same completion.
+Missing points remain gaps, and shared brightness is applied once all are ready.
+Older selected-only inputs show their exact saved frequencies and U/V images;
+they do not load or compute a full FFT. `--stage preview` remains available to
+prepare projections explicitly before opening a viewer.
 Ordinary mode generation does not fit per-frame coefficients, train a video
 reconstruction, start Viser or run experiment validation.
+
+For an explicitly requested RGB registration preview, run
+`python scripts/preview_reference_registration.py --scene corn --output NEW_EXPERIMENT_DIR`.
+It uses local SEA-RAFT weights once per reference view, from the static full-scene
+render to the saved video reference, and saves float32 flow plus four-panel PNGs.
+The overlay samples `reference(p + flow(p))`; magenta checks mark out-of-bounds
+samples, not occlusions. All views share a color scale (override with
+`--display-max-px`). This stops for user review without updating modal supervision
+or training. `--self-test` checks the warp and display logic on synthetic inputs.
 
 Prepared component-field training shares control layout, adjacency, owners and
 material support distances across frequencies. Control edge weights and soft
@@ -194,6 +268,20 @@ pauses new launches while active work finishes. See
 See [GPU alpha and geometry caching](docs/gpu-alpha.md) for the solver contract,
 timings and explicit `--alpha-backend cpu` compatibility option. Neither GPU backend
 silently falls back to CPU. Existing results retain their original alpha metadata.
+
+The user retained **new motion references + per-view RMS normalization +
+deformation weight 0.03** after the 2026-09-20 comparisons; control-rotation
+weight remains 0. See [BASELINE.md](BASELINE.md#current-experiment-policy-2026-09-20)
+for the completed inputs and comparison results.
+
+Modal loss defaults to per-view target RMS normalization (`"data_loss_normalization":
+"view_rms"` in `neural`; omitted historical settings retain this behavior). Set
+`"data_loss_normalization": "none"` in a copied config for an absolute-error
+ablation. This removes only the RMS division; fixed complex alpha, confidence
+normalization, equal-view averaging, Huber delta and structural penalties remain
+unchanged. The setting participates in model/checkpoint identities; changing it
+requires a new experiment from initialization. Loss values between these settings
+are on different scales and cannot be compared directly as quality scores.
 
 Fixed-geometry modal training can optionally cache gsplat projection and sorted
 tile intersections. In a **copy of your existing training config**, add

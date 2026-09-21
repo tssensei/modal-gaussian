@@ -1,5 +1,36 @@
 # Current neural motion baseline
 
+## Current experiment policy (2026-09-20)
+
+After the Bush/Corn comparisons, the user chose **per-view RMS normalization
+(`data_loss_normalization=view_rms`) + deformation weight 0.03**, with
+control-rotation weight 0. New experiments should use the new motion references
+selected against the Gaussian renders. The no-RMS and deformation-weight-0.3
+runs remain comparison experiments, not the default recipe. The user preferred
+the motion consistency of RMS; lower 2D reconstruction error alone does not
+establish better 3D motion.
+
+Reuse the completed new-reference inputs below; do not repeat flow, FFT, alpha
+or graph construction when their contracts match:
+
+| Scene | Motion reference frames (view order) | New-reference inputs under `scene_library/<scene>/experiments/` |
+| --- | --- | --- |
+| Corn | `00103`, `00078` | `reference_modes_0225_20260920/`: flow, spectrum (20 fps, Nfft 1600), modal images at bin 18, prepared and graph |
+| Bush | `00918`, `00640`, `00311` | `reference_flow_0744_20260920/`: selections, flow, spectrum (30 fps, Nfft 1250), modal images at bin 31; `reference_modes_0744_20260920/`: prepared and graph |
+
+Corn's completed **new-reference + RMS + 0.03** preview is
+`scene_library/corn/experiments/reference_modes_rms_0225_20260920/experiment/preview`.
+Bush now has 20 completed **new-reference + RMS + 0.03** modes over
+0.240–4.992 Hz, including 0.744 Hz. Their batch is
+`scene_library/bush/experiments/uniform20_0to5_newref_20260920/batch`;
+`results_index.json` beside it records exact frequencies and model paths.
+The earlier no-RMS runs remain comparison experiments.
+The user authorized deletion of old-reference motion outputs on 2026-09-20.
+Historical accepted models, the old Bush 40-frequency batch and coefficient fit
+have been deleted. New-reference comparison models and checkpoints remain.
+Registry inputs point to the new references. The replacement 20-frequency Bush
+batch is complete; this records execution, not scientific or visual acceptance.
+
 GPU propagation promotion (2026-09-19): the user accepted CuPy float64 soft
 propagation as the new mainline. New prepared/iteration/batch runs default to
 `cupy`; a single persistent GPU weight worker finishes all requested weights
@@ -9,12 +40,13 @@ unchanged. The CPU adaptive-Dijkstra implementation lives in
 explicit `--propagation-backend cpu` for historical work/comparison. There is no
 automatic CPU fallback. See [GPU usage](docs/gpu-soft-propagation.md).
 
-Storage update (2026-09-19): the accepted results below now have physical entries
+Historical storage record (2026-09-19; these old-reference results were deleted
+on 2026-09-20): the accepted results below originally had physical entries
 in `scene_library/corn/experiments/baseline_0225` and
 `scene_library/bush/experiments/baseline_0744`. Their models, prepared inputs,
 graphs and dependencies have also moved into the corresponding scene library.
-Historical paths in this document remain identity-preserving aliases through
-`registry.json`. Use `modal-gaussians storage list --scene corn|bush` and
+Historical result paths below are no longer runnable. Retained geometry paths
+still resolve through `registry.json`. Use `modal-gaussians storage list --scene corn|bush` and
 [SCENE_STORAGE.md](SCENE_STORAGE.md) before creating new experiments.
 
 On **2026-09-18**, the user accepted the **Corn 0.225 Hz** result below as the

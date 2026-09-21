@@ -87,6 +87,24 @@ def atomic_json(path: Path, value: Any) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def publish_directory(temporary, destination):
+    # Windows scanners can briefly hold a just-written directory. Retry the
+    # atomic rename only, preserving the expensive computed arrays in place.
+    delays = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
+    for attempt in range(len(delays) + 1):
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(destination)
+        try:
+            os.rename(temporary, destination)
+            return
+        except OSError as error:
+            if (os.name != "nt" or getattr(error, "winerror", None) not in {5, 32, 33}
+                    or attempt == len(delays)):
+                raise
+            time.sleep(delays[attempt])
+
+
+
 @lru_cache(maxsize=256)
 def _source_digest(path: str, stamp: tuple[int, ...]) -> str:
     # Cache code hashes only, never user data or artifact validation.
@@ -188,7 +206,7 @@ def put_entry(root: Path, contract: dict[str, Any], arrays: dict[str, np.ndarray
                                                "sha256": sha256(temporary / "arrays.npz")})
     try:
         # Atomic publication; reuse in-memory arrays without a read-back pass.
-        os.rename(temporary, destination)
+        publish_directory(temporary, destination)
     except OSError:
         if not destination.exists():
             raise

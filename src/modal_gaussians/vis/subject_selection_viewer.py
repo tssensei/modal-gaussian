@@ -1,8 +1,6 @@
 """Select a static scene's motion subject with an oriented 3D box."""
 from __future__ import annotations
 
-import math
-from pathlib import Path
 from modal_gaussians.scene_store import resolve_path
 
 import numpy as np
@@ -35,12 +33,7 @@ class SubjectSelectionData:
                     if selection_path is not None else self.initial_box)
         cameras = cameras_from_scene_manifest(self.scene.manifest)
         references = [camera for camera in cameras if camera.role == "reference"] or list(cameras[:1])
-        self.cameras = tuple(ViewerCamera(
-            label=camera.name, camera=camera,
-            c2w=np.linalg.inv(camera.world_to_camera.detach().cpu().numpy()).astype(np.float64),
-            fov=2 * math.atan(0.5 * camera.height / float(camera.K[1, 1])),
-            aspect=camera.width / camera.height,
-        ) for camera in references)
+        self.cameras = tuple(ViewerCamera.from_camera(camera) for camera in references)
 
     @torch.inference_mode()
     def render_selection(self, camera, selected, *, highlight=True, only_selected=False):

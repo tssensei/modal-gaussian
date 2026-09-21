@@ -253,11 +253,20 @@ def load_prepared(path: str | Path, *, validate: bool = False) -> PreparedNeural
     return result
 
 
+def _read_reference_rgb(flow: FlowAnalysisArtifact) -> np.ndarray:
+    """Read the geometry reference without importing Viewer code."""
+    from modal_gaussians.preparation import read_rgb
+    images = resolve_path(flow.manifest["inputs"]["sequence"]["image_directory"], strict=True)
+    rgb = read_rgb(images / f"{flow.manifest['reference_frame_name']}.png")
+    if rgb.shape[:2] != flow.arrays.mask_union.shape:
+        raise ValueError("Flow reference image shape differs from flow arrays")
+    return rgb
+
+
 def prepare_neural(*, output_dir, cache_dir=DEFAULT_CACHE, from_result=None,
                    scene_dir=None, topology_dir=None, measurements_dir=None, graph_dir=None,
                    alignment_from=None, config=None, config_overrides=None, timer=None):
     from modal_gaussians.result import load_modal_result
-    from modal_gaussians.vis.spectrum import _read_reference_rgb
     from .baseline import new_training_config
     from .component_field import ComponentFieldConfig
     from modal_gaussians.motion.common.projection import RenderedDesignConfig

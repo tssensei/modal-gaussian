@@ -3,7 +3,9 @@
 Follow [SCENE_STORAGE.md](SCENE_STORAGE.md). Preparation selects records by
 exact status from the registered scene's result index, checks the expected count,
 and sorts by frequency. For Bush, `completed_uniform60` selects the 40 completed
-modes and excludes the accepted 0.744 Hz baseline. It never resumes mode training.
+modes and excludes the accepted 0.744 Hz baseline. This is a historical example:
+the old 40-mode outputs were deleted on 2026-09-20. New batches must supply their
+own result index/status and expected count. Preparation never resumes mode training.
 
 ## Storage contract
 
@@ -75,6 +77,11 @@ the latter still stores a full flow sequence. Historical reference metadata
 binds geometry and masks; deleted Farneback flow/spectrum arrays are never
 opened. SEA motion data receives its own identity, separate from the historical
 geometry-reference identity. Stabilized image timing and location must match SEA.
+
+New motion references are supported through their saved reference-selection
+contract. The static camera and stabilization reference stay unchanged; the SEA
+reference must match the motion reference of every selected spatial mode. Mixing
+old-reference modes with new-reference flow is rejected.
 
 Defaults: pixel stride 2, alpha minimum 0.05, mask erosion 1, 8 modes per render
 batch, ridge 1e-4 and 64 frames per flow chunk. See `coordinates prepare --help`.
@@ -157,11 +164,17 @@ Select `Model support` for directly comparable input/projection image coverage,
 or `Cached region` to see the input over the larger saved region. Dim pixels
 outside projection support show the reference RGB, not zero-motion predictions.
 
-The old flow/measurement-based Spectrum loader and display-only alpha fitting
-have been removed. Legacy single-artifact viewers retain their 3D controls;
-the new floating panel uses v17 mode banks. Per-frequency graph/control overlays
-are still not merged into a single bank graph. No new disk cache or changed
-scientific artifact is created by this panel.
+The Viewer also accepts a model or a batch `results_index.json` directly through
+`viewer --input`, with optional `--coordinates`. The fitting pipeline still uses
+its mode bank; viewing does not require one. Coefficient columns bind original
+model identities and slots, not just frequency values. Only fitted views offer
+stored playback; all views support manual oscillation.
+
+Spectrum reads existing projection slices without combining their matrices.
+Missing view/mode projections are computed on demand and published to the scene's
+`cache/viewer_projection/`. Original models and manifests remain immutable.
+KNN edges, control layouts and alpha always follow the selected source mode.
+The panel never refits alpha, computes a new FFT or fits coefficients.
 
 ## Export one fitted view offline
 

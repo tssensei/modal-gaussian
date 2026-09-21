@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import json
-import math
-from pathlib import Path
 from modal_gaussians.scene_store import resolve_path
 
 import numpy as np
@@ -128,12 +126,7 @@ class GraphViewerData:
         selected = [camera for camera in cameras if camera.role == "reference"] or list(cameras[:1])
         if not selected:
             raise ValueError("Static graph viewer requires a calibrated scene camera")
-        self.cameras = tuple(ViewerCamera(
-            label=camera.name, camera=camera,
-            c2w=np.linalg.inv(camera.world_to_camera.detach().cpu().numpy()).astype(np.float64),
-            fov=2 * math.atan(0.5 * camera.height / float(camera.K[1, 1])),
-            aspect=camera.width / camera.height,
-        ) for camera in selected)
+        self.cameras = tuple(ViewerCamera.from_camera(camera) for camera in selected)
 
 
 class GraphViserViewer(ModalViserViewer):
@@ -199,6 +192,9 @@ class GraphViserViewer(ModalViserViewer):
         self._build_camera_controls()
 
     def _update_component_graph(self, means):
+        if not self.show_component_graph.value:
+            self._remove_component_graph()
+            return
         if self.data.is_soft_graph:
             selected = _candidate_edge_subset(self.data.graph_edge_factor < 1,
                 self.component_graph_edge_count.value, self.show_retained_edges.value, self.show_removed_edges.value)
@@ -209,29 +205,12 @@ class GraphViserViewer(ModalViserViewer):
         else:
             selected = _candidate_edge_subset(self.data.graph_edge_removed,
                 self.component_graph_edge_count.value, self.show_retained_edges.value, self.show_removed_edges.value)
-        if not self.show_component_graph.value or not len(selected):
-            self._remove_component_graph()
-            return
-        edges = self.data.graph_edge_gaussian_index[selected]
-        points = means[torch.as_tensor(edges, device=means.device)].detach().cpu().numpy()
-        if self._component_graph_handle is None or not np.array_equal(selected, self._component_graph_edge_indices):
-            self._remove_component_graph()
-            self._component_graph_handle = self.server.scene.add_line_segments(
-                "/debug/component_graph", points=points,
-                colors=np.repeat(self.data.graph_edge_colors[selected, None, :], 2, axis=1),
-                thickness=float(self.component_graph_line_width.value), thickness_units="screen")
-            self._component_graph_edge_indices = selected
-        else:
-            self._component_graph_handle.points = points
-            self._component_graph_handle.thickness = float(self.component_graph_line_width.value)
+        self._display_graph_edges(means, selected, self.data.graph_edge_colors)
 
     @torch.inference_mode()
     def _render(self, client):
         means = self.data.scene.foreground.active()["means"]
-        if self.show_component_graph.value:
-            self._update_component_graph(means)
-        else:
-            self._remove_component_graph()
+        self._update_component_graph(means)
         if self.show_points.value and self._point_cloud is None:
             self._point_cloud = self.server.scene.add_point_cloud(
                 "/debug/geometry_points", points=self.data.graph.points,
