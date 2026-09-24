@@ -90,6 +90,11 @@ def validate_sequences(views, images, scene_manifest, *, frame_count=None):
         raise ValueError('Sequence image coverage/order differs')
     offset = 0
     for i, (v, source) in enumerate(zip(views, images)):
+        if v.get('kind') == 'fixed':
+            from .rgb import load_valid_mask
+            if source.get('validity') is None:
+                raise ValueError('Fixed RGB sequence requires an explicit valid-pixel binding')
+            load_valid_mask(source, v['shape_hw'])
         validate_time_grid(v)
         count, fps = v['frame_count'], v['fps_hz']
         if (type(count) is not int or count < 1 or v['index'] != i or v['frame_offset'] != offset

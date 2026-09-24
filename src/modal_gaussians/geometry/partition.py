@@ -290,8 +290,8 @@ def _publish_partition(scene, output_dir, labels, arrays, partition_fields, sour
                 or projection not in ("pinhole_K_only", PROJECTION_CONVENTION)):
             raise ValueError("Manual selection must preserve the source camera projection")
         partition_fields = {**partition_fields, "camera_projection": projection}
-    elif scene.manifest["version"] not in (2, 3) or not all(c.distortion_applied for c in cameras):
-        raise ValueError("Partition requires a distortion-aware v2 or v3 static scene")
+    elif scene.manifest["version"] not in (5, 6) or not all(c.distortion_applied for c in cameras):
+        raise ValueError("Partition requires a distortion-aware v5 or v6 static scene")
     order = np.concatenate((subject, stationary)).astype(np.int64)
     arrays = {**arrays, "new_to_source_index": order}
     source_tensors = scene.tensor_dictionary()
@@ -322,7 +322,7 @@ def _publish_partition(scene, output_dir, labels, arrays, partition_fields, sour
         partition_identity = _sha256_json(partition)
         torch.save(tensors, temporary / "tensors.pt")
         manifest = deepcopy(scene.manifest)
-        manifest.update(version=3, partition=partition, partition_identity=partition_identity,
+        manifest.update(version=6, partition=partition, partition_identity=partition_identity,
                         partition_source_path=source_path,
                         foreground_identity=tensor_dictionary_identity(tensors, "foreground."),
                         background_identity=tensor_dictionary_identity(tensors, "background."),
@@ -340,7 +340,7 @@ def _publish_partition(scene, output_dir, labels, arrays, partition_fields, sour
             "dataset_identity": manifest["dataset"]["dataset_identity"],
             "foreground_identity": manifest["foreground_identity"],
             "background_identity": manifest["background_identity"], "normalization": manifest["scene_normalization"],
-            "representation": "vanilla_3dgs_direct_rgb", "camera_identities": partition["camera_identities"],
+            "representation": "vanilla_3dgs_sh3", "sh_degree": manifest["representation"]["sh_degree"], "camera_identities": partition["camera_identities"],
             "projection_convention": projection if manual else PROJECTION_CONVENTION,
             "partition_identity": partition_identity,
         }
@@ -456,15 +456,16 @@ def _validate_partition_source(manifest, partition):
         "dataset_identity": partition["source_dataset_identity"],
         "foreground_identity": partition["source_foreground_identity"],
         "background_identity": partition["source_background_identity"],
-        "normalization": manifest["scene_normalization"], "representation": "vanilla_3dgs_direct_rgb",
+        "normalization": manifest["scene_normalization"], "representation": "vanilla_3dgs_sh3",
+        "sh_degree": manifest["representation"]["sh_degree"],
     }
     source_version = partition.get("source_static_version")
-    if source_version in (2, 3):
+    if source_version in (5, 6):
         source_identity_payload.update(camera_identities=partition["camera_identities"],
             projection_convention=partition.get("camera_projection", PROJECTION_CONVENTION))
-    if source_version == 3:
+    if source_version == 6:
         source_identity_payload["partition_identity"] = partition["source_partition_identity"]
-    elif source_version != 2 or partition.get("source_partition_identity") is not None:
+    elif source_version != 5 or partition.get("source_partition_identity") is not None:
         raise ValueError("Unsupported partition source version")
     if _sha256_json(source_identity_payload) != partition["source_static_scene_identity"]:
         raise ValueError("Partition source scene identity mismatch")

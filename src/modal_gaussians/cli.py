@@ -80,7 +80,10 @@ def build_parser() -> argparse.ArgumentParser:
         reference.add_argument('--' + name, type=Path, required=True)
     reference.add_argument('--fps', type=_positive_float, required=True)
     reference.add_argument('--reference-frame', required=True)
-    reference.add_argument('--stabilize', action='store_true')
+    reference.add_argument('--tripod', action='store_true', help='Explicitly declare a stationary tripod recording; skip stabilization')
+    reference.add_argument('--scene', type=Path, help='Static scene with registered raw reference and COLMAP background map (required unless --tripod)')
+    reference.add_argument('--view', help='Registered reference camera label (required unless --tripod)')
+    reference.add_argument('--config', type=Path, help='StabilizationSettings JSON overrides')
     flow_parser = command_parsers.add_parser(
         "flow", help="SEA-RAFT reference-to-frame flow (FFT is a separate cache step)"
     )
@@ -162,17 +165,17 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--input", required=True, type=Path)
     train.add_argument("--work-dir", required=True, type=Path)
     train.add_argument("--output", required=True, type=Path)
-    train.add_argument("--epochs", type=_positive_int, default=100)
-    train.add_argument("--batch-size", type=_positive_int, default=8)
+    train.add_argument("--iterations", type=_positive_int, default=3_000)
+    train.add_argument("--batch-size", type=_positive_int, default=4)
     train.add_argument("--num-fg", type=_positive_int, default=40_000)
     train.add_argument("--num-bg", type=_positive_int, default=80_000)
     train.add_argument("--seed", type=_non_negative_int, default=42)
     train.add_argument("--mask-weight", type=_non_negative_float, default=1.0)
     train.add_argument(
-        "--fg-densify-stop-step", type=_positive_int, default=4_000
+        "--fg-densify-stop-step", type=_positive_int, default=9_000
     )
     train.add_argument(
-        "--bg-densify-stop-step", type=_positive_int, default=1_000
+        "--bg-densify-stop-step", type=_positive_int, default=9_000
     )
     train.add_argument("--max-bg-gaussians", type=_positive_int, default=160_000)
     train.add_argument(
@@ -472,8 +475,12 @@ def _dispatch(
             return 0
         if args.command == 'prepare' and args.prepare_command == 'reference':
             from modal_gaussians.preprocessing.reference import prepare_reference
+            from modal_gaussians.preprocessing.stabilization import StabilizationSettings
             artifact = prepare_reference(images=args.images, masks=args.masks, fps=args.fps,
-                reference_frame=args.reference_frame, output_dir=args.output, stabilize=args.stabilize)
+                reference_frame=args.reference_frame, output_dir=args.output, tripod=args.tripod,
+                scene_dir=args.scene, label=args.view,
+                settings=(StabilizationSettings(
+                    **json.loads(args.config.read_text(encoding='utf-8'))) if args.config else None))
             print(artifact.path)
             return 0
         if args.command == "prepare" and args.prepare_command == "gui":
@@ -512,7 +519,7 @@ def _dispatch(
                 work_dir=args.work_dir,
                 output_dir=args.output,
                 config=StaticTrainConfig(
-                    epochs=int(args.epochs),
+                    iterations=int(args.iterations),
                     batch_size=int(args.batch_size),
                     num_foreground=int(args.num_fg),
                     num_background=int(args.num_bg),

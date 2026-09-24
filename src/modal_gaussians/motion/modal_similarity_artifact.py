@@ -12,7 +12,7 @@ import tempfile
 import numpy as np
 from PIL import Image
 
-from modal_gaussians.common.cache import Timings, atomic_json, identity, load_entry
+from modal_gaussians.common.cache import Timings, atomic_json, identity, load_entry, sha256
 from modal_gaussians.spectrum.modes import TRANSFORM_CONVENTION
 from modal_gaussians.common.numpy_io import save_named_arrays
 from modal_gaussians.geometry.scene import cameras_from_scene_manifest
@@ -30,7 +30,7 @@ def _modal_view(path, flow, view, frequency, *, read_mask=True, static_scene_ide
     manifest = _manifest(root)
     frozen = flow["manifest"]
     if (manifest.get("format") != "modal_gaussians.spectrum_selected_frequency"
-            or manifest.get("version") != 1 or manifest.get("status") != "complete"
+            or manifest.get("version") != 2 or manifest.get("status") != "complete"
             or manifest.get("transform") != TRANSFORM_CONVENTION
             or manifest.get("flow_direction") != "reference_to_frame"
             or manifest.get("flow_units") != "input_pixels"
@@ -84,7 +84,11 @@ def _modal_view(path, flow, view, frequency, *, read_mask=True, static_scene_ide
             raise ValueError(f"Reference mask shape differs: {mask_path}")
     else:
         mask = np.ones(view["shape_hw"], dtype=bool)
-    return field[0], mask, {"label": view["label"], "path": str(root),
+    valid = np.load(root/'valid_mask.npy', allow_pickle=False)
+    if (valid.dtype != bool or valid.shape != mask.shape or not valid.any()
+            or sha256(root/'valid_mask.npy') != manifest['valid_mask_sha256']):
+        raise ValueError('Modal image validity differs')
+    return field[0], mask & valid, {"label": view["label"], "path": str(root),
         "manifest_identity": identity(manifest), "manifest": manifest,
         "reference_mask": str(mask_path) if read_mask else None, "prepared_flow_identity": flow["identity"]}
 
@@ -104,7 +108,7 @@ def build_modal_similarity_graph_artifact(*, prepared_dir, geometry_graph_dir, v
     timer = Timings()
     with timer.stage("modal_similarity_inputs"):
         prepared = _manifest(prepared_path)
-        if prepared.get("format") != "modal_gaussians.neural_prepared" or prepared.get("version") != 2:
+        if prepared.get("format") != "modal_gaussians.neural_prepared" or prepared.get("version") != 3:
             raise ValueError("Unsupported neural preparation")
         source = prepared["source"]
         graph_manifest = _manifest(graph_path)

@@ -3,6 +3,105 @@
 Configuration: [`configs/neural_component_field.json`](configs/neural_component_field.json).
 Pipeline/entry points: [README](README.md). Cleanup compatibility: [REBUILD](REBUILD.md).
 
+## Static coarse geometry — SH recipe, 2026-09-24
+
+The first static pass supplies coarse geometry for stabilization and mode learning.
+`static train` now budgets **3,000 Adam updates**, batch size 4, through
+`--iterations` (replaces `--epochs`). This follows the author's generic coarse
+budget, not the much longer supplied experiment launch. No real 540p run has yet
+validated this recipe or its speed/quality. Batch 4 is the user's iteration-speed
+choice, differing from the author's batch 1. The update budget and all step-based
+schedules stay unchanged; full batches give 12,000 image exposures (resolution
+groups may end with smaller batches).
+
+| Setting | Current default |
+| --- | --- |
+| Appearance | World-frame SH, degree 0 initially, +1 every 1,000 updates, maximum 3 |
+| Initialization | COLMAP RGB converted to SH DC; higher coefficients zero; opacity 0.1 |
+| Initial scale / rotation | RMS distance to up to three nearest neighbors within each retained partition (squared floor `1e-7`); identity quaternion |
+| Position LR | `1.6e-4 * camera_extent`, exponential to `1.6e-6 * camera_extent` over 20,000 updates |
+| SH DC / higher-order LR | 0.0025 / 0.000125 |
+| Opacity / scale / rotation LR | 0.05 / 0.005 / 0.001, constant |
+| Adam epsilon | `1e-15` |
+| RGB objective | Full-frame `L1 + 0.2 * (1 - SSIM)` |
+| Mask objective | Existing trimmed foreground-membership L1, weight 1 |
+| Depth objective | Disabled; no predicted depth supervision yet |
+| Density | After step 500, every 100 updates, before step 9,000 or training end |
+| Densify gradient / split scale | `2e-4` / `0.01 * camera_extent` |
+| Cull opacity | Below 0.005 |
+| Large-point cull | After step 6,000 only: scale above `0.1 * camera_extent` or radius above 20 pixels |
+| Opacity reset | Cap at 0.01 at step 500 (white background), then every 6,000 while density is active |
+
+Camera extent is 1.1 times the maximum distance of normalized camera centers from
+their mean. The 3,000-update run stops before the position LR reaches its final
+value, and degree 3 is activated only on its last update. Longer budgets train
+the highest SH band further; use `--iterations 30000` when explicitly requested.
+Training uses all registered sweep/reference cameras at their input resolution.
+
+Retained project-specific choices: foreground/background partitions, initial
+40k/80k point caps, 160k background cap, mask supervision and shuffled camera
+passes. We do not introduce the author's learned Gaussian retain-mask or depth
+pretraining. His supplied launch uses an 80k coarse loop but its optimizer gate
+stops at the global 30k budget; our budget counts actual updates and does not copy
+that gate. Numerical alignment is therefore not an exact reproduction.
+
+All photometric renderers evaluate SH from the current (possibly deformed)
+Gaussian position and camera center. The basis stays in world coordinates;
+Gaussian covariance rotation does not rotate SH. Fixed-mode coefficient fitting
+freezes SH; joint refinement optimizes DC at `color_lr`, higher bands at
+`color_lr / 20`. Coefficient/refinement RGB loss keeps its existing 0.8/0.2 weights.
+
+## Video stabilization baseline — accepted 2026-09-24
+
+The user accepted **fixed-map background camera poses + reference-depth
+reprojection** as the baseline for future fixed-view video stabilization.
+This replaces the earlier smoothed 2D homography method as the chosen method;
+it is now the sole production stabilization implementation. Fixed-view recordings
+default to it; only explicit `--tripod` skips stabilization. Supply `--scene STATIC
+--view LABEL` with the same-resolution raw reference PNG registered by COLMAP.
+The moving sweep remains a moving-camera input.
+
+1. Register the raw reference image in the sweep COLMAP map. Exclude the moving
+   subject with the existing foreground masks; use static background 2D–3D points.
+2. Track directly from the reference to each frame with forward/backward LK
+   checks. Estimate each pose against the same fixed map with EPnP RANSAC, then
+   refine inlier reprojection error with LM. Keep map and intrinsics fixed;
+   do not accumulate pairwise transforms or apply temporal smoothing.
+3. Render static 3DGS expected depth at the fixed target pose. For low-opacity
+   depth holes, interpolate background sparse-point inverse depth; outside its
+   convex hull use nearest sparse depth. This fills depth, not RGB pixels.
+4. Inverse-warp original RGB into the target camera using this depth, the full
+   per-frame rotation/translation and radial distortion. Preserve timing and
+   field of view. Leave out-of-image regions black; no border replication,
+   RGB inpainting or crop/zoom is part of the accepted trial.
+
+Accepted Bush view1 trial: **960x540, 30 FPS, 1170 frames**, target frame `00559`.
+Pose source: `scene_library/bush/experiments/background_pose_view1_540p_20260924_001/`.
+Stabilized preview, scripts, settings and checksums:
+`scene_library/bush/experiments/pose_stabilized_view1_540p_20260924_001/`.
+The pose fit used 1172 background points with 235 held out. Background tracking
+on 39 decoded output frames gave a time median of per-frame median displacement
+of **0.168 px** within the common valid region. This and the user's visual
+acceptance establish the preview baseline, not foreground motion accuracy or
+validation of other recordings. Static depth can still misrepresent moving
+boundaries and changing occlusions.
+
+The trial reused the existing static scene; it was not a cold 540p pipeline run.
+Production targets the exact registered static camera, rather than the trial's
+separately PnP-refined reference pose, keeping downstream projections consistent.
+Pixel thresholds scale with image height from the accepted 540p settings; override
+the settings dataclass through `--config` when needed. Production publishes PNGs,
+nearest-neighbor warped masks, per-frame/common validity, poses and depth. Flow
+retains time-complete valid trajectories; invalid modal samples do not supervise
+gains, soft graphs or modal loss. RGB L1 uses common valid pixels, SSIM wholly
+valid windows. Masked LPIPS uses equally zero-masked RGB and spatial valid-support
+weighting; boundary feature context remains. This evaluation protocol is distinct
+from the historical full-frame baseline below.
+MP4 previews are not training inputs. The next full run must publish lossless
+frames, consistently warped masks, valid-pixel masks and matching target-camera
+identities before rebuilding downstream stages; see [REBUILD](REBUILD.md).
+Historical reconstruction baselines and source artifacts remain unchanged.
+
 ## Spatial modes
 
 - Static geometry, appearance and cameras remain fixed during mode learning.

@@ -9,21 +9,26 @@ Run `modal-gaussians GROUP COMMAND --help` for additional options.
 ## Pixels, cameras and references
 
 `prepare gui --root-dir PREPARATION` opens the optional frame/mask tool. Reuse
-existing extracted pixels and masks when available. Bind each fixed-view sequence:
-
-```sh
-modal-gaussians prepare reference --images IMAGES --masks MASKS --fps FPS --reference-frame FRAME --output REFERENCE
-```
-
-Add `--stabilize` only when new stabilization is required. Existing stabilized
-PNGs can be bound directly. The geometry reference PNG must match the image registered by COLMAP; its hash
-is checked when preparing observations. The chosen reference fixes the camera pixel grid.
-For a new static scene, COLMAP consumes the sweep and those geometry references:
+existing extracted pixels and masks when available. First register the raw sweep
+and raw fixed-view reference images, then build static geometry:
 
 ```sh
 modal-gaussians colmap prepare --frames SWEEP_IMAGES --frame-masks SWEEP_MASKS --reference view1 REF_IMAGE1 REF_MASK1 --reference view2 REF_IMAGE2 REF_MASK2 --sample-stride STRIDE --output COLMAP_INPUT
-modal-gaussians static train --input COLMAP_INPUT --work-dir STATIC_WORK --output STATIC
+modal-gaussians static train --input COLMAP_INPUT --iterations 3000 --batch-size 4 --work-dir STATIC_WORK --output STATIC
+modal-gaussians prepare reference --images IMAGES --masks MASKS --fps FPS --reference-frame FRAME --scene STATIC --view view1 --output REFERENCE
 ```
+
+The static pass is coarse geometry: 3,000 updates at batch 4, progressively activated SH up
+to degree 3, and no depth supervision. `--iterations` replaces `--epochs`; the
+author-aligned numerical defaults are in BASELINE. Use new static/work paths:
+old direct-RGB bundles/checkpoints cannot be resumed into SH training.
+
+Stabilization is the default: background PnP poses plus static-depth reprojection.
+The raw reference PNG hash/resolution must match the registered camera. Only when
+the user explicitly confirms tripod capture, replace `--scene STATIC --view view1`
+with `--tripod`. Never use tripod as a workaround for missing geometry. The moving
+sweep stays on its own cameras. Old stabilized PNGs/MP4 previews cannot be relabeled
+as new stabilized references. Optional `--config` supplies stabilization settings.
 
 Use the current SIMPLE_RADIAL projection. Optional `static repartition` recomputes
 mask-based partition; manual subject selection is explicitly created through the

@@ -1,7 +1,7 @@
 """Reuse frozen geometry with independently computed selected modal observations."""
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 import copy
 import math
 from pathlib import Path
@@ -70,7 +70,7 @@ def _sample_fields(modal_fields, pixels, view_indices):
 def _replace_observations(arrays, target, alphas, identifiable, energy_floor_fraction):
     """Apply the existing neural observation normalization to a new modal source."""
     result = dict(arrays)
-    confidence = arrays["o_sample_confidence"].astype(np.float64)
+    confidence = arrays["o_sample_confidence"].astype(np.float64) * arrays['o_sample_valid']
     offsets = arrays["o_view_sample_offsets"]
     view_count = len(offsets) - 1
     target = np.asarray(target, dtype=np.complex64)
@@ -85,6 +85,8 @@ def _replace_observations(arrays, target, alphas, identifiable, energy_floor_fra
     for view in range(view_count):
         lo, hi = offsets[view:view + 2]
         weights = confidence[lo:hi]
+        if weights.sum() <= 0:
+            raise ValueError('No valid modal samples in a view')
         energy = np.sum(np.abs(target[:, lo:hi].astype(np.complex128)) ** 2, axis=-1)
         rms[:, view] = np.sqrt(np.sum(energy * weights[None], axis=1) / weights.sum())
         sensitivity[view] = np.average(arrays["o_sample_projection_sensitivity"][lo:hi], weights=weights)
@@ -154,7 +156,7 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
             raise ValueError("Selected modal sources must provide every prepared view exactly once")
         selected = [m for m in source["modes"] if math.isclose(m["frequency_hz"], frequency_hz, rel_tol=0, abs_tol=1e-9)]
         candidate_index = selected[0]["candidate_index"] if len(selected) == 1 else 0
-        modal_fields, records = [], []
+        modal_fields, records, supports = [], [], []
         for view, flow in zip(source["views"], parent.manifest["flows"]):
             field, _, record = _modal_view(requested[view["label"]], flow, view, frequency_hz,
                                          read_mask=not visible_subject,
@@ -164,6 +166,7 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
                 "reference_frame_index": exported["reference_frame_index"],
                 "selection_identity": exported["reference_selection"]["identity"]}
             modal_fields.append(field)
+            supports.append(np.load(Path(record['path'])/'valid_mask.npy', allow_pickle=False))
             records.append({**view, "flow_artifact": flow["path"], "flow_role": "geometry_reference_only",
                 "frame_count": len(flow["manifest"]["frame_names"]), "fps_hz": flow["manifest"]["fps_hz"],
                 "reference_frame_name": exported["reference_frame_name"],
@@ -192,6 +195,16 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
             raise ValueError("Inherited topology does not belong to the prepared geometry")
         with np.load(topology_path / ARRAY_FILENAME, allow_pickle=False) as archive:
             topology = TopologyArrays(**{name: archive[name] for name in ARRAY_DTYPES})
+        def sample_support(pixels, views):
+            return np.array([supports[v][y, x] for (x, y), v in zip(pixels, views)], bool)
+        supported = sample_support(topology.sample_pixels_xy, topology.sample_view_index)
+        counts = np.diff(topology.sample_offsets)
+        rows = np.repeat(supported, counts)
+        # Keep sample indices stable, remove only contributors of unsupported traces.
+        topology = replace(topology, sample_offsets=np.r_[0, np.cumsum(counts*supported)],
+            contributor_gaussian_index=topology.contributor_gaussian_index[rows],
+            contributor_weight=topology.contributor_weight[rows], contributor_jacobian=topology.contributor_jacobian[rows])
+        supported_topology_identity = identity({'parent':source['topology_identity'], 'support':supported.tolist()})
         points = parent.arrays["o_g_points"]
         bundle = {"format": FORMAT, "version": 1, "modes": [mode], "views": records,
             "topology_identity": source["topology_identity"], "transform": TRANSFORM_CONVENTION,
@@ -206,7 +219,7 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
         observations = prepare_observations(points=points, topology=topology,
             sample_measurements=_sample_fields(modal_fields, topology.sample_pixels_xy, topology.sample_view_index)[0],
             view_labels=tuple(labels), workspace=alpha_workspace,
-            topology_identity=source["topology_identity"], cache_dir=parent.cache_dir)
+            topology_identity=supported_topology_identity, cache_dir=parent.cache_dir)
         alpha = solve_alpha_sync(observations, alpha_config, backend=alpha_backend, workspace=alpha_workspace)
         alpha_arrays = {f.name: np.asarray(getattr(alpha, f.name)) for f in fields(alpha)}
         alignment = {"format": ALIGNMENT_FORMAT, "version": 1, "modes": [mode], "views": source["views"],
@@ -219,7 +232,10 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
             report_progress(f"selected modal alignment {label}: alpha={gain} supervised={bool(usable)} reason={reason}")
     with timer.stage("selected_modal_observations"):
         target = _sample_fields(modal_fields, parent.arrays["o_sample_pixels_xy"], parent.arrays["o_sample_view_index"])
-        arrays = _replace_observations(parent.arrays, target, alpha.alphas[None], alpha.identifiable_mask[None],
+        parent_arrays = dict(parent.arrays)
+        parent_arrays['o_sample_valid'] = sample_support(
+            parent.arrays['o_sample_pixels_xy'], parent.arrays['o_sample_view_index'])
+        arrays = _replace_observations(parent_arrays, target, alpha.alphas[None], alpha.identifiable_mask[None],
                                       config.energy_floor_fraction)
         source.update(modes=[mode], complex_2d_modes=str(destination / "selected_modes"),
             complex_2d_modes_identity=bundle["complex_2d_modes_identity"],
@@ -235,7 +251,7 @@ def _prepare_selected_modal(*, prepared_dir, views, frequency_hz, destination, t
         atomic_json(temporary / "alignment" / "manifest.json", alignment)
         save_named_arrays(temporary / "alignment" / "arrays.npz", alpha_arrays)
         save_named_arrays(temporary / "arrays.npz", arrays)
-        manifest = {"format": PREPARED_FORMAT, "version": 2, "source": source,
+        manifest = {"format": PREPARED_FORMAT, "version": 3, "source": source,
             "source_identity": nm._source_identity(source), "flows": parent.manifest["flows"],
             "cache_dir": str(parent.cache_dir), "arrays_sha256": sha256(temporary / "arrays.npz"),
             "arrays_identity": nm._arrays_identity(arrays), "defaults": parent.manifest["defaults"],

@@ -70,7 +70,7 @@ class PreparedNeuralInputs:
         for index, record in enumerate(self.manifest['flows']):
             if requested == resolve_path(record['path']):
                 reference = SequenceReference(requested, record['manifest'],
-                    SimpleNamespace(mask_union=self.arrays[f'v{index}_mask']))
+                    SimpleNamespace(mask_union=self.arrays[f'v{index}_mask'], valid_mask=self.arrays[f'v{index}_valid']))
                 if reference_identity(reference) != record['identity']:
                     raise ValueError('Prepared reference identity differs')
                 return reference
@@ -143,7 +143,7 @@ class PreparedNeuralInputs:
 def load_prepared(path: str | Path, *, validate: bool = False) -> PreparedNeuralInputs:
     root = resolve_path(path, strict=True)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("format") != FORMAT or manifest.get("version") != 2:
+    if manifest.get("format") != FORMAT or manifest.get("version") != 3:
         raise ValueError("Unsupported neural preparation")
     if validate:
         expected = identity({k: v for k, v in manifest.items() if k != "prepared_identity"})
@@ -171,6 +171,8 @@ def _read_reference_rgb(flow: SequenceReference) -> np.ndarray:
     """Read the geometry reference without importing Viewer code."""
     from modal_gaussians.preprocessing.frames import read_rgb
     images = resolve_path(flow.manifest["inputs"]["sequence"]["image_directory"], strict=True)
+    if flow.manifest['stabilized_sequence'] is not None:
+        images = flow.path / 'stabilized_sequence' / 'images'
     rgb = read_rgb(images / f"{flow.manifest['reference_frame_name']}.png")
     if rgb.shape[:2] != flow.arrays.mask_union.shape:
         raise ValueError("Flow reference image shape differs from flow arrays")
@@ -204,12 +206,17 @@ def prepare_neural(*, scene_dir, views, output_dir, cache_dir=DEFAULT_CACHE, con
         camera = cameras.get(label)
         if camera is None or flow.manifest['shape_hw'] != [camera.height, camera.width]:
             raise ValueError(f'Reference camera/grid differs: {label}')
+        stable = flow.manifest['stabilized_sequence']
+        if stable is not None and (stable['static_scene_identity'] != scene.manifest['static_scene_identity']
+                or stable['target_camera']['camera_identity'] != camera.to_manifest_record()['camera_identity']):
+            raise ValueError(f'Stabilization target camera/static scene differs: {label}')
         geometry_image = resolve_path(flow.manifest['inputs']['sequence']['image_directory']) / (flow.manifest['reference_frame_name'] + '.png')
         if sha256(geometry_image) != camera.image_sha256:
             raise ValueError(f'Geometry reference image differs from the registered camera: {label}')
         fid = reference_identity(flow)
         records.append({'path': str(flow.path), 'manifest': flow.manifest, 'identity': fid})
         arrays[f'v{index}_mask'] = flow.arrays.mask_union.copy()
+        arrays[f'v{index}_valid'] = flow.arrays.valid_mask.copy()
         arrays[f'v{index}_rgb'] = _read_reference_rgb(flow)
         sources.append({'index': index, 'label': label, 'camera_identity': camera.to_manifest_record()['camera_identity'],
             'shape_hw': flow.manifest['shape_hw'], 'flow_artifact': str(flow.path), 'flow_identity': fid,
@@ -243,7 +250,7 @@ def prepare_neural(*, scene_dir, views, output_dir, cache_dir=DEFAULT_CACHE, con
             lambda: geometry_graph.build_geometry_graph_arrays(foreground_means=arrays['o_g_points'],
                 view_count=len(views), config=nm._geometry_config(config)).as_dict(), timer, 'geometry_cache')
         save_named_arrays(temporary / 'arrays.npz', arrays)
-        manifest = {'format': FORMAT, 'version': 2, 'source': source, 'source_identity': nm._source_identity(source),
+        manifest = {'format': FORMAT, 'version': 3, 'source': source, 'source_identity': nm._source_identity(source),
             'flows': records, 'cache_dir': str(cache_dir), 'arrays_sha256': sha256(temporary / 'arrays.npz'),
             'arrays_identity': nm._arrays_identity(arrays),
             'geometry_graph': str(cache_dir / 'geometry' / identity(contract)),
@@ -281,6 +288,7 @@ def _observation_topology(parent, source, scene, output_dir, final_dir, config):
             alpha = rendered["alpha"].detach().cpu().numpy().astype(np.float32)
             mask = (alpha >= config.alpha_minimum if visible_subject
                     else load_reference(flow["path"]).arrays.mask_union)
+            mask &= load_reference(flow['path']).arrays.valid_mask
             cameras.append(camera)
             depths.append(rendered["expected_depth"].detach().cpu().numpy().astype(np.float32))
             alphas.append(alpha)

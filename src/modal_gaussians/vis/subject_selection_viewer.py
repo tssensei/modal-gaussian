@@ -36,7 +36,7 @@ class SubjectSelectionData:
         """Tint both original partitions with one shared depth order; never edit parameters."""
         active = self.active
         mask = torch.as_tensor(selected, device=self.device, dtype=torch.bool)
-        colors = active["colors"]
+        colors = self.scene.view_colors([camera], active["means"])[0]
         if highlight:
             tint = colors.new_tensor((0.15, 0.95, 1.0))
             colors = torch.where(mask[:, None], 0.35 * colors + 0.65 * tint, 0.4 * colors)

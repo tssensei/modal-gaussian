@@ -5,6 +5,13 @@ immutable complex displacement and angular fields. The static scene, appearance,
 cameras, Gaussian order and both fields remain frozen throughout RGB fitting.
 Videos were recorded separately; fit independent coefficients for each video.
 
+Appearance now uses world-frame SH (static scene v5/v6, refined v7). Fixed RGB and
+sweep fitting freeze all SH parameters while evaluating colors at each frame's
+camera and deformed positions. Joint refinement updates foreground SH DC at
+`color_lr` and higher bands at `color_lr / 20`; background SH stays frozen. Baked
+fields, result rendering, evaluation and playback use the same SH-aware renderer.
+This does not change the existing 0.8 L1 / 0.2 DSSIM coefficient/refinement loss.
+
 ```text
 completed batch index
   -> fixed mode bank + rendered linear projection design
@@ -16,6 +23,20 @@ completed batch index
 `coordinates.npy` is `complex64 [total_selected_frames, mode_count]`.
 Displacement is `Re(sum_k(q_k(t) * phi_k))`. Saved angular fields drive the
 exponential-map rotation of static Gaussian orientations.
+
+## Valid pixels after stabilization
+
+Fixed-view stabilization is now the default; only an explicitly confirmed tripod
+recording skips it. Prepare COLMAP/static geometry first, then run `prepare reference
+--scene STATIC --view LABEL`. The target is the registered static camera, so the
+coefficient renderer uses that same camera. Do not substitute preview MP4s for PNGs.
+
+Fixed RGB artifacts bind common valid support. Fit and joint refinement exclude
+black missing pixels from L1 and require entirely valid SSIM windows; sweep remains
+full-frame. Evaluation v2 uses the same pixel support for PSNR/RMSE and records its
+identity. LPIPS uses zero-masked inputs with spatial valid-support weighting;
+boundary feature context remains. Re-evaluate comparable baselines with the same
+inputs/support/protocol; historical full-frame numbers are not directly comparable.
 
 ## Commands
 

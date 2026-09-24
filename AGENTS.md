@@ -52,6 +52,17 @@ pipeline or remove recovery checkpoints speculatively.
 
 ## Protect scientific and storage contracts
 
+- Scene appearance is world-frame SH. Preserve all coefficient rows and active
+  degree through partitioning, density control, checkpoints and publication.
+  Photometric renderers evaluate SH using each camera and the current deformed
+  positions; DC-only colors are for point-cloud displays, not RGB supervision.
+
+- Fixed-view recordings default to background-PnP/depth stabilization. Skip only
+  when the user explicitly declares tripod capture (`prepare reference --tripod`).
+  Build COLMAP/static geometry from raw pixels first; use the registered camera
+  as the stabilization target. Preserve validity through flow, FFT, modal/RGB
+  supervision and evaluation. Do not treat black missing pixels as observations.
+  The moving sweep retains its calibrated cameras and is not a fixed observation.
 - Recordings are asynchronous. Keep per-video temporal coefficients independent.
   RGB coefficient fitting keeps static geometry, appearance, cameras, displacement
   modes and angular modes fixed. Changing these assumptions is an explicit method

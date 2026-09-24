@@ -55,13 +55,13 @@ class RenderedDesignConfig:
 
 
 @torch.no_grad()
-def prepare_modal_projection(scene, camera, mask, config):
+def prepare_modal_projection(scene, camera, mask, config, valid_mask=None):
     """Prepare one view using the shared sampling and projection convention."""
     means = scene.foreground.active()["means"]
     dummy = means.new_zeros((len(means), 1))
     _, alpha = render_motion_features(scene, camera, dummy)
     pixels, sampled_alpha = candidate_observation_pixels(
-        scene, mask, alpha.detach().cpu().float().numpy(), config)
+        scene, mask, alpha.detach().cpu().float().numpy(), config, valid_mask)
     jacobian, visible = projection_jacobian(
         means.detach().cpu().numpy().astype(np.float32),
         camera.K.detach().cpu().numpy().astype(np.float64),
@@ -198,14 +198,15 @@ def render_observation_geometry(
 
 def candidate_observation_pixels(
     scene: ForegroundBackgroundScene, mask: np.ndarray, alpha: np.ndarray,
-    config: RenderedDesignConfig,
+    config: RenderedDesignConfig, valid_mask=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Manual selections retain the alpha/stride gate without mask erosion."""
 
+    valid = np.ones_like(alpha, dtype=bool) if valid_mask is None else valid_mask
     if uses_visible_subject(scene):
-        return candidate_pixels(np.ones_like(alpha, dtype=bool), alpha,
+        return candidate_pixels(valid, alpha,
                                 replace(config, mask_erosion_iterations=0))
-    return candidate_pixels(mask, alpha, config)
+    return candidate_pixels(mask & valid, alpha, config)
 
 
 def sample_feature_render(

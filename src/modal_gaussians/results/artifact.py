@@ -289,7 +289,7 @@ def _load_sources(
                     raise ValueError('Refined fixed recording not in observation sources')
                 _require_equal('refined mode camera', view['camera_identity'], original[view['label']]['camera_identity'])
         if coordinate_kind == 'refined_rgb':
-            if completed.manifest.get('version') != 19 or scene_manifest.get('version') != 4:
+            if completed.manifest.get('version') != 19 or scene_manifest.get('version') != 7:
                 raise ValueError('Refined coordinates require derived scene and mode bank')
             for key in ('preparation_identity','run_identity'):
                 _require_equal(f'refined {key}',cm[key],completed.manifest[key])

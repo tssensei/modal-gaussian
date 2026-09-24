@@ -17,7 +17,7 @@ import numpy as np
 
 from modal_gaussians.spectrum.transform import temporal_rfft_tiles
 from modal_gaussians.flow.storage import create_array, open_array
-from modal_gaussians.common.cache import atomic_json, identity
+from modal_gaussians.common.cache import atomic_json, identity, sha256
 from modal_gaussians.spectrum.modes import TRANSFORM_CONVENTION
 from modal_gaussians.common.progress import Progress, report_progress
 
@@ -56,7 +56,7 @@ def load_spectrum(path):
     """Open only metadata and the small frequency table, never scan numerical data."""
     root = resolve_path(path, strict=True)
     manifest = _json(root / "manifest.json")
-    if (manifest.get("format") != FORMAT or manifest.get("version") != 1
+    if (manifest.get("format") != FORMAT or manifest.get("version") != 2
             or manifest.get("status") != "complete"):
         raise ValueError("Spectrum cache is incomplete or unsupported")
     length, fps = manifest["fft_length"], float(manifest["fps_hz"])
@@ -105,9 +105,7 @@ def read_region(cache, view_index, region):
     record = cache.manifest["views"][view_index]
     if region not in REGIONS:
         raise ValueError("Unknown spectrum region")
-    if region == "full_frame":
-        return np.ones(record["shape_hw"], dtype=bool)
-    result = np.load(_file(cache, record["region_file"]), allow_pickle=False)
+    result = np.load(_file(cache, record['valid_file'] if region == 'full_frame' else record["region_file"]), allow_pickle=False)
     if result.dtype != bool or result.shape != tuple(record["shape_hw"]) or not result.any():
         raise ValueError("Selected-box region is empty or invalid")
     return result
@@ -127,7 +125,7 @@ def _source(path):
     root = resolve_path(path, strict=True)
     source = _json(root / "manifest.json")
     if (source.get("format") != "modal_gaussians.sea_raft_flow"
-            or source.get("version") != 2 or source.get("status") != "complete"
+            or source.get("version") != 3 or source.get("status") != "complete"
             or source.get("flow_file") != "flow.zarr" or source.get("flow_dtype") != "float32"
             or source.get("flow_direction") != "reference_to_frame"
             or source.get("flow_units") != "input_pixels"
@@ -139,6 +137,10 @@ def _source(path):
             or len(frames) < 3 or not math.isfinite(float(source["fps_hz"])) or source["fps_hz"] <= 0
             or not 0 <= reference < len(frames) or frames[reference] != source["reference_frame_name"]):
         raise ValueError(f"Invalid SEA-RAFT timing or shape: {root}")
+    support = np.load(root/'valid_mask.npy', allow_pickle=False)
+    if (sha256(root/'valid_mask.npy') != source['valid_mask_sha256'] or support.dtype != bool
+            or list(support.shape) != shape[1:3] or not support.any()):
+        raise ValueError('Invalid SEA-RAFT support')
     return root, source
 
 
@@ -203,7 +205,11 @@ def build_spectrum(*, views, scene_dir=None, fft_length, output_dir, region_path
             records.append({"label": label, "path": str(path),
                             "sha256": hashlib.sha256(region.tobytes()).hexdigest()})
         scene_record = {"analysis_regions": records, "cache_clipped": False}
-    contract = {"implementation": "shared_zero_padded_rfft_v1", "fft_length": fft_length,
+    supports = [np.load(path/'valid_mask.npy', allow_pickle=False) for _, path, _ in sources]
+    regions = [region & support for region, support in zip(regions, supports)]
+    if any(not r.any() for r in regions):
+        raise ValueError('No valid spectrum analysis pixels')
+    contract = {"implementation": "shared_zero_padded_rfft_valid_v2", "fft_length": fft_length,
                 "fps_hz": fps, "transform": TRANSFORM_CONVENTION, "scene": scene_record,
                 "views": [{"label": label, "path": str(path), "source_identity": identity(source)}
                           for label, path, source in sources]}
@@ -217,7 +223,7 @@ def build_spectrum(*, views, scene_dir=None, fft_length, output_dir, region_path
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}-writing-", dir=destination.parent))
     frequencies = np.fft.rfftfreq(fft_length, d=1 / fps)
-    manifest = {"format": FORMAT, "version": 1, "status": "running", "contract": contract,
+    manifest = {"format": FORMAT, "version": 2, "status": "running", "contract": contract,
                 "spectrum_identity": identity(contract), "fft_length": fft_length, "fps_hz": fps,
                 "transform": TRANSFORM_CONVENTION, "views": [], "validation": False,
                 "created_utc": datetime.now(timezone.utc).isoformat()}
@@ -233,6 +239,7 @@ def build_spectrum(*, views, scene_dir=None, fft_length, output_dir, region_path
             if list(flow.shape) != source["flow_shape"] or flow.dtype != np.float32:
                 raise ValueError(f"SEA-RAFT flow storage differs from metadata: {label}")
             _, height, width, _ = flow.shape
+            support = supports[index]
             spectrum = create_array(folder / "spectrum.zarr", (len(frequencies), height, width, 2), np.complex64)
             sums = {name: np.zeros(len(frequencies), dtype=np.float64) for name in REGIONS}
             progress = Progress(f"shared FFT {label}", height * width, unit="pixels")
@@ -241,7 +248,7 @@ def build_spectrum(*, views, scene_dir=None, fft_length, output_dir, region_path
                 for rows, columns, values in temporal_rfft_tiles(flow, fft_length=fft_length, block_width=64):
                     spectrum[:, rows, columns, :] = values
                     amplitude = np.sqrt(np.abs(values[..., 0]) ** 2 + np.abs(values[..., 1]) ** 2)
-                    sums["full_frame"] += amplitude.sum(axis=(1, 2), dtype=np.float64)
+                    sums["full_frame"] += amplitude[:, support[rows, columns]].sum(axis=1, dtype=np.float64)
                     local = region[rows, columns]
                     if local.any():
                         sums["selected_box"] += amplitude[:, local].sum(axis=1, dtype=np.float64)
@@ -250,15 +257,17 @@ def build_spectrum(*, views, scene_dir=None, fft_length, output_dir, region_path
             finally:
                 flow.store.close()
                 spectrum.store.close()
-            sums["full_frame"] /= height * width
+            sums["full_frame"] /= int(support.sum())
             sums["selected_box"] /= int(region.sum())
             np.savez(folder / "curves.npz", **sums)
             np.save(folder / "region.npy", region, allow_pickle=False)
+            np.save(folder / "valid.npy", support, allow_pickle=False)
             shutil.copyfile(resolve_path(source["reference_image"]), folder / "reference.png")
             record = {"label": label, "shape_hw": [height, width], "source_path": str(source_path),
                       "source_manifest": source, "reference_image": (relative / "reference.png").as_posix(),
                       "spectrum_file": (relative / "spectrum.zarr").as_posix(),
                       "region_file": (relative / "region.npy").as_posix(),
+                      "valid_file": (relative / "valid.npy").as_posix(),
                       "curves_file": (relative / "curves.npz").as_posix(),
                       "selected_box_pixels": int(region.sum()), "seconds": time.perf_counter() - tick}
             manifest["views"].append(record)
@@ -317,6 +326,7 @@ def export_selection(cache, selection_path, output_dir):
             folder.mkdir(parents=True)
             values = read_mode(cache, view_index, bin_index)
             np.save(folder / "modal_image.npy", values[None], allow_pickle=False)
+            np.save(folder / 'valid_mask.npy', read_region(cache, view_index, 'full_frame'), allow_pickle=False)
             source = view["source_manifest"]
             manifest = {name: source.get(name) for name in (
                 "images", "stabilization_source", "stabilized_images", "inference_images", "reference_image",
@@ -324,7 +334,8 @@ def export_selection(cache, selection_path, output_dir):
                 "flow_direction", "smoothing", "transform")}
             if "reference_selection" in source:
                 manifest["reference_selection"] = source["reference_selection"]
-            manifest.update(format=EXPORT_FORMAT, version=1, status="complete", frequency_hz=frequency,
+            manifest.update(format=EXPORT_FORMAT, version=2, status="complete", frequency_hz=frequency,
+                            valid_mask_sha256=sha256(folder/'valid_mask.npy'),
                             modes_file="modal_image.npy", modes_shape=[1, *view["shape_hw"], 2],
                             modes_dtype="complex64", full_spectrum=False, validation=False,
                             source_flow_path=view["source_path"],

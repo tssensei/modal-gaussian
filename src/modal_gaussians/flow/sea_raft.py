@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from modal_gaussians.flow.storage import create_array
-from modal_gaussians.common.cache import atomic_json
+from modal_gaussians.common.cache import atomic_json, sha256, identity
 from modal_gaussians.spectrum.modes import TRANSFORM_CONVENTION
 from modal_gaussians.common.progress import Progress, report_progress
 
@@ -66,6 +66,8 @@ def compute_flow(*, images, reference, output_dir, sea_raft_repo, model_dir, com
     reference_path = image_dir / (names[reference_index] + ".png")
     reference_cpu = read_image(reference_path)
     height, width = reference_cpu.shape[-2:]
+    valid = seq['valid_mask'].copy()
+    yy, xx = np.mgrid[:height, :width].astype(np.float32)
     if [height, width] != source["shape_hw"]:
         raise ValueError("Reference dimensions differ from source metadata")
     if not torch.cuda.is_available():
@@ -73,7 +75,8 @@ def compute_flow(*, images, reference, output_dir, sea_raft_repo, model_dir, com
     model = load_model(sea_raft_repo, model_dir)
     shape = (len(names), height, width, 2)
     manifest = {
-        "format": FORMAT, "version": 2, "status": "running",
+        "format": FORMAT, "version": 3, "status": "running",
+        "sequence_reference_identity": identity(source), "valid_mask_file": "valid_mask.npy",
         "created_utc": datetime.now(timezone.utc).isoformat(), "command": command,
         "images": str(images), "stabilization_source": str(previous),
         "stabilized_images": str(image_dir) if stable_record is not None else None,
@@ -113,12 +116,25 @@ def compute_flow(*, images, reference, output_dir, sea_raft_repo, model_dir, com
                         del result, current
                     if frame_flow.shape != (height, width, 2) or not np.isfinite(frame_flow).all():
                         raise RuntimeError(f"Invalid model output: {names[index]}")
+                    endpoint = cv2.remap(seq['valid_mask'].astype(np.float32), xx+frame_flow[..., 0], yy+frame_flow[..., 1],
+                                         cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+                    valid &= endpoint >= 1-1e-6
                     batch[index - start] = frame_flow
                     progress.update(index + 1)
                 flow[start:stop] = batch
                 del batch
                 manifest["completed_frames"] = stop
                 atomic_json(output / "manifest.json", manifest)
+        # One temporal support for FFT: never zero only some samples of a trace.
+        if not valid.any():
+            raise ValueError('No complete valid flow trajectories')
+        for start in range(0, len(names), batch_size):
+            stop = min(start+batch_size, len(names))
+            values = np.asarray(flow[start:stop]).copy()
+            values[:, ~valid] = 0
+            flow[start:stop] = values
+        np.save(output/'valid_mask.npy', valid, allow_pickle=False)
+        manifest['valid_mask_sha256'] = sha256(output/'valid_mask.npy')
         flow.store.close()
         flow = None
         manifest.update(status="complete", elapsed_seconds=time.perf_counter() - started)

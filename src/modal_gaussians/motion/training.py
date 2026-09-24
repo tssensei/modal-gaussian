@@ -335,7 +335,8 @@ def _prepare_observation_arrays(scene: Any, source: Mapping[str, Any], dense: An
         alpha_image = render["alpha"].cpu().numpy().astype(np.float32)
         depth_image = render["expected_depth"].cpu().numpy().astype(np.float32)
         if frozen_arrays is None:
-            pixels, confidence = candidate_observation_pixels(scene, flow.arrays.mask_union, alpha_image, sampling)
+            pixels, confidence = candidate_observation_pixels(scene, flow.arrays.mask_union, alpha_image, sampling,
+                                                              flow.arrays.valid_mask)
         else:
             lo, hi = frozen_arrays["view_sample_offsets"][view["index"]:view["index"] + 2]
             pixels = frozen_arrays["sample_pixels_xy"][lo:hi]
@@ -405,6 +406,7 @@ def _prepare_observation_arrays(scene: Any, source: Mapping[str, Any], dense: An
         "sample_view_index": np.concatenate(views_all),
         "view_sample_offsets": np.asarray(offsets, dtype=np.int64),
         "sample_confidence": confidence.astype(np.float32),
+        "sample_valid": np.ones(len(confidence), dtype=bool),
         "sample_target": target,
         "mode_view_rms": rms.astype(np.float64),
         "mode_view_loss_scale": np.maximum(rms, floor).astype(np.float64),
@@ -441,7 +443,7 @@ def _mode_diagnostics(arrays: Mapping[str, np.ndarray], mode: int) -> dict[str, 
         lo, hi = offsets[view:view + 2]
         target = arrays["sample_target"][mode, lo:hi].astype(np.complex128)
         residual = arrays["sample_prediction"][mode, lo:hi] - target
-        w = arrays["sample_confidence"][lo:hi].astype(np.float64)
+        w = arrays["sample_confidence"][lo:hi].astype(np.float64) * arrays['sample_valid'][lo:hi]
         error = float(np.sum(w[:, None] * np.abs(residual) ** 2))
         energy = float(np.sum(w[:, None] * np.abs(target) ** 2))
         total_error += error
@@ -659,7 +661,7 @@ def build_neural_modes_artifact(*, work_dir, output_dir, prepared_inputs, config
                 observations.append(ModalObservation(
                     target=torch.as_tensor(arrays["sample_target"][mode, lo:hi], device=device),
                     project=projector, alpha=complex(arrays["alphas"][mode, view]),
-                    confidence=torch.as_tensor(arrays["sample_confidence"][lo:hi], device=device),
+                    confidence=torch.as_tensor(arrays["sample_confidence"][lo:hi]*arrays['sample_valid'][lo:hi], device=device),
                     normalized_rms=float(arrays["mode_view_loss_scale"][mode, view]),
                     name=str(source["views"][view]["label"]),
                 ))

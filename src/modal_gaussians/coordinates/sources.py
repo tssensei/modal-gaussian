@@ -32,6 +32,13 @@ def load_coordinate_flow(path):
     from modal_gaussians.flow.reference_selection import sequence_metadata
     root, source = _source(path)
     reference = load_reference(source['stabilization_source'])
+    from modal_gaussians.common.cache import sha256
+    if source.get('sequence_reference_identity') != reference_identity(reference):
+        raise ValueError('Flow/reference identity differs')
+    support = np.load(root/'valid_mask.npy', allow_pickle=False)
+    if (sha256(root/'valid_mask.npy') != source['valid_mask_sha256'] or support.dtype != bool
+            or support.shape != reference.arrays.valid_mask.shape or np.any(support & ~reference.arrays.valid_mask)):
+        raise ValueError('Invalid flow support')
     metadata = reference.manifest
     for new, old in (('frames', 'frame_names'), ('fps_hz', 'fps_hz')):
         if source[new] != metadata[old]:
@@ -49,4 +56,4 @@ def load_coordinate_flow(path):
     ref_id = reference_identity(reference)
     binding = identity({'source': source, 'reference_identity': ref_id, 'adapter': 'coefficient_sea_v2'})
     return CoordinateFlow(root, {**source, 'frame_names': source['frames']},
-        SimpleNamespace(flow=flow, mask_union=reference.arrays.mask_union), binding, ref_id, images)
+        SimpleNamespace(flow=flow, mask_union=reference.arrays.mask_union & support, valid_mask=support), binding, ref_id, images)

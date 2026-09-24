@@ -132,7 +132,7 @@ def prepare_refinement(*, scene_dir, completed_modes_dir, coordinates_dirs, outp
     with _publish(destination) as work:
         np.savez(work / "reference.npz", **arrays)
         np.savez(work / "initial.npz", coordinates=np.concatenate(qs), scales=scales)
-        m = dict(format=PREPARED_FORMAT, version=2, static_scene=str(paths[0]),
+        m = dict(format=PREPARED_FORMAT, version=3, static_scene=str(paths[0]),
             static_scene_identity=scene.manifest["static_scene_identity"],
             mode_bank=str(paths[1]), completed_modes_identity=bank.manifest["completed_modes_identity"],
             rgb_sources=rgb_sources, mode_sources=modes, modes=bank.manifest["modes"], views=views,
@@ -148,7 +148,7 @@ def prepare_refinement(*, scene_dir, completed_modes_dir, coordinates_dirs, outp
 
 
 def load_prepared(path):
-    root, m = read_manifest(path, PREPARED_FORMAT, 2, "preparation_identity")
+    root, m = read_manifest(path, PREPARED_FORMAT, 3, "preparation_identity")
     if set(m["checksums"]) != {"reference.npz", "initial.npz"} or m["reference_identity"] != m["checksums"]["reference.npz"]:
         raise ValueError("Prepared reference file contract differs")
     scene = load_static_scene(m["static_scene"], validate=True)
@@ -162,7 +162,7 @@ def load_prepared(path):
 
 
 def load_refined_coordinates(path):
-    root, m = read_manifest(path, COORDINATES_FORMAT, 2, "refined_coordinates_identity")
+    root, m = read_manifest(path, COORDINATES_FORMAT, 3, "refined_coordinates_identity")
     q = np.load(root / "coordinates.npy", allow_pickle=False)
     from .direct import _validate_modes
     _validate_modes(m["modes"])
@@ -236,7 +236,7 @@ def publish_refinement(destination, prepared, scene, field, mapping, coordinates
         m = copy.deepcopy(scene.manifest)
         for name in ("partition", "partition_identity", "partition_source", "partition_source_path", "partition_files"):
             m.pop(name, None)
-        m.update(version=4, tensors_sha256=sha256(scene_path / "tensors.pt"),
+        m.update(version=7, tensors_sha256=sha256(scene_path / "tensors.pt"),
             foreground_identity=tensor_dictionary_identity(tensors, "foreground."),
             background_identity=tensor_dictionary_identity(tensors, "background."),
             refinement={"parent_scene": source["static_scene"], "parent_scene_identity": source["static_scene_identity"],
@@ -255,7 +255,7 @@ def publish_refinement(destination, prepared, scene, field, mapping, coordinates
             foreground_role="refined_motion_subject", background_role="fixed_parent_background")
         payload = dict(dataset_identity=m["dataset"]["dataset_identity"], foreground_identity=m["foreground_identity"],
             background_identity=m["background_identity"], normalization=m["scene_normalization"],
-            representation="vanilla_3dgs_direct_rgb", projection_convention=PROJECTION_CONVENTION,
+            representation="vanilla_3dgs_sh3", sh_degree=m["representation"]["sh_degree"], projection_convention=PROJECTION_CONVENTION,
             camera_identities=[c.to_manifest_record()["camera_identity"] for c in cameras_from_scene_manifest(m)],
             refinement=m["refinement"])
         m["static_scene_identity"] = identity(payload)
@@ -296,7 +296,7 @@ def publish_refinement(destination, prepared, scene, field, mapping, coordinates
         write_manifest(bank_path, b, "completed_modes_identity")
         coord_path = work / "coordinates"
         np.save(coord_path / "coordinates.npy", np.asarray(coordinates, np.complex64), allow_pickle=False)
-        c = dict(format=COORDINATES_FORMAT, version=2, static_scene_identity=m["static_scene_identity"],
+        c = dict(format=COORDINATES_FORMAT, version=3, static_scene_identity=m["static_scene_identity"],
             completed_modes=str(destination / "mode_bank"), completed_modes_identity=b["completed_modes_identity"],
             modes=source["modes"], views=source["views"], images=source["images"], settings=settings,
             initialization=source["rgb_sources"], preparation_identity=source["preparation_identity"],

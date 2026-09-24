@@ -32,7 +32,7 @@ def sequence_metadata(reference_dir, images=None):
         raise ValueError('Sequence image/mask inventory differs')
     return dict(root=root, source=source, images=raw, image_dir=image_dir, mask_dir=mask_dir,
                 names=names, fps=float(source['fps_hz']), reference=source['reference_frame_index'],
-                shape_hw=source['shape_hw'])
+                shape_hw=source['shape_hw'], valid_mask=reference.arrays.valid_mask)
 
 
 def make_contract(sequence, scene, view, selected, settings):
@@ -202,12 +202,16 @@ def select_reference(*, scene_dir, label, reference, output_dir, target_mask="al
                    if c.role == "reference" and c.label == label), None)
     if camera is None or [camera.height, camera.width] != seq["shape_hw"]:
         raise ValueError("Reference camera label/shape differs")
+    stable = seq['source']['stabilized_sequence']
+    if stable is not None and (stable['static_scene_identity'] != scene.manifest['static_scene_identity']
+            or stable['target_camera']['camera_identity'] != camera.to_manifest_record()['camera_identity']):
+        raise ValueError('Stabilization target camera/static scene differs; prepare again')
     # One required render supplies RGB and visible subject coverage together.
     with torch.no_grad():
         rendered, _ = scene.render_batch([camera.to("cuda")], return_foreground_mask=True)
         rgb = (rendered["rgb"][0].clamp(0,1)*255).round().to(torch.uint8).cpu().numpy()
         alpha = rendered["foreground_mask"][0].cpu().numpy()
-    fixed = selection_mask(rgb, alpha, target_mask)
+    fixed = selection_mask(rgb, alpha, target_mask) & seq['valid_mask']
     target = target_data(fixed)
     destination.mkdir(parents=True, exist_ok=False)
     manifest = {"format": FORMAT, "version": 1, "status": "running", "command": command,
@@ -223,7 +227,7 @@ def select_reference(*, scene_dir, label, reference, output_dir, target_mask="al
     try:
         def evaluate(item):
             index, name = item
-            mask = _read(seq["mask_dir"] / f"{name}.png", True) > 0
+            mask = (_read(seq["mask_dir"] / f"{name}.png", True) > 0) & seq['valid_mask']
             return {"index": index, "frame": name, "time_seconds": index/seq["fps"], **score_mask(mask, target)}
         records = []
         with ThreadPoolExecutor(max_workers=workers) as pool:

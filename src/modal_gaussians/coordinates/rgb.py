@@ -27,14 +27,14 @@ from modal_gaussians.geometry.scene import cameras_from_scene_manifest
 
 RGB_COORDINATES_FORMAT = "modal_gaussians.rgb_modal_coordinates"
 SOLVER_CONVENTION = {
-    "solver": "fixed_modes_rgb_v1",
+    "solver": "fixed_modes_rgb_v2",
     "parameters": "independent_per_view_per_frame_complex_coordinates",
     "initialization": "direct_q_minus_reference_then_shared_rgb_offset",
     "gauge": "free_reference_and_temporal_mean",
     "normalization": "p=direct_mode_pair_scale*q; shared_real_imag_scale",
     "deformation": "means_static+real(sum(q*phi)); exp(real(sum(q*rotation)))*quat_static",
     "frozen": ["phi", "rotation", "static_scene", "appearance", "cameras"],
-    "rgb_loss": "0.8*L1+0.2*(1-SSIM); full_image_with_background",
+    "rgb_loss": "0.8*L1+0.2*(1-SSIM); common_valid_pixels; fully_valid_SSIM_windows",
     "anchor": "mean_k(abs(p-p_initial_rgb_offset)^2); linearly_decaying_weight",
     "temporal_regularization": "none",
 }
@@ -66,7 +66,7 @@ def _identity(manifest: Mapping[str, Any]) -> str:
               "completed_modes_identity", "modes", "views", "counts", "coordinates",
               "settings", "solver", "quality_gate", "training")
     payload = {name: manifest[name] for name in fields}
-    payload["images"] = [{"label": record["label"], "files": record["files"]}
+    payload["images"] = [{"label": record["label"], "files": record["files"], 'validity_sha256': record['validity']['sha256']}
                          for record in manifest["images"]]
     return hashlib.sha256(_canonical_json(payload)).hexdigest()
 
@@ -76,7 +76,7 @@ def load_rgb_modal_coordinates(path: str | Path) -> RGBModalCoordinatesArtifact:
     root = resolve_path(path, strict=True)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     if (not isinstance(manifest, dict) or manifest.get("format") != RGB_COORDINATES_FORMAT
-            or manifest.get("version") != 1):
+            or manifest.get("version") != 2):
         raise ValueError("Unsupported RGB-coordinate artifact")
     if manifest.get("solver") != SOLVER_CONVENTION or manifest.get("quality_gate") != QUALITY_GATE:
         raise ValueError("RGB-coordinate solver or quality gate differs")
@@ -111,7 +111,34 @@ def load_rgb_modal_coordinates(path: str | Path) -> RGBModalCoordinatesArtifact:
         raise ValueError("RGB coordinates must be finite complex64 [sum(T), K]")
     if _identity(manifest) != manifest.get("rgb_coordinates_identity"):
         raise ValueError("RGB-coordinate identity differs")
+    if len(views) != len(manifest['images']):
+        raise ValueError('RGB image view count differs')
+    for view, record in zip(views, manifest['images']):
+        if record['label'] != view['label'] or 'validity' not in record:
+            raise ValueError('RGB view/support binding differs')
+        load_valid_mask(record, view['shape_hw'])
     return RGBModalCoordinatesArtifact(root, manifest, coordinates)
+
+
+def load_valid_mask(record, shape_hw, scale=1., device='cpu'):
+    """Load a recorded common support, conservatively downsample it for RGB losses."""
+    support = record.get('validity')
+    if support is None:
+        return None
+    path = resolve_path(support['path'], strict=True)
+    if _sha256_file(path) != support['sha256']:
+        raise ValueError('RGB validity mask checksum differs')
+    mask = np.load(path, allow_pickle=False)
+    if mask.dtype != bool or list(mask.shape) != list(shape_hw) or not mask.any():
+        raise ValueError('Invalid RGB validity mask')
+    result = torch.as_tensor(mask, device=device)
+    if scale != 1:
+        from torch.nn import functional as F
+        height, width = int(shape_hw[0]*scale), int(shape_hw[1]*scale)
+        result = F.interpolate(result.float()[None, None], size=(height, width), mode='area')[0, 0] >= 1-1e-6
+    if not result.any():
+        raise ValueError('No valid RGB pixels at requested scale')
+    return result
 
 
 def _image_directory(flow_dir, view):
@@ -123,7 +150,9 @@ def _image_directory(flow_dir, view):
         for name in ('frame_names', 'fps_hz', 'reference_frame_name', 'reference_frame_index'):
             if flow.manifest[name] != view[name]:
                 raise ValueError(f'RGB SEA-RAFT {name} differs')
-        return flow.image_directory
+        from modal_gaussians.preprocessing.reference import load_reference
+        ref = load_reference(flow.manifest['stabilization_source'])
+        return flow.image_directory, dict(path=str(ref.path/'valid_mask.npy'), sha256=ref.manifest['valid_sha256'])
     finally:
         flow.arrays.flow.store.close()
 
@@ -173,8 +202,9 @@ def build_rgb_modal_coordinates_artifact(
     sources = []
     for view in views:
         label = view["label"]
-        directory = (resolve_path(overrides[label], strict=True) if label in overrides
-                     else _image_directory(flow_paths[view["index"]], view))
+        directory, validity = _image_directory(flow_paths[view["index"]], view)
+        if label in overrides:
+            directory = resolve_path(overrides[label], strict=True)
         if not directory.is_dir() or destination.is_relative_to(directory):
             raise ValueError("RGB source must be an image directory disjoint from output")
         paths = [directory / f"{name}.png" for name in view["frame_names"]]
@@ -183,11 +213,12 @@ def build_rgb_modal_coordinates_artifact(
         camera = cameras[view["camera_name"]]
         if [camera.height, camera.width] != view["shape_hw"]:
             raise ValueError(f"RGB camera shape differs for {label!r}")
-        sources.append((directory, paths, camera))
+        sources.append((directory, paths, camera, validity))
 
     coordinates_by_view, image_records, training = [], [], []
-    for view, (directory, paths, camera) in zip(views, sources):
+    for view, (directory, paths, camera, validity) in zip(views, sources):
         hashes: dict[str, str] = {}
+        supports = {scale:load_valid_mask({'validity':validity}, view['shape_hw'], scale, device) for scale in settings.scales}
 
         # ponytail: keep only a few CPU frames; use a disk pyramid if PNG decoding dominates.
         @lru_cache(maxsize=8)
@@ -210,11 +241,11 @@ def build_rgb_modal_coordinates_artifact(
         coordinates, summary = solve_rgb_coordinates_view(
             direct.coordinates[start:start + count], direct.diagnostics["mode_pair_scales"][view["index"]],
             view["reference_frame_index"], render, target, settings, device,
-            on_progress=on_progress,
+            on_progress=on_progress, valid_mask=supports.__getitem__,
         )
         coordinates_by_view.append(coordinates)
         training.append({"label": view["label"], **summary})
-        image_records.append({"label": view["label"], "directory": str(directory),
+        image_records.append({"label": view["label"], "directory": str(directory), 'validity':validity,
                               "files": [{"name": path.name, "sha256": hashes[path.name]} for path in paths]})
         target.cache_clear()
         del render
@@ -225,7 +256,7 @@ def build_rgb_modal_coordinates_artifact(
         work = Path(temporary)
         np.save(work / "coordinates.npy", coordinates, allow_pickle=False)
         manifest = {
-            "format": RGB_COORDINATES_FORMAT, "version": 1,
+            "format": RGB_COORDINATES_FORMAT, "version": 2,
             "producer": {"project_version": __version__, "created_utc": datetime.now(timezone.utc).isoformat(),
                          "command": list(command)},
             "direct_coordinates": str(direct.path),

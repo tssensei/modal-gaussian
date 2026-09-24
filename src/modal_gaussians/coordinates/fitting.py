@@ -52,8 +52,30 @@ class RGBFitConfig:
         return asdict(self)
 
 
-def _rgb_loss(prediction: Tensor, target: Tensor) -> Tensor:
+def rgb_ssim(prediction, target, valid=None):
     from pytorch_msssim import ssim
+    window = min(11, min(prediction.shape[:2]))
+    window -= 1-window % 2
+    x, y = prediction.permute(2, 0, 1)[None], target.permute(2, 0, 1)[None]
+    if valid is None:
+        return ssim(x, y, data_range=1., size_average=True, win_size=window)
+    from torch.nn import functional as F
+    if valid.shape != prediction.shape[:2] or valid.dtype != torch.bool or not valid.any():
+        raise ValueError('Invalid RGB support mask')
+    coords = torch.arange(window, device=x.device, dtype=x.dtype)-(window-1)/2
+    kernel = torch.exp(-coords.square()/(2*1.5**2)); kernel /= kernel.sum()
+    kernel = (kernel[:, None]*kernel[None, :])[None, None].expand(3, 1, -1, -1)
+    blur = lambda t: F.conv2d(t, kernel, groups=3)
+    ux, uy = blur(x), blur(y)
+    vx, vy, covariance = blur(x*x)-ux*ux, blur(y*y)-uy*uy, blur(x*y)-ux*uy
+    score = ((2*ux*uy+.01**2)*(2*covariance+.03**2))/((ux*ux+uy*uy+.01**2)*(vx+vy+.03**2))
+    support = F.avg_pool2d(valid.to(x.dtype)[None, None], window, stride=1) >= 1-1e-6
+    if not support.any():
+        raise ValueError('No complete valid SSIM windows at this scale')
+    return score.masked_select(support.expand_as(score)).mean()
+
+
+def _rgb_loss(prediction: Tensor, target: Tensor, valid=None) -> Tensor:
 
     if (
         prediction.ndim != 3
@@ -64,16 +86,9 @@ def _rgb_loss(prediction: Tensor, target: Tensor) -> Tensor:
         raise ValueError("RGB-fit render and target must have matching [H>=2, W>=2, 3] shapes")
     if not torch.all(torch.isfinite(target) & (target >= 0.0) & (target <= 1.0)):
         raise ValueError("RGB-fit target must contain finite RGB values in [0, 1]")
-    window = min(11, min(prediction.shape[:2]))
-    window -= 1 - window % 2
-    structural = ssim(
-        prediction.permute(2, 0, 1)[None],
-        target.permute(2, 0, 1)[None],
-        data_range=1.0,
-        size_average=True,
-        win_size=window,
-    )
-    return 0.8 * (prediction - target).abs().mean() + 0.2 * (1.0 - structural)
+    structural = rgb_ssim(prediction, target, valid)
+    delta = (prediction-target).abs()
+    return .8*(delta.mean() if valid is None else delta[valid].mean())+.2*(1-structural)
 
 
 def solve_rgb_coordinates_view(
@@ -87,6 +102,7 @@ def solve_rgb_coordinates_view(
     *,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     render_frame: Callable[[int, Tensor, float], Tensor] | None = None,
+    valid_mask: Callable[[float], Tensor] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Optimize one independently captured sequence with frozen rendering inputs.
 
@@ -148,7 +164,8 @@ def solve_rgb_coordinates_view(
         q = complex_coordinates(value)
         prediction = render(q, scale) if render_frame is None else render_frame(frame, q, scale)
         observed = target(frame, scale).detach().to(device=prediction.device, dtype=prediction.dtype)
-        loss = _rgb_loss(prediction, observed)
+        valid = None if valid_mask is None else valid_mask(scale).to(prediction.device)
+        loss = _rgb_loss(prediction, observed, valid)
         if not torch.isfinite(loss):
             raise ValueError(f"Non-finite RGB-fit loss for frame {frame} at scale {scale}")
         return loss

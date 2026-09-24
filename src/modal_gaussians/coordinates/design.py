@@ -522,7 +522,7 @@ def build_rendered_modal_design_artifact(
     with torch.no_grad():
         for camera, flow, record in zip(cameras, flows, view_records):
             pixels, sampled_alpha, jacobian, visible_count = prepare_modal_projection(
-                scene, camera, flow.arrays.mask_union, settings)
+                scene, camera, flow.arrays.mask_union, settings, flow.arrays.valid_mask)
             record["sample_offset"] = sample_offsets[-1]
             record["sample_count"] = len(pixels)
             record["foreground_gaussians_in_front"] = visible_count

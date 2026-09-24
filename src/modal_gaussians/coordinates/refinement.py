@@ -101,7 +101,7 @@ class RefinementTrainer:
             self.q.extend(torch.nn.Parameter(row.clone()) for row in torch.view_as_real(p).unbind(0))
         self.qopt = [torch.optim.Adam([row], lr=config.coefficient_lr) for row in self.q]
         self.rates = dict(means=config.position_lr, quaternions=config.quaternion_lr,
-            log_scales=config.scale_lr, color_logits=config.color_lr, opacity_logits=config.opacity_lr)
+            log_scales=config.scale_lr, sh_dc=config.color_lr, sh_rest=config.color_lr / 20, opacity_logits=config.opacity_lr)
         self.optimizers = {k: torch.optim.Adam([scene.foreground.params[k]], lr=v) for k,v in self.rates.items()}
         n = scene.foreground.count
         protected = np.zeros(n, bool); protected[field.a["controls"]] = True
@@ -234,7 +234,7 @@ class RefinementTrainer:
         self.baked_fields = None
         return dict(added=added, removed=removed, cancelled_splits=cancelled)
 
-    def update(self, render, target):
+    def update(self, render, target, valid_mask=None):
         if self.step >= self.total_steps:
             raise RuntimeError('Refinement has completed')
         self.enter_phase()
@@ -242,9 +242,9 @@ class RefinementTrainer:
         phase_step = self.step % self.round_steps
         if phase == 'coefficient':
             phase_step -= self.geometry_steps_per_round
-            row = self.coefficient_update(render, target, phase_step)
+            row = self.coefficient_update(render, target, phase_step, valid_mask)
         else:
-            row = self.geometry_update(render, target)
+            row = self.geometry_update(render, target, valid_mask)
         return dict(row, step=self.step, round=round_index, phase=phase, phase_step=phase_step+1,
                     scale=self.config.image_scale, geometry_step=self.geometry_step,
                     coefficient_step=self.coefficient_step,
@@ -254,7 +254,7 @@ class RefinementTrainer:
         c = self.config
         return c.coefficient_lr + self.step / max(1, self.total_steps-1) * (c.coefficient_final_lr-c.coefficient_lr)
 
-    def coefficient_update(self, render, target, phase_step):
+    def coefficient_update(self, render, target, phase_step, valid_mask=None):
         c, part = self.config, self.scene.foreground
         started = time.perf_counter()
         phi, omega = self.frozen_fields()
@@ -269,7 +269,8 @@ class RefinementTrainer:
         q = torch.view_as_complex(self.q[index]) / self.scales[v]
         means, rotations = deform_baked(part.params['means'], part.params['quaternions'], q, phi, omega)
         result, _ = render(v, frame, c.image_scale, means, rotations)
-        rgb_loss = _rgb_loss(result['rgb'], target(v, frame, c.image_scale))
+        rgb_loss = _rgb_loss(result['rgb'], target(v, frame, c.image_scale),
+                             None if valid_mask is None else valid_mask(v, c.image_scale))
         anchor = (self.q[index]-self.q0[index]).square().sum(-1).mean()
         loss = self.weights[v] * (rgb_loss+c.anchor_weight*anchor)
         if not bool(torch.isfinite(loss)):
@@ -293,7 +294,7 @@ class RefinementTrainer:
                     bake_seconds=bake_seconds, query_seconds=0., query_backward_seconds=0.,
                     render_seconds=render_seconds, backward_seconds=backward_seconds)
 
-    def geometry_update(self, render, target):
+    def geometry_update(self, render, target, valid_mask=None):
         c = self.config
         scale = c.image_scale
         fraction = self.geometry_step / max(1, c.rounds*self.geometry_steps_per_round-1)
@@ -318,7 +319,8 @@ class RefinementTrainer:
             started = time.perf_counter()
             rotations = apply_angular_rotation(part.params["quaternions"], render_angular[s])
             result, camera = render(v, frame, scale, render_means[s], rotations)
-            rgb_loss = _rgb_loss(result["rgb"], target(v, frame, scale))
+            rgb_loss = _rgb_loss(result["rgb"], target(v, frame, scale),
+                                 None if valid_mask is None else valid_mask(v, scale))
             anchor = (self.q[index]-self.q0[index]).square().sum(-1).mean()
             loss = (rgb_loss + c.anchor_weight * anchor) * self.weights[v]
             if not bool(torch.isfinite(loss)):
@@ -525,6 +527,11 @@ def refine_scene(*, prepared_dir, work_dir, output_dir, config=RefinementConfig(
         def camera_at(name, scale):
             return scaled_camera(cameras[name], scale)
         image_records = {v["label"]:v for v in manifest["images"]}
+        @lru_cache(maxsize=None)
+        def valid_at(v, scale):
+            from .rgb import load_valid_mask
+            view = manifest['views'][v]
+            return load_valid_mask(image_records[view['label']], view['shape_hw'], scale, device)
         def render(v, frame, scale, means, rotations):
             name = manifest['views'][v]['frames'][frame]['camera_name']
             camera = camera_at(name, scale)
@@ -550,7 +557,7 @@ def refine_scene(*, prepared_dir, work_dir, output_dir, config=RefinementConfig(
         try:
             with (work / "training.jsonl").open("a", encoding="utf-8") as log:
                 while trainer.step < trainer.total_steps:
-                    row = trainer.update(render, target)
+                    row = trainer.update(render, target, valid_at)
                     log.write(json.dumps(row, allow_nan=False)+"\n"); log.flush()
                     if trainer.step % config.checkpoint_interval == 0 or row['phase_boundary']:
                         save()

@@ -36,7 +36,8 @@ GAUSSIAN_FIELDS = (
     "means",
     "quaternions",
     "log_scales",
-    "color_logits",
+    "sh_dc",
+    "sh_rest",
     "opacity_logits",
 )
 
@@ -257,7 +258,8 @@ class GaussianSet(nn.Module):
         means: Tensor,
         quaternions: Tensor,
         log_scales: Tensor,
-        color_logits: Tensor,
+        sh_dc: Tensor,
+        sh_rest: Tensor,
         opacity_logits: Tensor,
     ) -> None:
         """Create a Gaussian parameter set after strict shape validation."""
@@ -267,7 +269,8 @@ class GaussianSet(nn.Module):
             "means": means,
             "quaternions": quaternions,
             "log_scales": log_scales,
-            "color_logits": color_logits,
+            "sh_dc": sh_dc,
+            "sh_rest": sh_rest,
             "opacity_logits": opacity_logits,
         }
         _validate_gaussian_tensors(tensors)
@@ -288,7 +291,7 @@ class GaussianSet(nn.Module):
             "means": self.params["means"],
             "quaternions": F.normalize(self.params["quaternions"], dim=-1),
             "scales": torch.exp(self.params["log_scales"]),
-            "colors": torch.sigmoid(self.params["color_logits"]),
+            "colors": (0.5 + 0.28209479177387814 * self.params["sh_dc"]).clamp_min(0.),
             "opacities": torch.sigmoid(self.params["opacity_logits"]),
         }
 
@@ -328,6 +331,7 @@ class ForegroundBackgroundScene(nn.Module):
         self.foreground = foreground
         self.background = background
         self.manifest = dict(manifest) if manifest is not None else None
+        self.sh_degree = int(manifest["representation"]["sh_degree"]) if manifest else 3
 
     @property
     def count(self) -> int:
@@ -351,6 +355,21 @@ class ForegroundBackgroundScene(nn.Module):
             for name in foreground
         }
 
+    def view_colors(self, cameras: Sequence[Camera], means: Tensor, composition: Composition = "all") -> Tensor:
+        """World-frame SH evaluated along camera-to-current-Gaussian directions.
+
+        Use gsplat's differentiable Torch SH implementation so semantic features
+        can share the same rasterization. Gaussian rotation does not rotate SH.
+        """
+        from gsplat.cuda._torch_impl import _spherical_harmonics
+        parts = (self.foreground, self.background) if composition == "all" else (getattr(self, composition),)
+        coefficients = torch.cat([torch.cat((part.params["sh_dc"][:, None], part.params["sh_rest"]), 1)
+                                  for part in parts])
+        centers = torch.stack([torch.linalg.inv(c.world_to_camera.to(means.device))[:3, 3] for c in cameras])
+        directions = means[None] - centers[:, None]
+        return (_spherical_harmonics(self.sh_degree, directions,
+                coefficients[None].expand(len(cameras), -1, -1, -1)) + 0.5).clamp_min(0.)
+
     def render_batch(
         self,
         cameras: Sequence[Camera],
@@ -370,7 +389,7 @@ class ForegroundBackgroundScene(nn.Module):
             raise ValueError("Foreground-mask rendering requires composition='all'")
         active = self._active_for(composition)
         device = active["means"].device
-        colors = active["colors"]
+        colors = self.view_colors(cameras, active["means"], composition)
         backgrounds = torch.ones((len(cameras), 3), device=device)
         if return_foreground_mask:
             foreground_feature = torch.cat(
@@ -388,7 +407,7 @@ class ForegroundBackgroundScene(nn.Module):
                 ],
                 dim=0,
             )
-            colors = torch.cat([colors, foreground_feature], dim=-1).contiguous()
+            colors = torch.cat([colors, foreground_feature[None].expand(len(cameras), -1, -1)], dim=-1).contiguous()
             backgrounds = torch.cat(
                 [
                     backgrounds,
@@ -526,7 +545,8 @@ class ForegroundBackgroundScene(nn.Module):
             quats=active["quaternions"],
             scales=active["scales"],
             opacities=active["opacities"],
-            colors=active["colors"],
+            colors=(self.view_colors([camera], active["means"], "all" if include_background else "foreground")[0]
+                    if foreground_colors is None else active["colors"]),
             viewmats=camera.world_to_camera.to(device)[None],
             Ks=camera.K.to(device)[None],
             width=camera.width,
@@ -808,6 +828,47 @@ def _read_registered_images_binary(path: Path) -> dict[int, str]:
     if not images:
         raise ValueError(f"COLMAP model contains no registered images: {path}")
     return images
+
+
+def registered_image_points(root: Path, image_name: str):
+    """Read one registered image's authoritative 2D/3D observations and quality."""
+    path = root / 'sparse/0/images.bin'
+    observations = None
+    with path.open('rb') as stream:
+        count, = struct.unpack('<Q', _read_exact(stream, 8, path))
+        for _ in range(count):
+            _read_exact(stream, 64, path)
+            name = _read_c_string(stream, path)
+            n, = struct.unpack('<Q', _read_exact(stream, 8, path))
+            raw = _read_exact(stream, n*24, path)
+            if name == image_name:
+                if observations is not None:
+                    raise ValueError('Duplicate registered reference image')
+                observations = np.frombuffer(raw, dtype=[('xy', '<f8', (2,)), ('id', '<i8')]).copy()
+    if observations is None:
+        raise ValueError(f'Registered image absent from sparse map: {image_name}')
+    wanted = set(observations['id'][observations['id'] >= 0].tolist())
+    found = {}
+    path = root / 'sparse/0/points3D.bin'
+    with path.open('rb') as stream:
+        count, = struct.unpack('<Q', _read_exact(stream, 8, path))
+        for _ in range(count):
+            row = struct.unpack('<QdddBBBdQ', _read_exact(stream, 51, path))
+            _read_exact(stream, row[8]*8, path)
+            if row[0] in wanted:
+                if row[0] in found:
+                    raise ValueError('Duplicate COLMAP point ID')
+                found[row[0]] = row[1:4], row[7], row[8]
+    if wanted != set(found) or not wanted:
+        raise ValueError('Reference observations contain missing or no 3D points')
+    observations = observations[observations['id'] >= 0]
+    ids, pixels = observations['id'], observations['xy']
+    xyz = np.array([found[i][0] for i in ids], np.float64)
+    errors = np.array([found[i][1] for i in ids])
+    lengths = np.array([found[i][2] for i in ids])
+    if not np.isfinite(xyz).all() or not np.isfinite(pixels).all() or not np.isfinite(errors).all():
+        raise ValueError('Non-finite registered background geometry')
+    return ids, pixels, xyz, errors, lengths
 
 
 def _read_points3d_binary(path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -1198,9 +1259,8 @@ def _initialize_gaussian_set(
     *,
     maximum_count: int,
     rng: np.random.Generator,
-    torch_generator: torch.Generator,
 ) -> GaussianSet:
-    """Initialize direct-RGB 3D Gaussians from one classified point subset."""
+    """Initialize SH Gaussians with RMS neighbor scales and identity rotations."""
 
     if maximum_count <= 0:
         raise ValueError("maximum_count must be positive")
@@ -1221,23 +1281,20 @@ def _initialize_gaussian_set(
     distances, _ = ckdtree_type(points).query(
         points, k=neighbor_count, workers=-1
     )
-    if neighbor_count == 2:
-        mean_distance = distances[:, 1]
-    else:
-        mean_distance = distances[:, 1:].mean(axis=1)
-    low, high = np.quantile(mean_distance, [0.05, 0.95])
-    scales = np.clip(mean_distance, low, high)
-    colors = np.clip(colors, 1e-4, 1.0 - 1e-4)
+    scales = np.sqrt(np.maximum(np.square(distances[:, 1:]).mean(axis=1), 1e-7))
+    colors = np.clip(colors, 0.0, 1.0)
     count = len(points)
-    quaternions = torch.rand((count, 4), generator=torch_generator)
+    quaternions = torch.zeros((count, 4))
+    quaternions[:, 0] = 1.0
     return GaussianSet(
         means=torch.from_numpy(points.astype(np.float32)),
         quaternions=quaternions,
         log_scales=torch.from_numpy(
             np.log(scales.astype(np.float32))[:, None].repeat(3, axis=1)
         ),
-        color_logits=torch.logit(torch.from_numpy(colors.astype(np.float32))),
-        opacity_logits=torch.logit(torch.full((count,), 0.7)),
+        sh_dc=(torch.from_numpy(colors.astype(np.float32)) - 0.5) / 0.28209479177387814,
+        sh_rest=torch.zeros((count, 15, 3)),
+        opacity_logits=torch.logit(torch.full((count,), 0.1)),
     )
 
 
@@ -1245,7 +1302,7 @@ def initialize_static_scene(
     dataset: StaticDataset,
     *,
     num_foreground: int = 40_000,
-    num_background: int = 100_000,
+    num_background: int = 80_000,
     seed: int = 42,
 ) -> tuple[ForegroundBackgroundScene, dict[str, int]]:
     """Build independently indexed FG/BG Gaussians from the classified sparse cloud."""
@@ -1253,21 +1310,17 @@ def initialize_static_scene(
     foreground_mask, background_mask, classification = classify_sparse_points(dataset)
     normalized_points = dataset.normalization.normalize_points(dataset.raw_points)
     rng = np.random.default_rng(seed)
-    torch_generator = torch.Generator(device="cpu")
-    torch_generator.manual_seed(seed)
     foreground = _initialize_gaussian_set(
         normalized_points[foreground_mask],
         dataset.point_colors[foreground_mask],
         maximum_count=num_foreground,
         rng=rng,
-        torch_generator=torch_generator,
     )
     background = _initialize_gaussian_set(
         normalized_points[background_mask],
         dataset.point_colors[background_mask],
         maximum_count=num_background,
         rng=rng,
-        torch_generator=torch_generator,
     )
     classification = {
         **classification,
@@ -1287,7 +1340,8 @@ def _validate_gaussian_tensors(tensors: Mapping[str, Tensor]) -> None:
         "means": (count, 3),
         "quaternions": (count, 4),
         "log_scales": (count, 3),
-        "color_logits": (count, 3),
+        "sh_dc": (count, 3),
+        "sh_rest": (count, 15, 3),
         "opacity_logits": (count,),
     }
     if count < 2:
@@ -1327,11 +1381,15 @@ def load_static_scene(
     if not manifest_path.is_file() or not tensors_path.is_file():
         raise FileNotFoundError(f"Incomplete static scene bundle: {path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("format") != "modal_gaussians.static_scene" or manifest.get("version") not in (2, 3, 4):
+    if manifest.get("format") != "modal_gaussians.static_scene" or manifest.get("version") not in (5, 6, 7):
         raise ValueError(f"Unsupported static scene manifest: {manifest_path}")
+    if (manifest["representation"].get("color") != "spherical_harmonics_world"
+            or type(manifest["representation"].get("sh_degree")) is not int
+            or not 0 <= manifest["representation"]["sh_degree"] <= 3):
+        raise ValueError("Static scene requires explicit SH degree 0..3")
     cameras = cameras_from_scene_manifest(manifest)
     # Derived scenes always verify their new tensor and identity-map bindings.
-    validate = validate or manifest["version"] == 4
+    validate = validate or manifest["version"] == 7
     if (not all(c.distortion_applied for c in cameras)
             or manifest["representation"].get("camera_projection") != PROJECTION_CONVENTION):
         raise ValueError("Static scene requires SIMPLE_RADIAL projection; rebuild the static scene")
@@ -1359,16 +1417,17 @@ def load_static_scene(
             "foreground_identity": manifest["foreground_identity"],
             "background_identity": manifest["background_identity"],
             "normalization": manifest["scene_normalization"],
-            "representation": "vanilla_3dgs_direct_rgb",
+            "representation": "vanilla_3dgs_sh3",
         }
+        static_identity_payload["sh_degree"] = manifest["representation"]["sh_degree"]
         static_identity_payload["camera_identities"] = [c.to_manifest_record()["camera_identity"] for c in cameras]
         static_identity_payload["projection_convention"] = PROJECTION_CONVENTION
-        if manifest["version"] == 3:
+        if manifest["version"] == 6:
             from modal_gaussians.geometry.partition import validate_partition_bundle
 
             validate_partition_bundle(path, manifest, loaded)
             static_identity_payload["partition_identity"] = manifest["partition_identity"]
-        if manifest["version"] == 4:
+        if manifest["version"] == 7:
             source = manifest["refinement"]
             if _sha256_file(path / "identity_map.npz") != source["identity_map_sha256"]:
                 raise ValueError("Refined Gaussian identity map checksum differs")

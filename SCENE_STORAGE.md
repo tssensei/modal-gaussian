@@ -55,6 +55,37 @@ The path resolver stays because current immutable data depends on relocation.
 It does not load removed model/flow schemas. [REBUILD.md](REBUILD.md) lists the
 pre-cleanup artifacts that now require new outputs.
 
+## SH static scene artifacts
+
+Current static scene versions are **v5** (trained base), **v6** (repartitioned or
+manually selected), and **v7** (jointly refined). Each partition stores `means`,
+`quaternions`, `log_scales`, `opacity_logits`, `sh_dc [G,3]` and
+`sh_rest [G,15,3]`. The manifest declares `spherical_harmonics_world` and the active
+SH degree (0..3), which also participates in scene identity. Repartitioning and
+density changes preserve/remap every SH row; refined publication preserves degree.
+Static resume v2 binds tensors, optimizers, sampler state, iteration budget and
+training/scene/density implementation hashes. Earlier direct-RGB scenes and resume
+v1 are not current inputs. Preserve them and publish new outputs as described in
+[REBUILD](REBUILD.md); never rewrite their manifests.
+
+## Stabilized recording artifacts
+
+Sequence reference v2 explicitly declares stabilized or tripod capture. Default
+preparation requires a static scene and registered raw reference of matching
+resolution/hash. Its `mask_union.npy` excludes pixels outside `valid_mask.npy`
+(common support). Stabilized sequences v2 own `images/`, `masks/`, `valid/`,
+`geometry.npz` and a manifest under `stabilized_sequence/`. Geometry records contain
+poses, target camera, depth/completion flags, point IDs, holdouts and timestamps.
+Identity binds source pixels, settings/code, static camera/scene and COLMAP hashes.
+Missing pixels remain black and invalid; no source camera/manifest is rewritten.
+
+SEA-RAFT v3 owns time-common trajectory support; spectrum/selected exports v2
+and neural preparation v3 carry it. Fixed RGB coordinates v2 and refinement preparation/coordinates v3 bind
+the common valid-mask path/checksum in each fixed recording's image record.
+Sweep has native full-frame support. Evaluation v2 records support identities and
+rejects comparisons with different supports. Old artifacts remain historical;
+rebuild requirements are in [REBUILD](REBUILD.md).
+
 ## Joint refinement artifacts
 
 ```text
@@ -63,13 +94,13 @@ experiments/NEW_REFINEMENT/
   sweep_coordinates/ # sweep RGB coordinates v1 at 30 FPS; fitted or parent-row subset
   baseline_result/   # original scene, fixed-view + sweep RGB; result v3
   baseline_evaluation/ # explicit native PNG metrics
-  prepared/       # preparation v2; immutable reference.npz, initial.npz, manifest.json
+  prepared/       # preparation v3; immutable reference.npz, initial.npz, manifest.json
   work/           # checkpoint.pt, training.jsonl, run.json, process lock
   refined/
     manifest.json
-    scene/        # static scene v4; tensors.pt and identity_map.npz
+    scene/        # static scene v7; tensors.pt and identity_map.npz
     mode_bank/    # completed modes v19; phi.npy, rotation.npy, support.npz
-    coordinates/  # refined RGB coordinates v2; coordinates.npy
+    coordinates/  # refined RGB coordinates v3; coordinates.npy
   result/         # explicit materialization, modal result v3
   evaluation/     # explicit evaluation, with per-frame CSV
   exports/        # explicit export-video
@@ -95,7 +126,7 @@ neighborhood around their parent. Checkpoint loading and publication reject cent
 outside that bound. A changed fraction or implementation requires a new work
 directory; original graph/path caches remain reusable.
 
-Scene v4 has fresh foreground/tensor identities and ranges, unchanged cameras
+Scene v7 has fresh foreground/tensor identities and ranges, unchanged cameras
 and normalization, and explicit parent-scene/refinement provenance. A parent's
 manual partition remains provenance; it is not a partition of the new rows.
 Mode v19 stores final displacement/angular fields in the new foreground order,

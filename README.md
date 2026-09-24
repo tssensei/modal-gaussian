@@ -25,15 +25,30 @@ CPU alpha/propagation backends, physics-coordinate fitting, preview wrappers and
 old CLI aliases are removed. Existing data was not migrated or deleted during
 cleanup; **the cleaned pipeline has not been rerun on Bush or Corn**.
 
+The accepted stabilization baseline is now **background camera-pose estimation
+against a fixed COLMAP map, followed by depth-aware reprojection to one camera**.
+See [BASELINE](BASELINE.md#video-stabilization-baseline--accepted-2026-09-24).
+`prepare reference --scene STATIC --view LABEL` uses it by default. Only explicitly
+confirmed tripod recordings use `--tripod`. The old `--stabilize` flag and 2D
+homography implementation are removed. The moving sweep remains a COLMAP input.
+The new method requires COLMAP and static-scene depth before stabilized references
+can be produced; [REBUILD](REBUILD.md) records this ordering for the next 540p run.
+
+The static bootstrap now uses a coarse **3,000-update, batch-4 SH** recipe:
+`static train --iterations 3000`. SH grows from degree 0 to 3 and is retained by
+coefficient fitting, refinement and playback. See [BASELINE](BASELINE.md) for
+the author-aligned learning rates/density rules and retained project differences.
+Depth supervision remains disabled. Old direct-RGB scenes require a new static
+run and downstream rebuild; no data is migrated automatically.
+
 ## Pipeline and source map
 
 ```text
 Sweep + fixed-view videos
-  -> frames / masks / optional stabilization -> sequence references
-  -> COLMAP + static 3DGS + subject partition
-       |                       |
-       |                       -> reusable observation geometry + KNN candidates
-       -> render-matched motion references -> SEA-RAFT flow
+  -> raw frames / masks -> COLMAP + static 3DGS + subject partition
+       -> background poses + depth stabilization (explicit tripod bypass)
+           -> sequence references + reusable observation geometry / KNN
+           -> render-matched motion references -> SEA-RAFT flow
            -> shared FFT -> select bins -> complex U/V modal images
                -> per-frequency complex view gains + soft graph weights
                -> controls + GNN -> saved complex 3D displacement / angular fields

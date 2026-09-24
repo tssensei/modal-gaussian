@@ -1,12 +1,38 @@
 # Cleanup and required rebuilds — 2026-09-23
 
+## SH coarse bootstrap — 2026-09-24
+
+This supersedes the direct-RGB scene versions mentioned in historical sections
+below. Static training now uses 3,000 updates at batch 4 by default (`--iterations`,
+not `--epochs`), author-aligned coarse learning rates/density control and world-frame
+SH up to degree 3. Depth loss is still disabled. See BASELINE for the complete recipe.
+The batch-size change changes the resolved training contract; batch-1 checkpoints
+cannot resume under the new default. No training was launched by this adjustment.
+
+| Stage / artifact | Required action |
+| --- | --- |
+| Raw recordings, native frames/masks, COLMAP | Reusable if resolution, masks and camera contract are unchanged. The planned 540p run still needs matching 540p inputs/cameras. |
+| Static scene and resume | New static v5 and resume v2; old v2/v3/v4 scenes and v1 checkpoints are not loaded or converted. Use new work/output directories. |
+| Subject partition | Recreate for new Gaussian order, producing v6; old selections bind the old scene. |
+| Stabilization / render-matched references / flow / FFT | Rebuild: static depth, rendered reference and scene identities change. Raw frame timing is unchanged. |
+| Geometry/KNN, modal preparation/weights, modes, mode bank | Rebuild against new Gaussian identities/order and observations. |
+| Coefficients, refinement reference/preparation/checkpoint | Refit/reprepare in new directories; SH and source identities change. No cross-implementation resume. |
+| Refinement publication | Scene v7 with SH, modes v19 and current refined coordinates; identities regenerated. |
+| Results, evaluation, video and viewer projection caches | Recreate from new ancestors when explicitly requested; preserve frozen historical baselines. |
+
+No published source, catalog entry or experiment was modified by this code change.
+The fixed-mode fitter freezes SH; shared refinement optimizes foreground SH only.
+Synthetic checks cover view-dependent colors and position gradients, static versus
+deformed rendering, SH row/moment preservation and exact-update recovery. A real
+540p run and quality/timing comparison remain unperformed.
+
 ## Next experiment decision — 2026-09-24 (not started)
 
 The user accepted the visual quality of the Bush 540p input previews. The next
 experiment should rerun the full pipeline from the beginning with 960x540 inputs
 for sweep and fixed-view recordings, recording each stage's elapsed time and the
-total runtime. Keep the current 30 FPS reconstruction convention; this decision
-changes input resolution, not frame timing or the numerical recipe.
+total runtime. Keep the current 30 FPS reconstruction convention. The separately
+accepted stabilization change below also applies to that future run.
 
 Preview sources/results: `scene_library/bush/experiments/input_resolution_preview_20260924_001/`.
 These MP4s are visual previews, not replacement training inputs: prepare fresh
@@ -15,6 +41,40 @@ Create new resolution-bound artifacts/caches and preserve all existing inputs,
 experiments and frozen baselines. Record reused inputs and excluded work when
 reporting timing. This is a pending plan, not an executed or validated 540p run.
 Do not start preparation, training or downstream stages until explicitly requested.
+
+## Stabilization replacement — 2026-09-24 (implemented; real rerun pending)
+
+Use the [new stabilization baseline](BASELINE.md#video-stabilization-baseline--accepted-2026-09-24)
+for future fixed-view recordings: fixed-map background PnP poses plus static-depth
+reprojection, with sparse background depth completion. The user accepted the Bush
+view1 preview in `pose_stabilized_view1_540p_20260924_001`; its inputs and the
+`background_pose_view1_540p_20260924_001` pose experiment remain preserved.
+The old homography implementation and `--stabilize` flag are removed. Default
+preparation requires `--scene STATIC --view LABEL`; only explicit tripod recordings
+use `--tripod`. No catalog has been redirected.
+
+- Required ordering: raw frames/masks -> sweep COLMAP including raw fixed-view
+  reference images -> initial static 3DGS -> per-recording poses and target depth
+  -> stabilized lossless frames/masks/validity and fixed target camera -> motion
+  references, flow, FFT and downstream motion/reconstruction stages. Keep the
+  moving sweep on its own calibrated per-frame cameras; do not stabilize it into
+  a fixed-view modal observation. Report reused geometry explicitly in timing.
+- New references bind poses, intrinsics/distortion, depth and its completion,
+  source frame hashes, target camera, masks and validity into the new cache
+  identity. Do not train on black missing pixels as if they were observations;
+  define valid support consistently for flow, RGB losses and evaluation.
+- Changed stabilized pixels/camera bindings require new sequence references,
+  flow, FFT/modal images, modes/projections, coefficients and result/evaluation
+  products. Reuse static/control geometry only where its own contracts match.
+  Preserve old results as historical baselines; never relabel their inputs.
+- New contracts: reference/stabilized sequence v2, SEA-RAFT v3, shared spectrum
+  and selected-frequency export v2, neural preparation v3, fixed RGB coordinates v2, refinement
+  preparation/coordinates v3, evaluation v2. Rebuild into new outputs; no manifest
+  relabeling or old-format compatibility reader is provided. Geometry preparation
+  now stores valid masks/sample validity, so rebuild it against new references.
+- Changed training code identity invalidates old checkpoints; use new work
+  directories. Synthetic checks do not constitute real-scene validation. The full
+  540p rerun remains stopped until explicitly requested.
 
 ## Viewer-only update
 
@@ -38,7 +98,7 @@ experiment was run to validate the cleaned pipeline. Synthetic checks are develo
   lists missing videos, replays each saved network once and checks field equivalence.
   It never automatically fits missing coordinates or retrains upstream modes.
 - Density changes create scene v4, completed modes v19 and refined coordinates
-  v2. Existing linear designs cannot be relabeled for the new Gaussian order.
+  v3 (including valid image support). Existing linear designs cannot be relabeled for the new Gaussian order.
   Refined playback/export use the final baked fields, without rebuilding ridge designs.
 - `modal_result` is now v3. Rematerialize existing supported scene/mode/coordinate
   combinations into new directories; no result-v1/v2 reader is retained. Existing MP4s remain historical
@@ -73,18 +133,17 @@ cherry-picking the relevant changes with their dependencies.
 | Sequence reference | `sequence_reference` v1 | New lightweight metadata/mask union; replaces `flow_analysis` reference artifacts. |
 | Static scene | v2/v3 with SIMPLE_RADIAL projection | Retain supported scenes; pinhole-only static bundles require retraining. |
 | Motion reference selection | v1 bound to new reference identity | Select again for the current static scene/grid. |
-| SEA-RAFT flow | v2 with explicit selection binding | Recompute into new directories. |
+| SEA-RAFT flow | v3 with selection and valid-support binding | Recompute into new directories. |
 | Shared FFT and selected modal images | current transform + new flow/reference identities | Rebuild after flow; export exact bins. |
-| Geometry/prepared observations | `neural_prepared` v2; KNN cache v2 | Rebuild directly from static scene and references. No old observed graph is required. |
+| Geometry/prepared observations | `neural_prepared` v3; KNN cache v2 | Rebuild directly from static scene and references. No old observed graph is required. |
 | Per-frequency soft graph | `modal_similarity_graph` v2 | Rebuild for the matching prepared frequency. |
 | Controls/alpha/work checkpoints | current input/code contracts | Rebuild; pre-cleanup checkpoints cannot resume into this implementation. |
 | Single-frequency completed mode | v18, baked angular/control fields | Retrain; readers reject the old schemas. |
 | Mode bank, design, direct/RGB coordinates, bound result/video | existing formats with new source identities | Rebuild downstream of the new modes. |
 
-To reuse already stabilized pixels, point `prepare reference --images ... --masks ...`
-at those PNG directories, specify the original FPS/reference frame, and omit
-`--stabilize`. This creates a new reference without decoding an old flow format.
-It does not reuse old downstream flow/FFT identities.
+The stabilization replacement supersedes reuse of old stabilized PNGs as new
+references: prepare from raw registered inputs using the current method. Preserve
+historical stabilized pixels and their baselines without relabeling them.
 
 ## Bush and Corn
 
