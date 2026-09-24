@@ -1,8 +1,4 @@
-"""Low-level geometry sampling, retaining each pipeline's original precision.
-
-The original rigid sampler rounds weights to float32; the neural depth sampler
-preserves float64. They remain explicit separate functions for compatibility.
-"""
+"""Projection and bilinear sampling with explicit caller-specific precision."""
 from __future__ import annotations
 
 import numpy as np
@@ -22,7 +18,7 @@ def project_points(
     camera = homogeneous @ np.asarray(world_to_camera, dtype=np.float64).T
     z = camera[:, 2]
     if radial_k:
-        from modal_gaussians.camera_geometry import project_camera
+        from modal_gaussians.common.camera_geometry import project_camera
         return project_camera(camera[:, :3], K, radial_k).astype(np.float32), z.astype(np.float32)
     x = float(K[0, 0]) * camera[:, 0] / z + float(K[0, 2])
     y = float(K[1, 1]) * camera[:, 1] / z + float(K[1, 2])

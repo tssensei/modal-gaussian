@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import json
-from modal_gaussians.scene_store import resolve_path
+from modal_gaussians.common.scene_store import resolve_path
 
 import numpy as np
 import torch
 
-from modal_gaussians.iteration_cache import identity, load_entry
-from modal_gaussians.motion.neural.geometry_graph import GeometryGraph
-from modal_gaussians.static import load_static_scene, cameras_from_scene_manifest, _load_gsplat_rasterization
+from modal_gaussians.common.cache import identity, load_entry
+from modal_gaussians.motion.geometry_graph import GeometryGraph
+from modal_gaussians.geometry.scene import load_static_scene, cameras_from_scene_manifest, _load_gsplat_rasterization
 from modal_gaussians.vis.viewer import ModalViserViewer, ViewerCamera, _component_colors, _stable_uniform_indices
 
 
@@ -86,8 +86,8 @@ class GraphViewerData:
         self.is_soft_graph = self.is_similarity_graph and manifest["config"]["modal_similarity"].get("soft_weights", False)
         self.graph_edge_factor = None
         status = None
-        if manifest.get("format") in ("modal_gaussians.modal_gradient_graph", "modal_gaussians.modal_similarity_graph"):
-            if manifest.get("version") != 1 or manifest.get("graph_file") != "graph.npz":
+        if self.is_similarity_graph:
+            if manifest.get("version") != 2 or manifest.get("graph_file") != "graph.npz":
                 raise ValueError("Unsupported modal graph artifact")
             if manifest.get("foreground_identity") != self.scene.manifest["foreground_identity"]:
                 raise ValueError("Modal graph does not belong to this scene's foreground")
@@ -103,7 +103,7 @@ class GraphViewerData:
             self.graph_config = manifest["config"]
         else:
             contract = manifest.get("contract", {})
-            if (contract.get("implementation") != "neural_geometry_cache_v1"
+            if (contract.get("implementation") != "neural_geometry_cache_v2"
                     or contract.get("foreground") != self.scene.manifest["foreground_identity"]):
                 raise ValueError("Geometry cache does not belong to this scene's foreground")
             if path.name != identity(contract):

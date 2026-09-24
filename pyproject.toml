@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = [
   "gsplat==1.5.3",
+  "cupy-cuda12x>=14.2",
   "numpy>=2.0",
   "opencv-python-headless>=4.8",
   "pytorch-msssim>=1.0",
@@ -24,7 +25,6 @@ dependencies = [
 modal-gaussians = "modal_gaussians.cli:main"
 
 [project.optional-dependencies]
-gpu-propagation = ["cupy-cuda12x>=14.2"]
 mask = [
   "gradio==6.21.0",
   "torchvision==0.22.1+cu128",

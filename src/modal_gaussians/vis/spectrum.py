@@ -12,9 +12,9 @@ import numpy as np
 import viser
 import viser.uplot
 
-from modal_gaussians.iteration_cache import identity
-from modal_gaussians.scene_store import resolve_path
-from modal_gaussians.spectrum_cache import load_spectrum, read_curves, read_region
+from modal_gaussians.common.cache import identity
+from modal_gaussians.common.scene_store import resolve_path
+from modal_gaussians.spectrum.cache import load_spectrum, read_curves, read_region
 from modal_gaussians.vis.projections import ViewerProjections
 
 PREVIEW_PERCENTILE = 99.0
@@ -84,7 +84,6 @@ class SpectrumComparisonController:
         self._alphas = np.zeros((len(self.frequencies_hz), len(self.design_views)), np.complex64)
         self._identifiable = np.zeros(self._alphas.shape, bool)
         self.cache = None
-        self._reference_images = {}
         for k, mode in enumerate(result.modes):
             model, slot, arrays = mode.artifact.manifest, mode.slot, mode.artifact.arrays
             alphas, identifiable = arrays["alphas"][slot], arrays["alpha_identifiable_mask"][slot]
@@ -99,8 +98,7 @@ class SpectrumComparisonController:
                 selected = view["selected_source"]
                 exported = mode.exports[label]
                 if (identity(exported) != selected["manifest_identity"]
-                        or exported.get("format") not in ("modal_gaussians.spectrum_selected_frequency",
-                            "modal_gaussians.sea_raft_selected_frequency_experiment")
+                        or exported.get("format") != "modal_gaussians.spectrum_selected_frequency"
                         or exported.get("status") != "complete"):
                     raise ValueError("Modal image must bind a complete selected-frequency export")
                 motion_reference = design_view.get("motion_reference", {
@@ -113,30 +111,21 @@ class SpectrumComparisonController:
                         or exported["fps_hz"] != design_view["fps_hz"]
                         or exported["modes_shape"] != [1, *design_view["shape_hw"], 2]):
                     raise ValueError("Modal export frequency, reference timing or shape differs")
-                if exported["format"] == "modal_gaussians.spectrum_selected_frequency":
-                    if self._reference_images:
-                        raise ValueError("Cannot mix shared FFT and selected-only sources")
-                    grid = exported["spectrum_source"]
-                    if self.cache is None:
-                        self.cache = load_spectrum(grid["path"])
-                    if (grid["identity"] != self.cache.manifest["spectrum_identity"]
-                            or resolve_path(grid["path"]) != self.cache.path
-                            or grid["fft_length"] != self.cache.manifest["fft_length"]):
-                        raise ValueError("Modal images must share the exact saved FFT cache")
-                    index = grid["bin_index"]
-                    if (type(index) is not int or not 0 <= index < len(self.cache.frequencies)
-                            or not math.isclose(self.cache.frequencies[index], self.frequencies_hz[k], rel_tol=0, abs_tol=1e-9)):
-                        raise ValueError("Modal frequency is not its exact shared FFT bin")
-                    cache_view = next(item for item in self.cache.manifest["views"] if item["label"] == label)
-                    if (resolve_path(exported["source_flow_path"]) != resolve_path(cache_view["source_path"])
-                            or exported["frames"] != cache_view["source_manifest"]["frames"]):
-                        raise ValueError("Spectrum/export reference timing or source differs")
-                else:
-                    if self.cache is not None:
-                        raise ValueError("Cannot mix shared FFT and selected-only sources")
-                    reference = resolve_path(exported["reference_image"], strict=True)
-                    if self._reference_images.setdefault(label, reference) != reference:
-                        raise ValueError("Selected modal reference images differ")
+                grid = exported["spectrum_source"]
+                if self.cache is None:
+                    self.cache = load_spectrum(grid["path"])
+                if (grid["identity"] != self.cache.manifest["spectrum_identity"]
+                        or resolve_path(grid["path"]) != self.cache.path
+                        or grid["fft_length"] != self.cache.manifest["fft_length"]):
+                    raise ValueError("Modal images must share the exact saved FFT cache")
+                index = grid["bin_index"]
+                if (type(index) is not int or not 0 <= index < len(self.cache.frequencies)
+                        or not math.isclose(self.cache.frequencies[index], self.frequencies_hz[k], rel_tol=0, abs_tol=1e-9)):
+                    raise ValueError("Modal frequency is not its exact shared FFT bin")
+                cache_view = next(item for item in self.cache.manifest["views"] if item["label"] == label)
+                if (resolve_path(exported["source_flow_path"]) != resolve_path(cache_view["source_path"])
+                        or exported["frames"] != cache_view["source_manifest"]["frames"]):
+                    raise ValueError("Spectrum/export reference timing or source differs")
                 image_path = resolve_path(view["modes_file"], strict=True)
                 if image_path != resolve_path(selected["path"]) / exported["modes_file"]:
                     raise ValueError("Modal image path differs from its export")
@@ -148,9 +137,8 @@ class SpectrumComparisonController:
         self._states = {}
         self.component_index = self.reconstructed_index = 0
         self.amplitude_normalization = "per mode"
-        self.full_spectrum_available = self.cache is not None
-        self.image_regions = (("Cached region", "Model support") if self.full_spectrum_available
-                              else ("Model support", "Full image"))
+        self.full_spectrum_available = True
+        self.image_regions = (('Cached region', 'Model support'))
         self.original_image_region = self.image_regions[0]
         self.select_view(self.available_view_ids[0])
 
@@ -181,34 +169,27 @@ class SpectrumComparisonController:
         raw = self._raw(label, k, value.pixels)
         projected = self._projection(state.index, k)
         state.reconstructed_power[k] = np.linalg.norm(projected, axis=1).mean()
-        if not self.full_spectrum_available:
-            state.raw_power[k] = np.linalg.norm(raw, axis=1).mean()
         state.magnitude_hi[:] = np.maximum(state.magnitude_hi,
             np.percentile(np.concatenate((np.abs(raw), np.abs(projected))), PREVIEW_PERCENTILE, axis=0))
 
     def _prepare_view(self, label):
         v = self.available_view_ids.index(label)
         h, w = self.design_views[v]["shape_hw"]
-        if self.full_spectrum_available:
-            cache_index = next(i for i, item in enumerate(self.cache.manifest["views"]) if item["label"] == label)
-            record = self.cache.manifest["views"][cache_index]
-            y, x = np.nonzero(read_region(self.cache, cache_index, "selected_box"))
-            selection = np.column_stack((x, y))
-            reference_path = resolve_path(self.cache.path / record["reference_image"], strict=True)
-        else:
-            selection = np.empty((0, 2), np.int64)
-            reference_path = self._reference_images[label]
+        cache_index = next(i for i, item in enumerate(self.cache.manifest["views"]) if item["label"] == label)
+        record = self.cache.manifest["views"][cache_index]
+        y, x = np.nonzero(read_region(self.cache, cache_index, "selected_box"))
+        selection = np.column_stack((x, y))
+        reference_path = resolve_path(self.cache.path / record["reference_image"], strict=True)
         reference = cv2.imread(str(reference_path))
         if reference is None or reference.shape != (h, w, 3):
             raise ValueError("Cached spectrum reference image has invalid dimensions")
-        f = self.cache.frequencies if self.full_spectrum_available else self.frequencies_hz
+        f = self.cache.frequencies
         spacing = float(np.min(np.diff(np.sort(f)))) if len(f) > 1 else max(float(abs(f[0])), 1e-3)
         margin = 0.05 * max(float(np.ptp(self.frequencies_hz)), spacing)
         limits = (max(0., float(self.frequencies_hz.min()) - margin), float(self.frequencies_hz.max()) + margin)
         raw_power = np.full(len(f), np.nan, np.float32)
-        if self.full_spectrum_available:
-            raw_power = read_curves(self.cache, cache_index)["selected_box"]
-            limits = (max(float(f[0]), limits[0]), min(float(f[-1]), limits[1]))
+        raw_power = read_curves(self.cache, cache_index)["selected_box"]
+        limits = (max(float(f[0]), limits[0]), min(float(f[-1]), limits[1]))
         empty = np.empty((0, 2), np.int64)
         return SpectrumViewState(v, label, empty, cv2.cvtColor(reference, cv2.COLOR_BGR2RGB), f,
             raw_power, np.full(len(self.frequencies_hz), np.nan, np.float32), self._alphas[:, v],
@@ -361,8 +342,7 @@ class SpectrumComparisonController:
             f"**Component:** {'U' if c == 0 else 'V'}  \n"
             f"**Projections available:** {count}/{len(self.frequencies_hz)}. Missing frequencies are gaps.  \n"
             "**Projection:** fixed 3D mode with saved training view alignment; no display refit.  \n"
-            + ("**Curve regions:** input = cached analysis region; projection = per-mode model-support samples.  \n"
-               if self.full_spectrum_available else "**Curve regions:** input and projection use each mode's support samples.  \n")
+            + ('**Curve regions:** input = cached analysis region; projection = per-mode model-support samples.  \n')
             + (f"**Projection failed:** {error}" if error else ("" if ready else "**Projection pending.**"))
             + ("" if self.state.alpha_identifiable[k] else "  \n**Projection unavailable:** saved view alignment is unidentifiable.")
             + ("  \n**Shared brightness pending:** waiting for all frequencies." if
@@ -434,8 +414,8 @@ class ModalSpectrumPanel:
         )
         self.frequency_range = server.gui.add_dropdown(
             "Frequency range",
-            options=(("full spectrum", "selected modes") if controller.full_spectrum_available else ("selected modes",)),
-            initial_value="full spectrum" if controller.full_spectrum_available else "selected modes",
+            options=(('full spectrum', 'selected modes')),
+            initial_value='full spectrum',
         )
         self.component = server.gui.add_dropdown(
             "Modal image component",
@@ -473,14 +453,9 @@ class ModalSpectrumPanel:
             self._refresh()
         self.status = server.gui.add_markdown(controller.status)
         server.gui.add_markdown(
-            "Input: saved full FFT curve over its cached analysis region. "
-            "Projection: saved frequencies on model-support pixels, with training alignment. "
-            "This is a modal projection, not a coefficient-video FFT."
-            if controller.full_spectrum_available else
-            "Only saved input frequencies are shown. Input and projection curves share model-support pixels. "
-            "The images use saved training alignment; no full spectrum is computed."
+            'Input: saved full FFT curve over its cached analysis region. Projection: saved frequencies on model-support pixels, with training alignment. This is a modal projection, not a coefficient-video FFT.'
         )
-        self._raw_title = "Original spectrum" if controller.full_spectrum_available else "Saved input frequencies"
+        self._raw_title = 'Original spectrum'
         maximum = self._shared_power_max()
         frequency = float(controller.frequencies_hz[controller.reconstructed_index])
         self.raw_plot, self.reconstructed_plot = (
@@ -562,7 +537,7 @@ class ModalSpectrumPanel:
         c = self.controller
         return (
             (c.raw_frequencies_hz, c.raw_power,
-             "Cached-region mean amplitude" if c.full_spectrum_available else "Model-support input amplitude",
+             'Cached-region mean amplitude',
              "#4c9aff", f"{self._raw_title} · {c.view_id}"),
             (c.frequencies_hz, c.reconstructed_power, "Model-support projected amplitude",
              "#ff9f43", f"Projected modes {c.view_id} spectrum"),

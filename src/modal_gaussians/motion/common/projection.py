@@ -7,7 +7,7 @@ from typing import Any
 import cv2
 import numpy as np
 import torch
-from modal_gaussians.static import Camera, ForegroundBackgroundScene
+from modal_gaussians.geometry.scene import Camera, ForegroundBackgroundScene
 
 @dataclass(frozen=True)
 class RenderedDesignConfig:
@@ -102,7 +102,7 @@ def projection_jacobian(
         raise ValueError("Foreground Gaussian camera coordinates are non-finite")
     visible = camera_points[:, 2] > 1.0e-8
     if radial_k < 0:
-        from modal_gaussians.camera_geometry import radial_domain
+        from modal_gaussians.common.camera_geometry import radial_domain
         visible &= radial_domain(camera_points, radial_k)
     jacobian = np.zeros((len(values), 2, 3), dtype=np.float64)
     if np.any(visible):
@@ -115,7 +115,7 @@ def projection_jacobian(
         camera_jacobian[:, 1, 1] = float(K[1, 1]) / z
         camera_jacobian[:, 1, 2] = -float(K[1, 1]) * y / (z * z)
         if radial_k:
-            from modal_gaussians.camera_geometry import camera_jacobian as radial_jacobian
+            from modal_gaussians.common.camera_geometry import camera_jacobian as radial_jacobian
             camera_jacobian = radial_jacobian(camera_points[visible], K, radial_k)
         jacobian[visible] = np.einsum(
             "nij,jk->nik", camera_jacobian, w2c[:3, :3]

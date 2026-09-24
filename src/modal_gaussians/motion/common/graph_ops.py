@@ -1,7 +1,7 @@
 """Induced geometry subgraphs, independent of motion strategy."""
 from dataclasses import replace
 import numpy as np
-from ..neural.geometry_graph import GeometryGraph, _components
+from modal_gaussians.motion.geometry_graph import GeometryGraph, _components
 
 def host_subgraph(graph: GeometryGraph, host_indices: np.ndarray) -> GeometryGraph:
     """An induced union of complete host components, with local index domains."""
@@ -22,4 +22,3 @@ def host_subgraph(graph: GeometryGraph, host_indices: np.ndarray) -> GeometryGra
                    degree=degree, component_index=component, component_size=sizes,
                    candidate_edge_index=inverse[graph.candidate_edge_index[candidate_keep]],
                    candidate_view_evidence=graph.candidate_view_evidence[candidate_keep])
-

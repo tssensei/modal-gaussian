@@ -4,8 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
-from pathlib import Path
-from modal_gaussians.scene_store import resolve_path
+from modal_gaussians.common.scene_store import resolve_path
 import sys
 import time
 
@@ -14,9 +13,9 @@ import numpy as np
 import torch
 
 from modal_gaussians.flow.storage import create_array
-from modal_gaussians.iteration_cache import atomic_json
-from modal_gaussians.modes import TRANSFORM_CONVENTION
-from modal_gaussians.progress import Progress, report_progress
+from modal_gaussians.common.cache import atomic_json
+from modal_gaussians.spectrum.modes import TRANSFORM_CONVENTION
+from modal_gaussians.common.progress import Progress, report_progress
 
 FORMAT = "modal_gaussians.sea_raft_flow"
 
@@ -41,46 +40,40 @@ def load_model(repo, weights):
     return RAFT.from_pretrained(str(weights), args=config).cuda().eval()
 
 
-def compute_flow(*, images, reuse_stabilization, output_dir, sea_raft_repo, model_dir, command=None,
-                 reference_selection=None):
-    """Reuse timing/reference metadata and stabilized RGBs, never old flow or masks.
-
-    The source is the existing geometry preparation's flow manifest. Its arrays
-    are not read; this keeps the same camera/reference contract as saved prepared
-    artifacts without running the legacy estimator or a frequency transform.
-    """
+def compute_flow(*, images, reference, output_dir, sea_raft_repo, model_dir, command=None,
+                 reference_selection):
+    """Compute flow using the selected reference on the prepared pixel grid."""
     started = time.perf_counter()
     from modal_gaussians.flow.reference_selection import sequence_metadata, reference_binding, motion_reference
 
     output = resolve_path(output_dir)
     if output.exists():
         raise FileExistsError(f"Choose a new flow output directory: {output}")
-    seq = sequence_metadata(reuse_stabilization, images)
+    seq = sequence_metadata(reference, images)
     source, previous, images = seq["source"], seq["root"], seq["images"]
     names, fps, reference_index = seq["names"], seq["fps"], seq["reference"]
     image_dir = seq["image_dir"]
     stable_record = source.get("stabilized_sequence")
     binding = None
-    if reference_selection is not None:
-        selection_path = resolve_path(reference_selection, strict=True)
-        selected = json.loads((selection_path / "manifest.json").read_text(encoding="utf-8"))
-        binding = reference_binding(selected)
-        contract = binding["contract"]
-        _, reference_index = motion_reference({
-            "reference_frame_name": contract["reference_frame_name"],
-            "reference_frame_index": contract["reference_frame_index"],
-            "reference_selection": binding}, source)
+    selection_path = resolve_path(reference_selection, strict=True)
+    selected = json.loads((selection_path / "manifest.json").read_text(encoding="utf-8"))
+    binding = reference_binding(selected)
+    contract = binding["contract"]
+    _, reference_index = motion_reference({
+        "reference_frame_name": contract["reference_frame_name"],
+        "reference_frame_index": contract["reference_frame_index"],
+        "reference_selection": binding}, source)
     reference_path = image_dir / (names[reference_index] + ".png")
     reference_cpu = read_image(reference_path)
     height, width = reference_cpu.shape[-2:]
-    if [height, width] != source["arrays"]["flow"]["shape"][1:3]:
+    if [height, width] != source["shape_hw"]:
         raise ValueError("Reference dimensions differ from source metadata")
     if not torch.cuda.is_available():
         raise RuntimeError("SEA-RAFT inference requires CUDA")
     model = load_model(sea_raft_repo, model_dir)
     shape = (len(names), height, width, 2)
     manifest = {
-        "format": FORMAT, "version": 1, "status": "running",
+        "format": FORMAT, "version": 2, "status": "running",
         "created_utc": datetime.now(timezone.utc).isoformat(), "command": command,
         "images": str(images), "stabilization_source": str(previous),
         "stabilized_images": str(image_dir) if stable_record is not None else None,
@@ -94,9 +87,8 @@ def compute_flow(*, images, reuse_stabilization, output_dir, sea_raft_repo, mode
                   "repository": str(resolve_path(sea_raft_repo)),
                   "config": vars(model.args), "native_resolution": True},
     }
-    if binding is not None:
-        manifest["reference_selection"] = binding
-        manifest["reference_selection_path"] = str(selection_path)
+    manifest["reference_selection"] = binding
+    manifest["reference_selection_path"] = str(selection_path)
     output.mkdir(parents=True, exist_ok=False)
     atomic_json(output / "manifest.json", manifest)
     flow = None

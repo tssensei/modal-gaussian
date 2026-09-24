@@ -3,7 +3,7 @@ import numpy as np
 
 def observation_inputs(points, cameras, depths, alphas, tolerances, alpha_minimum):
     """Freeze center visibility and the same Jacobian used by full-image training."""
-    from modal_gaussians.camera_geometry import project_camera
+    from modal_gaussians.common.camera_geometry import project_camera
     from modal_gaussians.motion.common.projection import projection_jacobian
     points = np.asarray(points, np.float64)
     visible = np.zeros((len(points), len(cameras)), bool)
@@ -25,4 +25,3 @@ def observation_inputs(points, cameras, depths, alphas, tolerances, alpha_minimu
             & (np.abs(xyz[rows, 2]-depth) <= tolerances[v])
             & (alphas[v][xy[rows, 1], xy[rows, 0]] >= alpha_minimum))
     return {"h_surface_visible": visible, "h_view_jacobian": np.stack(jacobians).astype(np.float32)}
-

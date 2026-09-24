@@ -45,4 +45,3 @@ def assign_points(points, component, sources, targets, neighbors):
         ids[rows, :len(chosen[0])] = chosen
         weights[rows, :len(chosen[0])] = raw
     return ids, weights, owner
-

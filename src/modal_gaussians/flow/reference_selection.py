@@ -1,53 +1,38 @@
 """Choose a motion reference on the fixed camera grid, independently of geometry."""
 from concurrent.futures import ThreadPoolExecutor
 import csv
-import json
-from pathlib import Path
 import time
 
 import cv2
 import numpy as np
 
-from modal_gaussians.iteration_cache import atomic_json, identity
-from modal_gaussians.progress import report_progress
-from modal_gaussians.scene_store import resolve_path
+from modal_gaussians.common.cache import atomic_json, identity
+from modal_gaussians.common.progress import report_progress
+from modal_gaussians.common.scene_store import resolve_path
 
 FORMAT = "modal_gaussians.motion_reference_selection"
 KERNEL = np.ones((3, 3), np.uint8)
 
 
-def sequence_metadata(reuse_stabilization, images=None):
-    """Read timing and the existing pixel grid; never re-anchor stabilization."""
-    root = resolve_path(reuse_stabilization, strict=True)
-    source = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    if source.get("format") != "modal_gaussians.flow_analysis" or source.get("version") not in (6, 7):
-        raise ValueError("Expected an existing geometry preparation flow manifest")
-    sequence = source["inputs"]["sequence"]
-    raw = resolve_path(sequence["image_directory"], strict=True)
+def sequence_metadata(reference_dir, images=None):
+    from modal_gaussians.preprocessing.reference import load_reference
+    reference = load_reference(reference_dir)
+    root, source = reference.path, reference.manifest
+    raw = resolve_path(source['inputs']['sequence']['image_directory'], strict=True)
     if images is not None and resolve_path(images) != raw:
-        raise ValueError("Images differ from the recorded sequence")
-    names, fps, reference = source["frame_names"], float(source["fps_hz"]), source["reference_frame_index"]
-    if (len(names) < 3 or len(set(names)) != len(names) or not np.isfinite(fps) or fps <= 0
-            or any(not isinstance(n, str) or not n or Path(n).name != n or n in (".", "..") for n in names)
-            or type(reference) is not int or not 0 <= reference < len(names)
-            or names[reference] != source["reference_frame_name"]
-            or sorted(p.stem for p in raw.glob("*.png")) != names):
-        raise ValueError("Invalid sequence timing, reference, or frame names")
-    image_dir = raw
-    mask_dir = resolve_path(sequence["mask_directory"]) if sequence.get("mask_directory") else None
-    stable_record = source.get("stabilized_sequence")
-    if stable_record is not None:
-        stable_root = (root / stable_record["path"]).resolve()
-        if not stable_root.is_relative_to(root):
-            raise ValueError("Stabilized sequence must be inside its source artifact")
-        stable = json.loads((stable_root / "manifest.json").read_text(encoding="utf-8"))
-        if (names != stable["frames"] or stable["reference_frame"] != names[reference]
-                or float(stable["fps_hz"]) != fps):
-            raise ValueError("Stabilized sequence metadata differs from its source")
-        image_dir, mask_dir = stable_root / "images", stable_root / "masks"
+        raise ValueError('Images differ from the recorded sequence')
+    if source['stabilized_sequence'] is not None:
+        image_dir, mask_dir = root / 'stabilized_sequence/images', root / 'stabilized_sequence/masks'
+    else:
+        image_dir = raw
+        mask_dir = resolve_path(source['inputs']['sequence']['mask_directory'], strict=True)
+    names = source['frame_names']
+    if (sorted(p.stem for p in image_dir.glob('*.png')) != names
+            or sorted(p.stem for p in mask_dir.glob('*.png')) != names):
+        raise ValueError('Sequence image/mask inventory differs')
     return dict(root=root, source=source, images=raw, image_dir=image_dir, mask_dir=mask_dir,
-                names=names, fps=fps, reference=reference,
-                shape_hw=source["arrays"]["flow"]["shape"][1:3])
+                names=names, fps=float(source['fps_hz']), reference=source['reference_frame_index'],
+                shape_hw=source['shape_hw'])
 
 
 def make_contract(sequence, scene, view, selected, settings):
@@ -72,23 +57,21 @@ def reference_binding(selection):
 
 
 def motion_reference(manifest, frozen, *, view=None, static_scene_identity=None):
-    """Check the explicit bridge to unchanged geometry, or enforce legacy equality."""
+    """Check the explicit motion-reference binding to the fixed pixel grid."""
     name, index = manifest["reference_frame_name"], manifest["reference_frame_index"]
     names = frozen["frame_names"]
     if type(index) is not int or not 0 <= index < len(names) or names[index] != name:
         raise ValueError("Motion reference is outside the original sequence")
     binding = manifest.get("reference_selection")
     if binding is None:
-        if name != frozen["reference_frame_name"] or index != frozen["reference_frame_index"]:
-            raise ValueError("Changed motion reference requires a reference-selection contract")
-        return name, index
+        raise ValueError("A motion-reference selection is required")
     contract = binding.get("contract", {})
     if (binding.get("identity") != identity(contract) or contract.get("format") != FORMAT
             or contract.get("version") != 1 or contract.get("implementation") != "silhouette_distance_v1"
             or contract.get("geometry_source_identity") != identity(frozen)
             or contract.get("reference_frame_name") != name or contract.get("reference_frame_index") != index
             or contract.get("fps_hz") != frozen["fps_hz"] or contract.get("frame_count") != len(names)
-            or contract.get("shape_hw") != frozen["arrays"]["flow"]["shape"][1:3]):
+            or contract.get("shape_hw") != frozen["shape_hw"]):
         raise ValueError("Motion reference does not match its geometry/sequence contract")
     if view is not None and any(contract.get(k) != view[k] for k in ("label", "camera_identity", "shape_hw")):
         raise ValueError("Motion reference camera/view differs")
@@ -199,10 +182,10 @@ def write_previews(output, render_rgb, fixed, old_rgb, new_rgb, old, selected, o
     _write(output / "contours.png", np.concatenate(panels, axis=1))
 
 
-def select_reference(*, scene_dir, label, reuse_stabilization, output_dir, target_mask="alpha", workers=6,
+def select_reference(*, scene_dir, label, reference, output_dir, target_mask="alpha", workers=6,
                      command=None):
     started = time.perf_counter()
-    from modal_gaussians.static import load_static_scene, cameras_from_scene_manifest
+    from modal_gaussians.geometry.scene import load_static_scene, cameras_from_scene_manifest
     import torch
 
     destination = resolve_path(output_dir)
@@ -210,7 +193,7 @@ def select_reference(*, scene_dir, label, reuse_stabilization, output_dir, targe
         raise FileExistsError(destination)
     if type(workers) is not int or workers < 1 or target_mask not in ("alpha", "green"):
         raise ValueError("Invalid selector settings")
-    seq = sequence_metadata(reuse_stabilization)
+    seq = sequence_metadata(reference)
     if seq["mask_dir"] is None:
         raise ValueError("Reference selection requires existing per-frame subject masks")
     scene = load_static_scene(scene_dir, device="cuda", validate=False).eval()

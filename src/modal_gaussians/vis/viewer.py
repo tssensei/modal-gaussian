@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from pathlib import Path
-from modal_gaussians.scene_store import resolve_path
+from modal_gaussians.common.scene_store import resolve_path
 import threading
 import time
 from typing import Any
@@ -16,25 +16,13 @@ from torch import Tensor
 import viser
 import viser.transforms as vtf
 
-from modal_gaussians.motion.common.mode_mapping import resolve_source_mode_slots
 from modal_gaussians.motion.common.projection import projection_jacobian
-from modal_gaussians.motion.rigid.rigid import load_rigid_modes
-from modal_gaussians.static import (
-    Camera,
-    _load_gsplat_rasterization,
-    cameras_from_scene_manifest,
-)
-from modal_gaussians.motion.rigid.structure_graph import load_observed_structure_graph
-from modal_gaussians.topology import load_observation_topology
+from modal_gaussians.geometry.scene import Camera, _load_gsplat_rasterization, cameras_from_scene_manifest
 from modal_gaussians.vis.playback_panel import add_gui_playback_group
 from modal_gaussians.vis.inputs import ViewerInput, load_viewer_input
 from modal_gaussians.vis.projections import ViewerProjections
 from modal_gaussians.vis.render_panel import populate_render_tab
-from modal_gaussians.vis.spectrum import (
-    ModalSpectrumPanel,
-    SpectrumComparisonController,
-    _hsv_rgb,
-)
+from modal_gaussians.vis.spectrum import ModalSpectrumPanel, SpectrumComparisonController, _hsv_rgb
 
 
 DRIVE_FLOW = "flow-derived coordinates"
@@ -43,16 +31,6 @@ COLOR_RGB = "rgb"
 COLOR_PHASE = "modal phase"
 COLOR_OBSERVATIONS = "obs count"
 
-LEGACY_SUPPORT_DISPLAY_NAMES = (
-    "anchor",
-    "filled",
-    "unobserved",
-)
-BASIS_SUPPORT_DISPLAY_NAMES = (
-    "measurement-supported",
-    "graph-propagated",
-    "zero-fallback",
-)
 NEURAL_SUPPORT_DISPLAY_NAMES = (
     "directly-supervised",
     "structure-inferred",
@@ -147,56 +125,6 @@ def _component_colors(
     return rgb.astype(np.float32)
 
 
-def _component_graph_color_frames(
-    edge_components: np.ndarray,
-    completed_manifest: dict[str, Any],
-    completed_arrays: dict[str, np.ndarray],
-    rigid_manifest: dict[str, Any],
-    rigid_arrays: dict[str, np.ndarray],
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """Keep legacy trust static; color v6/v7 active bases in greedy mode order."""
-
-    retained = np.asarray(rigid_arrays["component_retained_mask"])
-    graph_ids = np.asarray(rigid_arrays["component_graph_index"])
-    if retained.dtype != np.bool_ or retained.ndim != 2:
-        raise ValueError("Component trust must be boolean [K_source,C]")
-    if graph_ids.shape != (retained.shape[1],):
-        raise ValueError("Rigid-to-graph component mapping has the wrong shape")
-    if completed_manifest.get("version") not in (6, 7):
-        trusted_graph = graph_ids[np.all(retained, axis=0)]
-        return _component_colors(edge_components, trusted_component_index=trusted_graph), None
-    if completed_manifest.get("motion_basis", {}).get("basis_selection_policy") != "trusted_per_mode":
-        raise ValueError("Per-mode graph colors require trusted_per_mode eligibility")
-    source_slots = resolve_source_mode_slots(
-        completed_manifest["modes"], rigid_manifest["modes"]
-    )
-    basis_components = np.asarray(completed_arrays["basis_component_index"])
-    active = np.asarray(completed_arrays["basis_active_mask"])
-    if (
-        basis_components.ndim != 1
-        or not np.issubdtype(basis_components.dtype, np.integer)
-        or not len(basis_components)
-        or basis_components[-1] != -1
-        or np.any(basis_components[:-1] < 0)
-        or np.any(basis_components[:-1] >= len(graph_ids))
-    ):
-        raise ValueError("Per-mode graph basis component indices are invalid")
-    if active.dtype != np.bool_ or active.shape != (len(source_slots), len(basis_components)):
-        raise ValueError("Per-mode graph basis activity must be boolean [K,B]")
-    expected_active = np.column_stack((
-        retained[source_slots][:, basis_components[:-1]],
-        np.ones(len(source_slots), dtype=bool),
-    ))
-    if not np.array_equal(active, expected_active):
-        raise ValueError("Per-mode graph basis activity differs from source trust")
-    basis_graph_ids = graph_ids[basis_components[:-1]]
-    colors = np.stack([
-        _component_colors(edge_components, trusted_component_index=basis_graph_ids[row[:-1]])
-        for row in active
-    ])
-    return colors[0], colors
-
-
 @dataclass(frozen=True)
 class ViewerCamera:
     """Expose one calibrated result camera in the Viser convention."""
@@ -217,117 +145,16 @@ class ViewerCamera:
         )
 
 
-def _motion_fill_display_classes(arrays: dict[str, np.ndarray]) -> np.ndarray:
-    """Map the final sequential-fill state to the three useful Viewer roles."""
-
-    # Both trusted seeds and promoted components are fixed anchors. All other
-    # completed points are filled, while incomplete points remain unobserved.
-    anchors = arrays["trusted_seed_mask"] | arrays["component_anchor_point_mask"]
-    classes = np.full(anchors.shape, 2, dtype=np.int8)  # Unobserved.
-    classes[arrays["completion_mask"] & ~anchors] = 1  # Filled.
-    classes[anchors] = 0  # Anchor, including promoted single-view components.
-    return classes
-
-
-def _basis_display_classes(
-    manifest: dict[str, Any], arrays: dict[str, np.ndarray]
-) -> np.ndarray:
-    """Map shared, per-frequency, or green-refined basis support to Viewer roles."""
-
-    version = manifest.get("version")
-    methods = {
-        3: "shared_motion_basis_blend",
-        4: "per_frequency_motion_basis_blend",
-        5: "fixed_observation_green_basis_refinement",
-        6: "per_frequency_motion_basis_blend",
-        7: "fixed_observation_green_basis_refinement",
-    }
-    if version not in methods or manifest.get("completion_method") != methods[version]:
-        raise ValueError("Unsupported motion-basis completion role contract")
-    names = (
-        "measurement_supported_mask",
-        "graph_propagated_mask",
-        "zero_fallback_mask",
-    )
-    missing = [name for name in (*names, "phi") if name not in arrays]
-    if missing:
-        raise ValueError(
-            "Motion-basis Viewer arrays are missing: " + ", ".join(missing)
-        )
-    masks = tuple(np.asarray(arrays[name]) for name in names)
-    phi = np.asarray(arrays["phi"])
-    if phi.ndim != 3 or phi.shape[2] != 3:
-        raise ValueError("Motion-basis phi must have shape [K,G,3]")
-    gaussian_count = phi.shape[1]
-    support_shape = (gaussian_count,) if version == 3 else phi.shape[:2]
-    if any(
-        mask.dtype != np.bool_ or mask.shape != support_shape
-        for mask in masks
-    ):
-        shape_label = "[G]" if version == 3 else "[K,G]"
-        raise ValueError(f"Motion-basis support masks must be boolean {shape_label}")
-    membership = np.stack(masks, axis=0).sum(axis=0)
-    if not np.all(membership == 1):
-        raise ValueError(
-            "Motion-basis support masks must be mutually exclusive and exhaustive"
-        )
-    classes = np.full(support_shape, 2, dtype=np.int8)
-    classes[masks[1]] = 1
-    classes[masks[0]] = 0
-    if version != 3:
-        return classes
-    return np.repeat(classes[None], phi.shape[0], axis=0)
-
-
-def _completed_mode_display_roles(
-    manifest: dict[str, Any], arrays: dict[str, np.ndarray]
-) -> tuple[np.ndarray, tuple[str, ...], str]:
-    """Resolve exact debug-role labels for sequential fill or basis blending."""
-
-    if manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
-        derived = manifest["version"] in (9, 10, 11, 12, 13, 14, 15, 16, 17)
-        method = {8: "neural_complex_displacement_field", 9: "neural_fragment_motion_propagation",
-                  10: "neural_field_with_training_fragment_fill", 11: "neural_field_with_surface_attachments",
-                  12: "neural_field_with_pointwise_displacement_fill", 13: "neural_pointwise_observation_refinement",
-                  14: "neural_field_with_guarded_neighbor_residuals", 15: "neural_guarded_observation_refinement",
-                  16: "neural_component_field_with_stable_donors",
-                  17: "fixed_frequency_mode_bank"}[manifest["version"]]
-        if manifest.get("completion_method") != method:
-            raise ValueError("Unsupported neural completion role contract")
-        phi = np.asarray(arrays["phi"])
-        support = np.asarray(arrays["support_class"])
-        if (
-            phi.ndim != 3 or phi.shape[2] != 3
-            or support.shape != phi.shape[:2]
-            or not np.issubdtype(support.dtype, np.integer)
-            or np.any((support < 0) | (support > (3 if derived else 2)))
-        ):
-            raise ValueError("Neural support classes must match the method's role range")
-        classes = np.asarray([2, 0, 1, 3] if derived else [2, 0, 1], dtype=np.int8)[support]
-        legend = (
-            "**Role colors:** directly image-supervised = blue | "
-            "structure-inferred = green | unresolved = purple"
-        )
-        if derived:
-            legend += " | fragment-propagated = yellow (original image support recorded separately)"
-        if manifest["version"] == 13:
-            legend += " | yellow includes observation-refined propagated points"
-        if manifest["version"] in (14, 15):
-            legend += " | blue includes small-component residuals constrained by stable neighbors; yellow stays propagated"
-        names = NEURAL_SUPPORT_DISPLAY_NAMES + (("fragment-propagated",) if derived else ())
-        if manifest["version"] == 16:
-            legend += " | blue/green use their own component field; donor eligibility is recorded separately"
-        return classes, names, legend
-    if manifest.get("version") in (3, 4, 5, 6, 7):
-        classes = _basis_display_classes(manifest, arrays)
-        legend = (
-            "**Role colors:** measurement-supported = blue | "
-            "graph-propagated = green | zero-fallback = purple"
-        )
-        return classes, BASIS_SUPPORT_DISPLAY_NAMES, legend
-    classes = _motion_fill_display_classes(arrays)
-    legend = "**Role colors:** anchor = blue | filled = green | unobserved = purple"
-    return classes, LEGACY_SUPPORT_DISPLAY_NAMES, legend
+def _completed_mode_display_roles(manifest, arrays):
+    if manifest.get('version') not in (18, 17):
+        raise ValueError('Unsupported model for Viewer')
+    support, phi = np.asarray(arrays['support_class']), np.asarray(arrays['phi'])
+    if (phi.ndim != 3 or phi.shape[2] != 3 or support.shape != phi.shape[:2]
+            or support.dtype.kind not in 'iu' or np.any((support < 0) | (support > 3))):
+        raise ValueError('Invalid support classes')
+    return np.asarray([2,0,1,3], np.int8)[support], NEURAL_SUPPORT_DISPLAY_NAMES + ('propagated',), (
+        '**Role colors:** directly supervised = blue | structure inferred = green | '
+        'unresolved = purple | propagated = yellow')
 
 
 def _hsv_to_rgb(hue: Tensor, value: Tensor) -> Tensor:
@@ -375,32 +202,11 @@ def _viewer_cameras(result: ViewerInput) -> tuple[ViewerCamera, ...]:
     return tuple(cameras)
 
 
-def _observation_counts(completed, gaussian_count: int) -> np.ndarray:
-    """Count unique topology views contributing to each foreground Gaussian."""
-
-    if completed.manifest.get("version") in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
-        observed = np.asarray(completed.arrays["observation_view_mask"])
-        expected = (
-            len(completed.manifest["modes"]), gaussian_count,
-            len(completed.manifest["views"]),
-        )
-        if observed.dtype != np.bool_ or observed.shape != expected:
-            raise ValueError("Neural observation view mask must be boolean [K,G,V]")
-        return observed.sum(axis=2, dtype=np.int16)
-    topology = load_observation_topology(completed.manifest["topology"])
-    offsets = topology.arrays.sample_offsets
-    contributor_views = np.repeat(
-        topology.arrays.sample_view_index,
-        np.diff(offsets),
-    )
-    contributors = topology.arrays.contributor_gaussian_index
-    view_count = len(completed.manifest["views"])
-    observed = np.zeros((gaussian_count, view_count), dtype=bool)
-    observed[contributors, contributor_views] = True
-    per_gaussian = np.asarray(observed.sum(axis=1), dtype=np.int16)
-    return np.repeat(
-        per_gaussian[None], len(completed.manifest["modes"]), axis=0
-    )
+def _observation_counts(completed, gaussian_count):
+    observed = np.asarray(completed.arrays['observation_view_mask'])
+    if observed.dtype != bool or observed.shape != (len(completed.manifest['modes']), gaussian_count, len(completed.manifest['views'])):
+        raise ValueError('Observation mask must be boolean [K,G,V]')
+    return observed.sum(axis=2, dtype=np.int16)
 
 
 def _neural_graph_display(
@@ -445,7 +251,7 @@ def _control_point_gaussian_indices(arrays: dict[str, np.ndarray], gaussian_coun
 class ModalViewerData:
     """Hold strict result data and implement all scientific display transforms."""
 
-    def __init__(self, result_dir: str | Path, device: str = "cuda", *, preview: bool = False,
+    def __init__(self, result_dir: str | Path, device: str = "cuda", *,
                  coordinates=None, work_dir=None) -> None:
         requested_device = torch.device(device)
         if requested_device.type != "cuda" or not torch.cuda.is_available():
@@ -512,79 +318,18 @@ class ModalViewerData:
 
         mode_index = 0 if mode_index is None else mode_index
         completed = self.result.modes[mode_index].artifact
-        version = completed.manifest.get("version")
-        arrays = completed.arrays
-        if version in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
-            self.structure_graph = None
-            self.graph_edge_gaussian_index, self.graph_edge_colors = _neural_graph_display(
-                arrays, self.scene.foreground.count,
-            )
-            self.graph_mode_index = mode_index
-            self.graph_edge_colors_by_mode = None
-            self.graph_legend = (
-                "**Geometry graph:** distinct colors = connected geometry components. "
-                "Colors indicate connectivity, not rigid trust or observation support."
-            )
-            return
+        self.structure_graph = None
+        self.graph_edge_gaussian_index, self.graph_edge_colors = _neural_graph_display(
+            completed.arrays, self.scene.foreground.count)
         self.graph_mode_index = mode_index
-        graph_path = completed.manifest.get(
-            "observed_structure_graph"
-        )
-        graph_identity = completed.manifest.get(
-            "observed_structure_graph_identity"
-        )
-        if not isinstance(graph_path, str) or not graph_path:
-            raise ValueError("Completed modes do not identify their observed graph")
-        self.structure_graph = (
-            load_observed_structure_graph(graph_path)
-        )
-        if (
-            self.structure_graph.manifest["observed_structure_graph_identity"]
-            != graph_identity
-        ):
-            raise ValueError("Completed modes identify a different observed graph")
-        if (
-            self.structure_graph.manifest["static_scene_identity"]
-            != self.scene.manifest["static_scene_identity"]
-            or self.structure_graph.manifest["foreground_identity"]
-            != self.scene.manifest["foreground_identity"]
-        ):
-            raise ValueError("Observed graph does not belong to the Viewer scene")
-        graph_arrays = self.structure_graph.arrays
-        self.graph_edge_gaussian_index = graph_arrays.node_gaussian_index[
-            graph_arrays.edge_index
-        ]
-        edge_components = graph_arrays.component_index[
-            graph_arrays.edge_index[:, 0]
-        ]
-        completed_manifest = completed.manifest
-        rigid = load_rigid_modes(completed_manifest["rigid_modes"])
-        for identity in (
-            "rigid_modes_identity",
-            "observed_structure_graph_identity",
-            "static_scene_identity",
-            "foreground_identity",
-        ):
-            if rigid.manifest[identity] != completed_manifest[identity]:
-                raise ValueError(f"Component graph rigid source differs: {identity}")
-        self.graph_edge_colors, self.graph_edge_colors_by_mode = _component_graph_color_frames(
-            edge_components, completed_manifest, completed.arrays,
-            rigid.manifest, rigid.arrays,
-        )
-        self.graph_legend = (
-            "**Component graph:** distinct colors = active trusted components at "
-            "Selected frequency (Hz); gray = inactive components. Select a frequency "
-            "in Gaussian color or Spectrum."
-            if self.graph_edge_colors_by_mode is not None else
-            "**Component graph:** distinct colors = components trusted at "
-            "every source frequency; gray = other components."
-        )
+        self.graph_edge_colors_by_mode = None
+        self.graph_legend = '**Geometry graph:** distinct colors = connected components.'
 
     def coordinate(self, view_index: int, local_frame: int) -> np.ndarray:
         """Return one stored flow-derived complex coordinate vector."""
 
         if self.coordinates is None:
-            raise ValueError("This preview has no video coordinates; use the manual oscillator")
+            raise ValueError("This model has no video coordinates; use the manual oscillator")
         label = self.result.views[view_index]["label"]
         if label not in self.result.coordinate_views:
             raise ValueError(f"View {label!r} has no fitted coordinates")
@@ -1604,7 +1349,6 @@ def run_modal_viewer(
     host: str = "0.0.0.0",
     port: int = 8080,
     viewer_resolution: int = 2048,
-    preview: bool = False,
     coordinates: str | Path | None = None,
 ) -> None:
     """Load one complete modal result and run its full Viser interface."""
@@ -1612,7 +1356,7 @@ def run_modal_viewer(
     # Load the CUDA backend synchronously. Deferring this to a render worker
     # leaves a connected but blank Viewer when compiler activation fails.
     _load_gsplat_rasterization()
-    data = ModalViewerData(result_dir, preview=preview, coordinates=coordinates, work_dir=work_dir)
+    data = ModalViewerData(result_dir, coordinates=coordinates, work_dir=work_dir)
     viewer = ModalViserViewer(
         data,
         work_dir=work_dir,

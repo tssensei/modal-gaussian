@@ -1,0 +1,668 @@
+"""Full-foreground rasterized modal projection design for temporal coordinates."""
+
+from __future__ import annotations
+
+from modal_gaussians.motion.common.projection import RenderedDesignConfig, uses_visible_subject, prepare_modal_projection, project_modal_features
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+from modal_gaussians.common.scene_store import resolve_path
+import shutil
+import tempfile
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+from modal_gaussians.common.progress import Progress
+import torch
+
+from modal_gaussians.common.numpy_io import save_named_arrays
+
+from modal_gaussians import __version__
+from modal_gaussians.preprocessing.reference import SequenceReference
+from modal_gaussians.coordinates.sources import coordinate_flow_identity as reference_identity, load_coordinate_flow
+from modal_gaussians.motion.common.completed_modes import CompletedModesArtifact, load_completed_modes
+from modal_gaussians.geometry.scene import Camera, ForegroundBackgroundScene, cameras_from_scene_manifest, load_static_scene
+
+
+RENDERED_DESIGN_FORMAT = "modal_gaussians.rendered_modal_design"
+RENDERED_DESIGN_VERSION = 1
+DESIGN_FILENAME = "design.npy"
+SAMPLES_FILENAME = "samples.npz"
+DESIGN_DTYPE = np.dtype(np.float32)
+FINITE_BLOCK_SAMPLES = 65_536
+
+SAMPLE_DTYPES = {
+    "view_shapes_hw": np.dtype(np.int64),
+    "view_sample_offsets": np.dtype(np.int64),
+    "sample_view_index": np.dtype(np.int64),
+    "sample_pixels_xy": np.dtype(np.int64),
+    "sample_foreground_alpha": np.dtype(np.float32),
+}
+
+DESIGN_CONVENTION = {
+    "source_field": "completed_complex_3d_foreground_gaussian_displacement",
+    "projection": "pinhole_pixel_jacobian_at_static_gaussian_mean",
+    "rasterization": "single_full_foreground_gsplat_3dgs_depth_order",
+    "background_features": "zero",
+    "normalization": "divide_by_rendered_foreground_alpha",
+    "packing": "design[p,:,2k]=real(J_phi); design[p,:,2k+1]=-imag(J_phi)",
+    "coordinate_action": "real(q_k * J_phi_k)",
+    "background_gaussians": "excluded",
+    "unresolved_modes": "included_as_explicit_zero_phi",
+}
+
+DISTORTED_DESIGN_CONVENTION = {
+    **DESIGN_CONVENTION,
+    "projection": "simple_radial_pixel_jacobian_at_static_gaussian_mean",
+    "rasterization": "full_foreground_gsplat_with_simple_radial_image_warp_v1",
+}
+
+
+def _visible_subject_convention(convention: Mapping[str, Any]) -> dict[str, Any]:
+    """Record manual-selection overrides with their visible-subject sampling policy."""
+
+    return {
+        **convention,
+        "rasterization": convention["rasterization"].replace("foreground", "scene"),
+        "normalization": "divide_by_visible_subject_mass",
+        "background_gaussians": "included_as_zero_features_with_depth_ordered_occlusion",
+        "sampling_mask_source": "visible_subject_alpha",
+        "sampling_mask_erosion_iterations": 0,
+    }
+
+
+@dataclass(frozen=True)
+class RenderedDesignViewInput:
+    """Bind one ordered completed-mode view to its exact flow artifact."""
+
+    label: str
+    flow_artifact: Path
+
+
+@dataclass(frozen=True)
+class RenderedModalDesignArtifact:
+    """Represent one validated mmap-backed rendered modal design."""
+
+    path: Path
+    manifest: dict[str, Any]
+    design: np.ndarray
+    samples: dict[str, np.ndarray]
+
+
+def _canonical_json(value: Any) -> bytes:
+    """Encode one path-independent identity payload deterministically."""
+
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+
+
+def _sha256_file(path: Path) -> str:
+    """Hash one artifact file in bounded chunks."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _arrays_identity(arrays: Mapping[str, np.ndarray]) -> str:
+    """Hash sample-array names, dtypes, shapes, and values canonically."""
+
+    digest = hashlib.sha256()
+    for name in sorted(arrays):
+        value = np.ascontiguousarray(arrays[name])
+        digest.update(name.encode("utf-8"))
+        digest.update(value.dtype.str.encode("ascii"))
+        digest.update(np.asarray(value.shape, dtype=np.int64).tobytes())
+        digest.update(value.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _identity_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Select scientific inputs, conventions, diagnostics, and output hashes."""
+
+    return {
+        "format": RENDERED_DESIGN_FORMAT,
+        "version": manifest["version"],
+        "static_scene_identity": manifest["static_scene_identity"],
+        "foreground_identity": manifest["foreground_identity"],
+        "completed_modes_identity": manifest["completed_modes_identity"],
+        "modes": manifest["modes"],
+        "views": manifest["views"],
+        "settings": manifest["settings"],
+        "convention": manifest["convention"],
+        "quality_gate": manifest["quality_gate"],
+        "counts": manifest["counts"],
+        "design": manifest["design"],
+        "samples": {
+            "arrays": manifest["samples"]["arrays"],
+            "arrays_identity": manifest["samples"]["arrays_identity"],
+        },
+    }
+
+
+def _validate_modes(modes: Any) -> None:
+    """Validate the ordered spatial mode bank copied from motion completion."""
+
+    if not isinstance(modes, list) or not modes:
+        raise ValueError("Rendered design must contain ordered modes")
+    candidates: list[int] = []
+    for expected_slot, mode in enumerate(modes):
+        if not isinstance(mode, dict) or mode.get("mode_slot") != expected_slot:
+            raise ValueError("Rendered-design mode slots must be contiguous")
+        candidate = mode.get("candidate_index")
+        frequency = float(mode.get("frequency_hz", np.nan))
+        if (
+            isinstance(candidate, bool)
+            or not isinstance(candidate, int)
+            or candidate < 0
+            or not math.isfinite(frequency)
+            or frequency <= 0.0
+        ):
+            raise ValueError("Rendered-design mode metadata is invalid")
+        candidates.append(candidate)
+    if len(set(candidates)) != len(candidates):
+        raise ValueError("Rendered-design candidate indices must be unique")
+
+
+def _validate_samples(
+    samples: Mapping[str, np.ndarray],
+    *,
+    view_count: int,
+    sample_count: int,
+    config: RenderedDesignConfig,
+) -> None:
+    """Validate view partitions, stride-grid pixels, and sampled alpha values."""
+
+    if set(samples) != set(SAMPLE_DTYPES):
+        raise ValueError("Rendered-design sample fields are invalid")
+    for name, dtype in SAMPLE_DTYPES.items():
+        if samples[name].dtype != dtype:
+            raise ValueError(f"Rendered-design {name} must be {dtype.name}")
+    shapes = samples["view_shapes_hw"]
+    offsets = samples["view_sample_offsets"]
+    sample_views = samples["sample_view_index"]
+    pixels = samples["sample_pixels_xy"]
+    alpha = samples["sample_foreground_alpha"]
+    if shapes.shape != (view_count, 2) or np.any(shapes < 3):
+        raise ValueError("Rendered-design view shapes are invalid")
+    if (
+        offsets.shape != (view_count + 1,)
+        or offsets[0] != 0
+        or offsets[-1] != sample_count
+        or np.any(np.diff(offsets) <= 0)
+    ):
+        raise ValueError("Rendered-design view sample offsets are invalid")
+    if sample_views.shape != (sample_count,):
+        raise ValueError("Rendered-design sample_view_index shape is invalid")
+    if pixels.shape != (sample_count, 2):
+        raise ValueError("Rendered-design sample_pixels_xy shape is invalid")
+    if alpha.shape != (sample_count,) or not np.isfinite(alpha).all():
+        raise ValueError("Rendered-design sampled alpha is invalid")
+    if np.any(alpha < config.alpha_minimum - 1.0e-6) or np.any(
+        alpha > 1.0 + 1.0e-5
+    ):
+        raise ValueError("Rendered-design sampled alpha leaves its declared range")
+    for view_index in range(view_count):
+        lower, upper = int(offsets[view_index]), int(offsets[view_index + 1])
+        if not np.all(sample_views[lower:upper] == view_index):
+            raise ValueError("Rendered-design samples are not contiguous by view")
+        height, width = (int(value) for value in shapes[view_index])
+        view_pixels = pixels[lower:upper]
+        x, y = view_pixels[:, 0], view_pixels[:, 1]
+        if (
+            np.any(x < 1)
+            or np.any(x >= width - 1)
+            or np.any(y < 1)
+            or np.any(y >= height - 1)
+            or np.any((x - 1) % config.pixel_sample_stride)
+            or np.any((y - 1) % config.pixel_sample_stride)
+            or np.unique(view_pixels, axis=0).shape[0] != len(view_pixels)
+        ):
+            raise ValueError("Rendered-design pixels violate the declared stride grid")
+
+
+def _validate_finite_design(design: np.ndarray) -> None:
+    """Scan the mmap-backed design without copying the complete array."""
+
+    for lower in range(0, len(design), FINITE_BLOCK_SAMPLES):
+        if not np.isfinite(design[lower : lower + FINITE_BLOCK_SAMPLES]).all():
+            raise ValueError("Rendered modal design contains NaN or Inf")
+
+
+def load_rendered_modal_design(path: str | Path, *, validate: bool = False) -> RenderedModalDesignArtifact:
+    """Read a saved design; exhaustive checks are explicit diagnostics only."""
+
+    root = resolve_path(path, strict=True)
+    manifest_path = root / "manifest.json"
+    design_path = root / DESIGN_FILENAME
+    samples_path = root / SAMPLES_FILENAME
+    if not manifest_path.is_file() or not design_path.is_file() or not samples_path.is_file():
+        raise FileNotFoundError(f"Incomplete rendered modal design: {root}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") != RENDERED_DESIGN_FORMAT:
+        raise ValueError("Unsupported rendered-design format")
+    if manifest.get("version") not in (RENDERED_DESIGN_VERSION, 2):
+        raise ValueError("Unsupported rendered-design version")
+    if not validate:
+        design = np.load(design_path, mmap_mode="r", allow_pickle=False)
+        counts = manifest["counts"]
+        if design.dtype != DESIGN_DTYPE or design.shape != (counts["samples"], 2, 2 * counts["modes"]):
+            design._mmap.close()
+            raise ValueError("Rendered-design array shape or dtype is invalid")
+        with np.load(samples_path, allow_pickle=False) as archive:
+            samples = {name: archive[name] for name in archive.files}
+        return RenderedModalDesignArtifact(root, manifest, design, samples)
+    expected_convention = DISTORTED_DESIGN_CONVENTION if manifest["version"] == 2 else DESIGN_CONVENTION
+    if manifest.get("convention") not in (expected_convention, _visible_subject_convention(expected_convention)):
+        raise ValueError("Rendered-design convention is unsupported")
+    if manifest.get("quality_gate") != {
+        "required": True,
+        "status": "rendered_design_candidate_unapproved",
+        "inherited_from": "completion_candidate_unapproved",
+    }:
+        raise ValueError("Rendered design must inherit the completion quality gate")
+    for name in (
+        "static_scene_identity",
+        "foreground_identity",
+        "completed_modes_identity",
+    ):
+        if not isinstance(manifest.get(name), str) or not manifest[name]:
+            raise ValueError(f"Rendered-design {name} is invalid")
+    _validate_modes(manifest.get("modes"))
+    settings = manifest.get("settings")
+    if not isinstance(settings, dict):
+        raise ValueError("Rendered-design settings are invalid")
+    config = RenderedDesignConfig(
+        pixel_sample_stride=int(settings["pixel_sample_stride"]),
+        alpha_minimum=float(settings["alpha_minimum"]),
+        mask_erosion_iterations=int(settings["mask_erosion_iterations"]),
+        modes_per_batch=int(settings["modes_per_batch"]),
+    )
+    config.validate()
+    if settings != config.to_dict():
+        raise ValueError("Rendered-design settings contain unsupported fields")
+    counts = manifest.get("counts")
+    views = manifest.get("views")
+    if not isinstance(counts, dict) or not isinstance(views, list) or not views:
+        raise ValueError("Rendered-design counts or views are invalid")
+    view_count = int(counts.get("views", -1))
+    mode_count = int(counts.get("modes", -1))
+    sample_count = int(counts.get("samples", -1))
+    if view_count != len(views) or mode_count != len(manifest["modes"]) or sample_count <= 0:
+        raise ValueError("Rendered-design counts disagree with metadata")
+    labels: list[str] = []
+    for index, view in enumerate(views):
+        if not isinstance(view, dict) or view.get("index") != index:
+            raise ValueError("Rendered-design views must be contiguous and ordered")
+        label = view.get("label")
+        if not isinstance(label, str) or not label:
+            raise ValueError("Rendered-design view label is invalid")
+        labels.append(label)
+        for name in ("camera_identity", "flow_identity"):
+            if not isinstance(view.get(name), str) or not view[name]:
+                raise ValueError(f"Rendered-design {name} for {label!r} is invalid")
+    if len(set(labels)) != len(labels):
+        raise ValueError("Rendered-design view labels must be unique")
+    design_record = manifest.get("design")
+    samples_record = manifest.get("samples")
+    if not isinstance(design_record, dict) or not isinstance(samples_record, dict):
+        raise ValueError("Rendered-design file metadata is invalid")
+    if (
+        design_record.get("file") != DESIGN_FILENAME
+        or design_record.get("dtype") != DESIGN_DTYPE.name
+        or design_record.get("shape") != [sample_count, 2, 2 * mode_count]
+        or design_record.get("sha256") != _sha256_file(design_path)
+        or samples_record.get("file") != SAMPLES_FILENAME
+        or samples_record.get("sha256") != _sha256_file(samples_path)
+    ):
+        raise ValueError("Rendered-design file metadata or SHA-256 is invalid")
+    design = np.load(design_path, mmap_mode="r", allow_pickle=False)
+    if design.dtype != DESIGN_DTYPE or design.shape != (sample_count, 2, 2 * mode_count):
+        raise ValueError("Rendered-design array shape or dtype is invalid")
+    with np.load(samples_path, allow_pickle=False) as archive:
+        samples = {name: archive[name] for name in archive.files}
+    sample_metadata = {
+        name: {"dtype": value.dtype.name, "shape": list(value.shape)}
+        for name, value in samples.items()
+    }
+    if samples_record.get("arrays") != sample_metadata:
+        raise ValueError("Rendered-design sample metadata differs")
+    if samples_record.get("arrays_identity") != _arrays_identity(samples):
+        raise ValueError("Rendered-design sample identity differs")
+    _validate_samples(
+        samples,
+        view_count=view_count,
+        sample_count=sample_count,
+        config=config,
+    )
+    offsets = samples["view_sample_offsets"]
+    shapes = samples["view_shapes_hw"]
+    for index, view in enumerate(views):
+        lower, upper = int(offsets[index]), int(offsets[index + 1])
+        if (
+            view.get("shape_hw") != shapes[index].astype(int).tolist()
+            or view.get("sample_offset") != lower
+            or view.get("sample_count") != upper - lower
+        ):
+            raise ValueError("Rendered-design view/sample metadata differs")
+    _validate_finite_design(design)
+    expected_identity = hashlib.sha256(
+        _canonical_json(_identity_payload(manifest))
+    ).hexdigest()
+    if manifest.get("rendered_design_identity") != expected_identity:
+        raise ValueError("Rendered-design identity differs from its contents")
+    return RenderedModalDesignArtifact(root, manifest, design, samples)
+
+
+def _load_sources(
+    scene_dir: str | Path,
+    completed_modes_dir: str | Path,
+    views: Sequence[RenderedDesignViewInput],
+    device: torch.device,
+    flow_loader: Any = None,
+    validated_completed: Any = None,
+) -> tuple[
+    Path,
+    ForegroundBackgroundScene,
+    CompletedModesArtifact,
+    tuple[Camera, ...],
+    tuple[SequenceReference, ...],
+    list[dict[str, Any]],
+]:
+    """Load the new-project identity chain and ordered fixed-view inputs."""
+
+    if not views:
+        raise ValueError("At least one rendered-design view is required")
+    labels = [view.label.strip() for view in views]
+    if any(not label for label in labels) or len(set(labels)) != len(labels):
+        raise ValueError("Rendered-design view labels must be non-empty and unique")
+    scene_path = resolve_path(scene_dir, strict=True)
+    scene = load_static_scene(scene_path, device)
+    if scene.manifest is None:
+        raise ValueError("Static scene has no manifest")
+    completed = validated_completed if validated_completed is not None else load_completed_modes(completed_modes_dir)
+    if completed.path.resolve() != resolve_path(completed_modes_dir):
+        raise ValueError("Reused completed modes belong to a different path")
+    for name, actual, expected in (
+        (
+            "static scene",
+            completed.manifest.get("static_scene_identity"),
+            scene.manifest["static_scene_identity"],
+        ),
+        (
+            "foreground",
+            completed.manifest.get("foreground_identity"),
+            scene.manifest["foreground_identity"],
+        ),
+    ):
+        if actual != expected:
+            raise ValueError(f"Completed-mode {name} identity differs")
+    completed_views = completed.manifest["views"]
+    if len(views) != len(completed_views):
+        raise ValueError("Rendered-design and completed-mode view counts differ")
+    reference_cameras = {
+        camera.label: camera
+        for camera in cameras_from_scene_manifest(scene.manifest)
+        if camera.role == "reference" and camera.label is not None
+    }
+    cameras: list[Camera] = []
+    flow_artifacts: list[SequenceReference] = []
+    view_records: list[dict[str, Any]] = []
+    for index, (label, source, completed_view) in enumerate(
+        zip(labels, views, completed_views)
+    ):
+        if completed_view.get("index") != index or completed_view.get("label") != label:
+            raise ValueError("Rendered-design view order differs from completed modes")
+        camera = reference_cameras.get(label)
+        if camera is None:
+            raise ValueError(f"Static scene has no reference camera for {label!r}")
+        camera_identity = camera.to_manifest_record()["camera_identity"]
+        if completed_view.get("camera_identity") != camera_identity:
+            raise ValueError(f"Completed-mode camera identity for {label!r} differs")
+        flow = (flow_loader or load_coordinate_flow)(
+            resolve_path(source.flow_artifact, strict=True)
+        )
+        flow_identity = reference_identity(flow)
+        if completed_view.get("flow_identity") != flow_identity:
+            raise ValueError(f"Completed-mode flow identity for {label!r} differs")
+        expected_shape = [camera.height, camera.width]
+        if completed_view.get("shape_hw") != expected_shape:
+            raise ValueError(f"Completed-mode image shape for {label!r} differs")
+        if list(flow.arrays.mask_union.shape) != expected_shape:
+            raise ValueError(f"Flow mask shape for {label!r} differs from its camera")
+        cameras.append(camera.to(device))
+        flow_artifacts.append(flow)
+        view_records.append(
+            {
+                "index": index,
+                "label": label,
+                "camera_name": camera.name,
+                "camera_identity": camera_identity,
+                "flow_identity": flow_identity,
+                "shape_hw": expected_shape,
+                "flow_reference_frame_name": flow.manifest[
+                    "reference_frame_name"
+                ],
+                "flow_reference_frame_index": int(
+                    flow.manifest["reference_frame_index"]
+                ),
+                "frame_count": int(flow.arrays.flow.shape[0]),
+                "fps_hz": float(flow.manifest["fps_hz"]),
+                **({"motion_reference": completed_view["motion_reference"]}
+                   if "motion_reference" in completed_view else {}),
+            }
+        )
+    return (
+        scene_path,
+        scene,
+        completed,
+        tuple(cameras),
+        tuple(flow_artifacts),
+        view_records,
+    )
+
+
+def build_rendered_modal_design_artifact(
+    *,
+    scene_dir: str | Path,
+    completed_modes_dir: str | Path,
+    views: Sequence[RenderedDesignViewInput],
+    output_dir: str | Path,
+    config: RenderedDesignConfig | None = None,
+    command: Sequence[str] = (),
+    flow_loader: Any = None,
+    validated_completed: Any = None,
+) -> RenderedModalDesignArtifact:
+    """Render completed full-foreground modes and publish the compact C16 artifact."""
+
+    settings = config or RenderedDesignConfig()
+    settings.validate()
+    destination = resolve_path(output_dir)
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(f"Rendered-design output already exists: {destination}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("Rendered modal design construction requires CUDA")
+    device = torch.device("cuda")
+    (
+        scene_path,
+        scene,
+        completed,
+        cameras,
+        flows,
+        view_records,
+    ) = _load_sources(scene_dir, completed_modes_dir, views, device, flow_loader=flow_loader, validated_completed=validated_completed)
+    scene_manifest = scene.manifest
+    if scene_manifest is None:
+        raise ValueError("Static scene has no manifest")
+    mode_records = [dict(mode) for mode in completed.manifest["modes"]]
+    _validate_modes(mode_records)
+    phi = np.asarray(completed.arrays["phi"])
+    mode_count, foreground_count, coordinate_count = phi.shape
+    if (
+        phi.dtype != np.complex64
+        or coordinate_count != 3
+        or mode_count != len(mode_records)
+        or foreground_count != scene.foreground.count
+    ):
+        raise ValueError("Completed modes do not match the static foreground")
+
+    scene.eval()
+    pixels_by_view: list[np.ndarray] = []
+    alpha_by_view: list[np.ndarray] = []
+    jacobian_by_view: list[np.ndarray] = []
+    sample_offsets = [0]
+    with torch.no_grad():
+        for camera, flow, record in zip(cameras, flows, view_records):
+            pixels, sampled_alpha, jacobian, visible_count = prepare_modal_projection(
+                scene, camera, flow.arrays.mask_union, settings)
+            record["sample_offset"] = sample_offsets[-1]
+            record["sample_count"] = len(pixels)
+            record["foreground_gaussians_in_front"] = visible_count
+            sample_offsets.append(sample_offsets[-1] + len(pixels))
+            pixels_by_view.append(pixels)
+            alpha_by_view.append(sampled_alpha)
+            jacobian_by_view.append(jacobian)
+
+    sample_count = sample_offsets[-1]
+    view_shapes = np.asarray(
+        [[camera.height, camera.width] for camera in cameras], dtype=np.int64
+    )
+    sample_view_index = np.concatenate(
+        [
+            np.full(len(pixels), index, dtype=np.int64)
+            for index, pixels in enumerate(pixels_by_view)
+        ]
+    )
+    samples = {
+        "view_shapes_hw": view_shapes,
+        "view_sample_offsets": np.asarray(sample_offsets, dtype=np.int64),
+        "sample_view_index": sample_view_index,
+        "sample_pixels_xy": np.concatenate(pixels_by_view, axis=0),
+        "sample_foreground_alpha": np.concatenate(alpha_by_view, axis=0),
+    }
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+    )
+    try:
+        design_path = temporary / DESIGN_FILENAME
+        design = np.lib.format.open_memmap(
+            design_path,
+            mode="w+",
+            dtype=DESIGN_DTYPE,
+            shape=(sample_count, 2, 2 * mode_count),
+        )
+        progress = Progress("rendered design", len(cameras) * mode_count, unit="view-modes")
+        with torch.no_grad():
+            for view_index, (camera, pixels, sampled_alpha, jacobian) in enumerate(
+                zip(cameras, pixels_by_view, alpha_by_view, jacobian_by_view)
+            ):
+                lower, upper = sample_offsets[view_index : view_index + 2]
+                for start in range(0, mode_count, settings.modes_per_batch):
+                    stop = min(start + settings.modes_per_batch, mode_count)
+                    design[lower:upper, :, 2*start:2*stop] = project_modal_features(
+                        scene, camera, phi[start:stop], pixels, sampled_alpha, jacobian)
+                    progress.update(
+                        view_index * mode_count + stop,
+                        f"camera={camera.name} modes={stop}/{mode_count}",
+                    )
+
+                view_records[view_index]["diagnostics"] = {"packing_verification": {"status": "not_run"}}
+        design.flush()
+        del design
+        samples_path = temporary / SAMPLES_FILENAME
+        save_named_arrays(samples_path, samples)
+        design_record = {
+            "file": DESIGN_FILENAME,
+            "dtype": DESIGN_DTYPE.name,
+            "shape": [sample_count, 2, 2 * mode_count],
+            "sha256": _sha256_file(design_path),
+        }
+        samples_record = {
+            "file": SAMPLES_FILENAME,
+            "arrays": {
+                name: {"dtype": value.dtype.name, "shape": list(value.shape)}
+                for name, value in samples.items()
+            },
+            "arrays_identity": _arrays_identity(samples),
+            "sha256": _sha256_file(samples_path),
+        }
+        convention = dict(DISTORTED_DESIGN_CONVENTION if any(c.distortion_applied for c in cameras) else DESIGN_CONVENTION)
+        if uses_visible_subject(scene):
+            convention = _visible_subject_convention(convention)
+        manifest = {
+            "format": RENDERED_DESIGN_FORMAT,
+            "version": 2 if any(c.distortion_applied for c in cameras) else RENDERED_DESIGN_VERSION,
+            "producer": {
+                "project_version": __version__,
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "command": list(command),
+            },
+            "static_scene": str(scene_path),
+            "static_scene_identity": scene_manifest["static_scene_identity"],
+            "foreground_identity": scene_manifest["foreground_identity"],
+            "completed_modes": str(completed.path),
+            "completed_modes_identity": completed.manifest[
+                "completed_modes_identity"
+            ],
+            "flow_artifacts": [str(flow.path.resolve()) for flow in flows],
+            "modes": mode_records,
+            "views": view_records,
+            "settings": settings.to_dict(),
+            "convention": convention,
+            "quality_gate": {
+                "required": True,
+                "status": "rendered_design_candidate_unapproved",
+                "inherited_from": "completion_candidate_unapproved",
+            },
+            "counts": {
+                "views": len(cameras),
+                "modes": mode_count,
+                "foreground_gaussians": foreground_count,
+                "samples": sample_count,
+                "columns": 2 * mode_count,
+            },
+            "design": design_record,
+            "samples": samples_record,
+        }
+        manifest["rendered_design_identity"] = hashlib.sha256(
+            _canonical_json(_identity_payload(manifest))
+        ).hexdigest()
+        (temporary / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(
+                f"Rendered-design output already exists: {destination}"
+            )
+        os.replace(temporary, destination)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return RenderedModalDesignArtifact(
+        destination,
+        manifest,
+        np.load(destination / DESIGN_FILENAME, mmap_mode="r", allow_pickle=False),
+        samples,
+    )
+
+
+__all__ = [
+    "RenderedDesignConfig",
+    "RenderedDesignViewInput",
+    "RenderedModalDesignArtifact",
+    "build_rendered_modal_design_artifact",
+    "load_rendered_modal_design",
+]

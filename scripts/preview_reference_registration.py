@@ -13,9 +13,9 @@ import time
 import cv2
 import numpy as np
 
-from modal_gaussians.iteration_cache import atomic_json
-from modal_gaussians.progress import progress_log, report_progress
-from modal_gaussians.scene_store import asset_path, library_root, resolve_path
+from modal_gaussians.common.cache import atomic_json
+from modal_gaussians.common.progress import progress_log, report_progress
+from modal_gaussians.common.scene_store import asset_path, library_root, resolve_path
 
 
 def warp_reference(reference, flow):
@@ -91,7 +91,7 @@ def comparison(render, reference, flow_rgb, warped, valid, label, limit, coloriz
 def run(args):
     import torch
     from modal_gaussians.flow.sea_raft import load_model, read_image
-    from modal_gaussians.static import cameras_from_scene_manifest, load_static_scene
+    from modal_gaussians.geometry.scene import cameras_from_scene_manifest, load_static_scene
 
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=False)

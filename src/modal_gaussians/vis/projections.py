@@ -5,10 +5,10 @@ import threading
 
 import numpy as np
 
-from modal_gaussians.iteration_cache import atomic_json, identity, module_revision, publish_directory
+from modal_gaussians.common.cache import atomic_json, identity, module_revision, publish_directory
 from modal_gaussians.motion.common import projection
-from modal_gaussians.scene_store import resolve_path, scene_cache
-from modal_gaussians.static import cameras_from_scene_manifest
+from modal_gaussians.common.scene_store import resolve_path, scene_cache
+from modal_gaussians.geometry.scene import cameras_from_scene_manifest
 from modal_gaussians.vis.inputs import read_json
 
 
@@ -97,7 +97,7 @@ class ViewerProjections:
         return self._samples[key]
 
     def _compute(self, k, label, settings):
-        from modal_gaussians.flow.artifact import load_flow_analysis_artifact, flow_artifact_identity
+        from modal_gaussians.preprocessing.reference import load_reference, reference_identity
         mode = self.result.modes[k]
         scene = self.result.scene
         camera = next(c for c in cameras_from_scene_manifest(scene.manifest) if c.label == label)
@@ -107,7 +107,7 @@ class ViewerProjections:
         mask = None
         if not projection.uses_visible_subject(scene):
             if mode.prepared is not None:
-                from modal_gaussians.motion.neural.prepared import load_prepared
+                from modal_gaussians.motion.prepared import load_prepared
                 if mode.prepared not in self._prepared:
                     prepared = load_prepared(mode.prepared)
                     prepared.arrays = {f"v{i}_mask": prepared.arrays[f"v{i}_mask"]
@@ -115,8 +115,8 @@ class ViewerProjections:
                     self._prepared[mode.prepared] = prepared
                 flow = self._prepared[mode.prepared].flow(dense["flow_artifact"])
             else:
-                flow = load_flow_analysis_artifact(resolve_path(dense["flow_artifact"], strict=True))
-            if flow_artifact_identity(flow) != dense["flow_identity"]:
+                flow = load_reference(resolve_path(dense["flow_artifact"], strict=True))
+            if reference_identity(flow) != dense["flow_identity"]:
                 raise ValueError("Viewer sampling flow identity differs")
             mask = flow.arrays.mask_union
         with self.gpu_lock:

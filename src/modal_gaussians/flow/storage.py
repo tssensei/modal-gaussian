@@ -6,12 +6,12 @@ import asyncio
 import hashlib
 import os
 from pathlib import Path
-from modal_gaussians.scene_store import resolve_path
+from modal_gaussians.common.scene_store import resolve_path
 from typing import Any, Iterator
 
 import numpy as np
 import zarr
-from modal_gaussians.iteration_cache import read_bytes
+from modal_gaussians.common.cache import read_bytes
 from zarr.codecs import ZstdCodec
 from zarr.storage import LocalStore
 

@@ -8,10 +8,10 @@ from typing import Any
 import numpy as np
 
 from modal_gaussians.motion.common.completed_modes import CompletedModesArtifact, load_completed_modes
-from modal_gaussians.rendered_design import load_rendered_modal_design
-from modal_gaussians.result import _load_coordinate_artifact
-from modal_gaussians.scene_store import library_root, resolve_path
-from modal_gaussians.static import cameras_from_scene_manifest, load_static_scene
+from modal_gaussians.coordinates.design import load_rendered_modal_design
+from modal_gaussians.results.artifact import _load_coordinate_artifact
+from modal_gaussians.common.scene_store import library_root, resolve_path
+from modal_gaussians.geometry.scene import cameras_from_scene_manifest, load_static_scene
 
 
 def read_json(path):
@@ -95,7 +95,7 @@ def load_viewer_input(path, *, coordinates=None):
         physical = resolve_path(path, strict=True)
         if physical not in models:
             loaded = load_completed_modes(physical)
-            if loaded.manifest.get("version") == 16:
+            if loaded.manifest.get("version") == 18:
                 # Release training/interpolation arrays before loading the next frequency.
                 names = {"phi", "g_points", "support_class", "observation_view_mask", "alphas",
                          "alpha_identifiable_mask", "g_edge_index", "g_edge_weight", "g_component_index",
@@ -140,10 +140,6 @@ def load_viewer_input(path, *, coordinates=None):
         format_name = header.get("format")
         if format_name == "modal_gaussians.completed_modes":
             records = [{"completed_modes": str(root)}]
-        elif format_name == "modal_gaussians.modal_preview":
-            if header.get("version") not in (1, 2):
-                raise ValueError("Unsupported preview version")
-            records = [header]
         elif format_name == "modal_gaussians.modal_result":
             if header.get("version") != 1:
                 raise ValueError("Unsupported result version")
@@ -159,7 +155,7 @@ def load_viewer_input(path, *, coordinates=None):
             records = [record]
             coordinates = sources["coordinates"]["path"]
         else:
-            raise ValueError("Viewer input must be a model, result index, preview or result")
+            raise ValueError("Viewer input must be a model, result index or result")
     else:
         raise ValueError("Viewer input manifest must be an object or result index")
 

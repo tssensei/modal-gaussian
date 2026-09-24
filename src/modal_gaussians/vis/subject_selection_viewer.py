@@ -1,18 +1,14 @@
 """Select a static scene's motion subject with an oriented 3D box."""
 from __future__ import annotations
 
-from modal_gaussians.scene_store import resolve_path
+from modal_gaussians.common.scene_store import resolve_path
 
 import numpy as np
 import torch
 
-from modal_gaussians.camera_rendering import rasterize_cameras
-from modal_gaussians.static import (
-    _load_gsplat_rasterization, cameras_from_scene_manifest, load_static_scene,
-)
-from modal_gaussians.subject_selection import (
-    _box_values, load_subject_selection, points_in_box, save_subject_selection,
-)
+from modal_gaussians.common.camera_rendering import rasterize_cameras
+from modal_gaussians.geometry.scene import _load_gsplat_rasterization, cameras_from_scene_manifest, load_static_scene
+from modal_gaussians.geometry.selection import _box_values, load_subject_selection, points_in_box, save_subject_selection
 from modal_gaussians.vis.viewer import ModalViserViewer, ViewerCamera
 
 

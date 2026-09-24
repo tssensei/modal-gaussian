@@ -1,204 +1,80 @@
 # Current pipeline commands
 
-Use these commands for SEA-RAFT/shared-FFT frequency work with existing reference
-metadata and prepared geometry. They are examples, not a script to execute in
-full. Run only the requested stages and reuse completed matching artifacts.
-[The skill's no-validation policy](../SKILL.md#禁止-validate--no-experiment-validation)
-applies throughout. Historical bootstrap and research commands are archived in
-[legacy/commands.md](legacy/commands.md); they do not define the current pipeline.
+These are recipes, not a script to run automatically. Replace uppercase paths,
+labels, timing and frequency choices with inspected scene inputs. All outputs
+belong under `scene_library/<scene>/experiments/<new_name>/` or a matching scene
+cache. The [skill](../SKILL.md) and [baseline](../../../BASELINE.md) define scope.
+Run `modal-gaussians GROUP COMMAND --help` for additional options.
 
-Examples below use Anaconda Prompt from the repository root in the
-`modal-gaussian` environment. `modal-gaussians` is equivalent to
-`python -m modal_gaussians.cli`. On another host, resolve input/output paths and
-use its actual interpreter. Do not assume the old example dataset or frame rate.
+## Pixels, cameras and references
 
-## Flow only: compute once or reuse
+`prepare gui --root-dir PREPARATION` opens the optional frame/mask tool. Reuse
+existing extracted pixels and masks when available. Bind each fixed-view sequence:
 
-Corn already has complete flow at `outputs/corn1_sea_raft_0225_001` and
-`outputs/corn2_sea_raft_0225_001`. Reuse it. When inference is requested:
-
-```bat
-modal-gaussians flow compute --images data\prepared\images\corn1 --reuse-stabilization outputs\corn_local_001\flow\view1 --output outputs\corn1_sea_raft_flow_trial_001
+```sh
+modal-gaussians prepare reference --images IMAGES --masks MASKS --fps FPS --reference-frame FRAME --output REFERENCE
 ```
 
-The inherited artifact supplies frame order, FPS, reference and already
-stabilized images when present; its Farneback arrays and spectra are not read.
-The model repository and local weights default to `outputs/third_party/SEA-RAFT`
-and `outputs/models/sea-raft-M`; override with `--sea-raft-repo` and `--model-dir`.
-No model download, mask clipping, smoothing or temporal transform occurs here.
-Use a new output path; preserve the accepted flow and its ancestors.
+Add `--stabilize` only when new stabilization is required. Existing stabilized
+PNGs can be bound directly. The geometry reference PNG must match the image registered by COLMAP; its hash
+is checked when preparing observations. The chosen reference fixes the camera pixel grid.
+For a new static scene, COLMAP consumes the sweep and those geometry references:
 
-## Shared-grid spectrum and manual selection
-
-All views must share FPS and Nfft, with Nfft covering every sequence length.
-Original-length mean subtraction and symmetric Hann precede padding. This
-example is Corn at 20 fps, Nfft 1600, bins 0–800 over 0–10 Hz:
-
-```bat
-modal-gaussians --log-file outputs\corn_spectrum_001.log spectrum build --view view1 outputs\corn1_sea_raft_0225_001 --view view2 outputs\corn2_sea_raft_0225_001 --scene outputs\corn_subject_selection_001\static_scene --nfft 1600 --output outputs\corn_spectrum_001
+```sh
+modal-gaussians colmap prepare --frames SWEEP_IMAGES --frame-masks SWEEP_MASKS --reference view1 REF_IMAGE1 REF_MASK1 --reference view2 REF_IMAGE2 REF_MASK2 --sample-stride STRIDE --output COLMAP_INPUT
+modal-gaussians static train --input COLMAP_INPUT --work-dir STATIC_WORK --output STATIC
 ```
 
-The completed matching cache is reusable. All image pixels are stored; the
-manual subject box only chooses the default curve/display region. No Gaussian
-weight loading, training, optical-flow recomputation or validation is added.
+Use the current SIMPLE_RADIAL projection. Optional `static repartition` recomputes
+mask-based partition; manual subject selection is explicitly created through the
+static viewer and applied with `static apply-selection`. Never reuse a Gaussian
+order-dependent artifact after changing the partition.
 
-When the user requests a GUI, hand off its command without starting it:
+## Motion reference, flow and FFT
 
-```bat
-modal-gaussians spectrum viewer --input outputs\corn_spectrum_001 --work-dir outputs\corn_spectrum_001\work --host 127.0.0.1 --port 8110
+The motion reference can differ from the geometry reference:
+
+```sh
+modal-gaussians flow select-reference --scene STATIC --view-label view1 --reference REFERENCE1 --output SELECTION1
+modal-gaussians flow compute --images IMAGES1 --reference REFERENCE1 --reference-selection SELECTION1 --output FLOW1
+modal-gaussians spectrum build --view view1 FLOW1 --view view2 FLOW2 --scene STATIC --nfft NFFT --output FFT
+modal-gaussians spectrum select --input FFT --count COUNT --max-frequency MAX_HZ --output BIN_SELECTION
+modal-gaussians spectrum export --input FFT --selection BIN_SELECTION/selection.json --output MODAL_IMAGES
 ```
 
-The local URL is `http://127.0.0.1:8110/` after launch. Select actual plotted bins,
-step bins or enter exact grid frequencies. There is no automatic nearest-bin or
-peak snapping; off-grid input leaves selection unchanged. DC is display-only.
-Save produces a selection JSON. GUI Export also writes per-bin/view modal images
-under its new session's `modal_images` directory. The equivalent CLI is:
+Repeat selection/flow for every view. All views must share FPS and NFFT, and NFFT
+must cover every video. Preserve the actual bin list for exact reproduction.
+`--max-frequency` is optional; selection otherwise spans positive bins to Nyquist.
+A requested `spectrum viewer --input FFT --work-dir VIEWER_WORK` can save manually
+selected bins. Export copies cached complex slices; it never recomputes DFT.
 
-```bat
-modal-gaussians spectrum export --input outputs\corn_spectrum_001 --selection PATH_TO_SELECTION_JSON --output outputs\corn_selected_modes_trial_001\modal_images
+## Reusable geometry and frequency training
+
+Freeze observations/KNN geometry directly from the static scene and references.
+Per-view relative depth tolerances are explicit calibration values; do not invent
+them from another scene. Read the resulting `manifest.json` for `geometry_graph`.
+
+```sh
+modal-gaussians motion prepare-neural --scene STATIC --view view1 REFERENCE1 TOLERANCE1 --view view2 REFERENCE2 TOLERANCE2 --config configs/neural_component_field.json --cache-dir SCENE_CACHE --output PREPARED
+modal-gaussians motion batch-neural --modal-images MODAL_IMAGES --prepared PREPARED --geometry-graph GEOMETRY_GRAPH --config configs/neural_component_field.json --output BATCH --cpu-workers 3 --gpu-workers 2 --threads-per-worker 2
 ```
 
-CLI export writes `bin_XXXX/view1` and other views directly inside `--output`.
-This copies cache slices; a missing or mismatched cache is an error, not permission
-to fall back to DFT. Frequency 0.225 Hz is bin 18 in this example.
+The batch prepares each frequency, constructs its soft graph, computes GPU control
+weights, then trains the GNN. `--stage weights` stops before training. A completed
+mode batch writes `index.json`, usable directly by `viewer --input BATCH/index.json`
+and coefficient preparation. The viewer still requires an explicit work directory.
+No viewer or temporal fitting starts automatically.
 
-For requested uniform/greedy comparisons, use `spectrum select --input CACHE
---method uniform --count 60 --output NEW_SELECTION_DIR`, or `--method greedy
---topology EXISTING_TOPOLOGY`. Both produce `selection.json` for `spectrum export`.
-Greedy additionally saves its ordered gains and sufficient statistics, fitting
-SEA-RAFT targets on the existing topology samples without DFT. These fits are the
-selection objective, not an added validation pass. Uniform bins span `(0, Nyquist]`;
-resolve the actual frame rate from source metadata. Bush is 30 fps; Corn is 20 fps.
+The same stages can be called individually for one exported bin:
 
-## Selected-modal preparation and matching graph
-
-The exported fields can introduce a frequency absent from the parent snapshot.
-Preparation preserves geometry/timing and recomputes complex view alignment and
-normalization; it does not inherit another mode's alignment or specialized graph.
-
-```bat
-modal-gaussians motion prepare-selected-modal --prepared outputs\corn_subject_selection_001\prepared --view view1 outputs\corn_selected_modes_trial_001\modal_images\bin_0018\view1 --view view2 outputs\corn_selected_modes_trial_001\modal_images\bin_0018\view2 --frequency-hz 0.225 --output outputs\corn_prepared_trial_001
-modal-gaussians graph build-modal-similarity --prepared outputs\corn_prepared_trial_001 --geometry-graph PATH_TO_UNFILTERED_GEOMETRY_CACHE --view view1 outputs\corn_selected_modes_trial_001\modal_images\bin_0018\view1 --view view2 outputs\corn_selected_modes_trial_001\modal_images\bin_0018\view2 --frequency 0.225 --soft-weights --minimum-edge-factor 0.05 --output outputs\corn_soft_graph_trial_001
+```sh
+modal-gaussians motion prepare-selected-modal --prepared PREPARED --view view1 BIN/view1 --view view2 BIN/view2 --frequency-hz HZ --output FREQUENCY_PREPARED
+modal-gaussians graph build-modal-similarity --prepared FREQUENCY_PREPARED --geometry-graph GEOMETRY_GRAPH --view view1 BIN/view1 --view view2 BIN/view2 --frequency HZ --output SOFT_GRAPH
+modal-gaussians motion prepare-control-weights --prepared FREQUENCY_PREPARED --geometry-graph SOFT_GRAPH --config configs/neural_component_field.json --frequency-hz HZ --output WEIGHTS_READY.json
+modal-gaussians motion iterate-neural --prepared FREQUENCY_PREPARED --geometry-graph SOFT_GRAPH --config configs/neural_component_field.json --frequency-hz HZ --output EXPERIMENT
 ```
 
-Resolve `PATH_TO_UNFILTERED_GEOMETRY_CACHE` from the matching scene/prepared
-metadata. Do not substitute a pruned graph or another scene's cache. Keep baseline
-K=16/radius 0.08 and soft factors 1/0.05. Controls/support retain original
-geometric distances; soft propagation attenuates interpolation without increasing
-control count. [BASELINE.md](../../../BASELINE.md) records exact accepted paths
-and numerical settings. Modal graph files remain frequency-specific, but prepared
-component-field training shares geometry independently of weights and observations.
-
-Before a batch, import compatible existing controls without sampling them again:
-
-```bat
-modal-gaussians motion prepare-shared-controls --prepared outputs\bush_neural_modal_similarity_0744_001\prepared --geometry-graph outputs\_cache\geometry\d8037d88fd6390382ad02ca899fb5f6ce7009e3a33814209164047b77be43126 --controls-from outputs\_cache\trained_modes\50a4e5e3a235247ed38405eeea55adbea7d811c0e6c5069db83cd556989fea32 --config configs\neural_component_field.json
-```
-
-This reads the existing KNN and v16 layout, fills material distances on saved
-supports once, and publishes `control_geometry` in the prepared cache directory.
-Alternatively, pass an existing compatible `control_geometry` directory through
-`--controls-from` to import both layout and support distances without recomputing
-them. This is useful after a code change; source cache identities remain intact.
-No network replay, training or validation occurs. Later `iterate-neural` calls
-reuse it automatically; only soft propagation/control weights are recomputed
-under `control_weights`, with observation-dependent donor roles kept separate.
-Without a compatible import/cache, layout construction runs once. Changing
-topology, geometry, control radius/budget or learning-component gates creates a
-different shared cache. Old completed artifacts and single-frequency inputs remain
-readable. A stopped run created before this code change needs a new experiment
-directory; preserve its checkpoint rather than rewriting its contract.
-
-An applied manual subject scene may be passed to preparation using `--scene`.
-It rebuilds observations using visible selected-Gaussian contributions, without
-old fine-mask gating. A new scene without existing reference metadata/prepared
-geometry needs a separately resolved bootstrap. Do not silently launch the
-archived Farneback chain to manufacture these inputs.
-
-## Train modes, optionally publish a manual preview
-
-```bat
-modal-gaussians motion iterate-neural --prepared outputs\corn_prepared_trial_001 --config configs\neural_component_field.json --geometry-graph outputs\corn_soft_graph_trial_001 --frequency-hz 0.225 --output outputs\corn_modes_trial_001\experiment --stage modes
-```
-
-The default endpoint is `modes_ready`, without validation or per-frame coordinates.
-The preset uses rigidity 0.03 and control-rotation loss 0; local motion rotations
-and Viewer ellipsoid rotation remain enabled. The accepted component-field donor
-rules are unchanged. For exact historical reproduction, use its frozen config.
-
-When a preview is requested, use the same settings and `--stage preview` instead.
-After publication, provide this launch command without executing it:
-
-```bat
-modal-gaussians viewer --preview outputs\corn_modes_trial_001\experiment\preview --work-dir outputs\corn_modes_trial_001\work\viewer --host 127.0.0.1 --port 8108
-```
-
-A preview does not imply that Viser was started or the result was visually tested.
-Do not append `--stage full`, coordinate fitting, PNG exports or quality checks.
-
-## Logs, failures and compatibility
-
-The current config sets `neural.max_iterations=5000`, counting all prior updates
-when resuming. For an iteration-cap increase, stop dispatch and let active work
-finish, then use a new batch output and `--continue-from OLD_BATCH` (not
-`--resume-from`, which skips completed frequencies). The same option on
-`motion iterate-neural` takes an old experiment directory. Only the cap may
-increase; data/graph/loss/optimizer settings must match. Published prepared
-inputs and graph caches are reused. Compatible checkpoints retain model,
-optimizer, RNG, history and patience; already-converged checkpoints need no
-additional updates. Missing/incompatible numerical-input checkpoints restart
-with a logged reason. Old results and their identities remain unchanged.
-
-For an explicitly authorized parallel batch from an already exported selection:
-
-```bat
-modal-gaussians storage run --scene bush -- motion batch-neural --modal-images @modal_images --prepared @prepared --geometry-graph @candidate_graph --config configs/neural_component_field.json --output @experiments/uniform60_cupy_001 --cpu-workers 3 --gpu-workers 2 --threads-per-worker 2 --stage modes
-```
-
-CuPy float64 is the default (`--propagation-backend cupy` remains accepted).
-CPU slots prepare observations and modal graph evidence while one resident GPU
-worker computes frequency control weights. The worker reuses topology/workspace;
-all required weights finish before it exits and the GNN queue begins. Control
-layout and supports are unchanged. Import saved shared geometry first if source
-revision changes its cache key. Missing CuPy or a GPU error fails explicitly.
-
-Use `--stage weights` to prepare weights only, then the same output/command with
-`--stage modes` to continue. Monitor `batch_state.json`, `gpu_weights.log`,
-`propagation_status.json` and five-second `gpu_usage.csv` samples. Change
-`batch_workers.json` atomically, for example `{"cpu_workers":3,"gpu_workers":2}`.
-Any positive GPU count enables one weight worker; it controls normal GNN
-concurrency after the weight phase. Zero pauses new frequencies while active
-work finishes. No ordinary experiment needs `propagation_workers`.
-
-The CPU adaptive-Dijkstra implementation lives under `motion/legacy/neural`.
-Only explicit historical comparisons use `--propagation-backend cpu`; that route
-retains `--propagation-workers` and the old CPU/GPU-overlap scheduler. A GPU cache
-cannot be substituted for a legacy CPU identity, or vice versa. Use a new output
-when changing backend or code, and preserve historical artifacts. Do not resume
-the stopped Bush batch without a user request. See `docs/gpu-soft-propagation.md`
-for installation, reuse and benchmark details.
-
-To migrate an old unsplit scheduler, first set its control file to `{"workers":0}`,
-let its active frequencies finish, and stop that idle scheduler. Only then replace
-the file with the two queue limits. Scheduling-only changes preserve scientific
-identities and can resume the same batch directory.
-
-To continue after a model/geometry code change, first let active frequencies finish and stop the
-old scheduler. Use a new `--output` plus `--resume-from OLD_BATCH`. Matching
-completed modes are inherited through their original `result_dir`; there is no
-network replay or identity rewrite. Inputs, selected bins and scientific config
-must match. Unfinished frequencies run under the new code; import the existing
-shared geometry cache before launching if its code key changed. Subsequent
-resumes use the same complete command, including `--resume-from`.
-
-Place `--log-file PATH` before the subcommand, outside the new artifact directory.
-Keep the failing process's output/checkpoint, repair an actual failure and resume
-with unchanged scientific settings. Use exit status and existing publication
-metadata to report completion; do not read back or hash-scan the output as a check.
-Avoid duplicate training processes and broad environment changes.
-
-Old flow/mode/result readers preserve artifact identities and ancestors. Explicit
-historical computation uses `legacy flow analyze`, `legacy frequency select` and
-`legacy frequency export-modes`; ordinary work must not execute them. Coordinate
-and static/bootstrap compatibility commands remain available when specifically
-needed. Do not delete historical dependencies referenced by accepted outputs.
+Mode output is bound by `EXPERIMENT/status.json`. Shared control geometry is created
+or reused automatically. Never use a soft graph from another frequency. To proceed
+to video reconstruction, follow [COEFFICIENT_FITTING.md](../../../COEFFICIENT_FITTING.md)
+only when requested. See [recovery](validation-recovery.md) for resume semantics.
