@@ -79,13 +79,14 @@ def _rgb_loss(prediction: Tensor, target: Tensor) -> Tensor:
 def solve_rgb_coordinates_view(
     initial: np.ndarray,
     pair_scales: np.ndarray,
-    reference_index: int,
-    render: Callable[[Tensor, float], Tensor],
+    reference_index: int | None,
+    render: Callable[[Tensor, float], Tensor] | None,
     target: Callable[[int, float], Tensor],
     config: RGBFitConfig = RGBFitConfig(),
     device: str | torch.device = "cuda",
     *,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
+    render_frame: Callable[[int, Tensor, float], Tensor] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Optimize one independently captured sequence with frozen rendering inputs.
 
@@ -98,6 +99,8 @@ def solve_rgb_coordinates_view(
     offset first places reference-relative flow coordinates in the static
     scene's frame. This result anchors the subsequent unconstrained per-frame
     fit; no zero-mean, temporal, or oscillator constraint is applied.
+    Moving-camera sequences pass ``render_frame(frame, q, scale)`` and
+    ``reference_index=None`` to preserve their initial absolute coordinate gauge.
     """
     config.validate()
     initial = np.asarray(initial)
@@ -116,7 +119,7 @@ def solve_rgb_coordinates_view(
         or np.any(pair_scales <= 0.0)
     ):
         raise ValueError("RGB-fit pair_scales must be finite positive real [K] values")
-    if (
+    if reference_index is not None and (
         isinstance(reference_index, bool)
         or not isinstance(reference_index, (int, np.integer))
         or not 0 <= reference_index < len(initial)
@@ -125,7 +128,8 @@ def solve_rgb_coordinates_view(
 
     scales = torch.tensor(pair_scales, dtype=torch.float32, device=device)
     relative = torch.tensor(initial, dtype=torch.complex64, device=device)
-    relative = relative - relative[reference_index].clone()
+    if reference_index is not None:
+        relative = relative - relative[reference_index].clone()
     normalized = torch.view_as_real(relative * scales).clone()
     if not torch.isfinite(normalized).all() or not torch.all(torch.isfinite(scales) & (scales > 0)):
         raise ValueError("RGB-fit coordinates and scales must be representable in float32")
@@ -141,7 +145,8 @@ def solve_rgb_coordinates_view(
         return torch.complex(value[..., 0], value[..., 1]) / scales
 
     def photometric(value: Tensor, frame: int, scale: float) -> Tensor:
-        prediction = render(complex_coordinates(value), scale)
+        q = complex_coordinates(value)
+        prediction = render(q, scale) if render_frame is None else render_frame(frame, q, scale)
         observed = target(frame, scale).detach().to(device=prediction.device, dtype=prediction.dtype)
         loss = _rgb_loss(prediction, observed)
         if not torch.isfinite(loss):
@@ -209,7 +214,7 @@ def solve_rgb_coordinates_view(
         "config": config.to_dict(),
         "frame_count": len(initial),
         "mode_count": initial.shape[1],
-        "reference_index": int(reference_index),
+        "reference_index": None if reference_index is None else int(reference_index),
         "shared_offset_real": shared_offset.real.tolist(),
         "shared_offset_imag": shared_offset.imag.tolist(),
         "history": history,

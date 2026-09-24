@@ -70,7 +70,7 @@ class SpectrumComparisonController:
         self.result = result
         self.projections = projections or ViewerProjections(result)
         self.frequencies_hz = np.asarray([m.frequency for m in result.modes], np.float64)
-        self.design_views = result.views
+        self.design_views = result.observation_views
         self._lock = threading.RLock()
         self._executor = None
         self._pending = set()

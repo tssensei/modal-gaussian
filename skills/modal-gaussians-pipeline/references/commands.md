@@ -64,6 +64,8 @@ weights, then trains the GNN. `--stage weights` stops before training. A complet
 mode batch writes `index.json`, usable directly by `viewer --input BATCH/index.json`
 and coefficient preparation. The viewer still requires an explicit work directory.
 No viewer or temporal fitting starts automatically.
+Add `--no-spectrum` to `viewer` for 3D playback without loading the optional FFT
+panel. This does not relax source validation when Spectrum is enabled.
 
 The same stages can be called individually for one exported bin:
 

@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from modal_gaussians.geometry.scene import GAUSSIAN_FIELDS, Camera, ForegroundBackgroundScene, GaussianSet, StaticDataset, cameras_from_scene_manifest, initialize_static_scene, load_static_dataset, load_static_scene, tensor_dictionary_identity
 from modal_gaussians.common.progress import Progress, report_progress
 from modal_gaussians.common.camera_geometry import PROJECTION_CONVENTION
+from modal_gaussians.geometry.density import densify_parameters, remap_parameters
 
 
 @dataclass(frozen=True)
@@ -241,27 +242,6 @@ def _scene_from_tensor_dictionary(tensors: Mapping[str, Tensor]) -> ForegroundBa
         raw = {field: tensors[f"{part}.{field}"].float() for field in GAUSSIAN_FIELDS}
         parts[part] = GaussianSet(**raw)
     return ForegroundBackgroundScene(parts["foreground"], parts["background"])
-
-
-def _quaternion_to_rotation_matrix(quaternions: Tensor) -> Tensor:
-    """Convert normalized wxyz quaternions to differentiable 3x3 rotations."""
-
-    values = F.normalize(quaternions, dim=-1)
-    w, x, y, z = values.unbind(dim=-1)
-    return torch.stack(
-        (
-            1 - 2 * (y * y + z * z),
-            2 * (x * y - w * z),
-            2 * (x * z + w * y),
-            2 * (x * y + w * z),
-            1 - 2 * (x * x + z * z),
-            2 * (y * z - w * x),
-            2 * (x * z - w * y),
-            2 * (y * z + w * x),
-            1 - 2 * (x * x + y * y),
-        ),
-        dim=-1,
-    ).reshape(-1, 3, 3)
 
 
 class StaticTrainer:
@@ -518,60 +498,8 @@ class StaticTrainer:
         """Split/duplicate one semantic set without crossing its index domain."""
 
         part: GaussianSet = getattr(self.scene, part_name)
-        old_count = part.count
-        added_count = int(duplicate.sum().item()) + 2 * int(split.sum().item())
-        split_means = part.params["means"].detach()[split]
-        if split_means.numel() > 0:
-            split_scales = torch.exp(part.params["log_scales"].detach()[split])
-            split_rotations = _quaternion_to_rotation_matrix(
-                part.params["quaternions"].detach()[split]
-            )
-            local_offsets = torch.randn(
-                (len(split_means), 2, 3),
-                device=self.device,
-                dtype=split_means.dtype,
-            ) * split_scales[:, None, :]
-            world_offsets = torch.einsum(
-                "nij,nkj->nki", split_rotations, local_offsets
-            )
-            child_means = (split_means[:, None, :] + world_offsets).reshape(-1, 3)
-        else:
-            child_means = split_means.new_empty((0, 3))
-        for field in GAUSSIAN_FIELDS:
-            old_parameter = part.params[field]
-            value = old_parameter.detach()
-            split_values = value[split].repeat_interleave(2, dim=0)
-            if field == "means":
-                split_values = child_means
-            elif field == "log_scales":
-                split_values = split_values - math.log(1.6)
-            resized = torch.cat(
-                [value[~split], value[duplicate], split_values], dim=0
-            )
-            new_parameter = part.replace_parameter(field, resized)
-
-            def transform_state(
-                state_value: Any,
-                *,
-                count: int = old_count,
-                keep: Tensor = ~split,
-                additions: int = added_count,
-            ) -> Any:
-                """Remove split parents and append zeroed state for new children."""
-
-                if not isinstance(state_value, Tensor) or state_value.ndim == 0:
-                    return state_value
-                if state_value.shape[0] != count:
-                    return state_value
-                zeros = state_value.new_zeros((additions,) + state_value.shape[1:])
-                return torch.cat([state_value[keep], zeros], dim=0)
-
-            self._replace_optimizer_parameter(
-                f"{part_name}.{field}",
-                old_parameter,
-                new_parameter,
-                transform_state,
-            )
+        densify_parameters(part, {field: self.optimizers[f"{part_name}.{field}"]
+                                  for field in GAUSSIAN_FIELDS}, split, duplicate)
 
     @staticmethod
     def _limit_densify_candidates(
@@ -698,32 +626,8 @@ class StaticTrainer:
         part: GaussianSet = getattr(self.scene, part_name)
         if int((~cull).sum().item()) < 2:
             raise RuntimeError(f"Density control would leave fewer than two {part_name} Gaussians")
-        old_count = part.count
-        for field in GAUSSIAN_FIELDS:
-            old_parameter = part.params[field]
-            resized = old_parameter.detach()[~cull]
-            new_parameter = part.replace_parameter(field, resized)
-
-            def transform_state(
-                state_value: Any,
-                *,
-                count: int = old_count,
-                keep: Tensor = ~cull,
-            ) -> Any:
-                """Keep only Adam rows belonging to surviving Gaussians."""
-
-                if not isinstance(state_value, Tensor) or state_value.ndim == 0:
-                    return state_value
-                if state_value.shape[0] != count:
-                    return state_value
-                return state_value[keep]
-
-            self._replace_optimizer_parameter(
-                f"{part_name}.{field}",
-                old_parameter,
-                new_parameter,
-                transform_state,
-            )
+        remap_parameters(part, {field: self.optimizers[f"{part_name}.{field}"]
+                                for field in GAUSSIAN_FIELDS}, (~cull).nonzero().flatten())
 
     @torch.no_grad()
     def _cull(self) -> dict[str, int]:

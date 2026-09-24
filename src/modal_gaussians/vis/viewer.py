@@ -146,12 +146,16 @@ class ViewerCamera:
 
 
 def _completed_mode_display_roles(manifest, arrays):
-    if manifest.get('version') not in (18, 17):
+    if manifest.get('version') not in (18, 17, 19):
         raise ValueError('Unsupported model for Viewer')
     support, phi = np.asarray(arrays['support_class']), np.asarray(arrays['phi'])
     if (phi.ndim != 3 or phi.shape[2] != 3 or support.shape != phi.shape[:2]
             or support.dtype.kind not in 'iu' or np.any((support < 0) | (support > 3))):
         raise ValueError('Invalid support classes')
+    if manifest.get('version') == 19:
+        return np.asarray([2,0,1,3], np.int8)[support], tuple('inherited ' + name for name in NEURAL_SUPPORT_DISPLAY_NAMES) + ('inherited propagated',), (
+            '**Inherited mode sources:** blue = supervised source | green = inferred source | '
+            'purple = unresolved | yellow = donor source. Refined points have no new modal supervision.')
     return np.asarray([2,0,1,3], np.int8)[support], NEURAL_SUPPORT_DISPLAY_NAMES + ('propagated',), (
         '**Role colors:** directly supervised = blue | structure inferred = green | '
         'unresolved = purple | propagated = yellow')
@@ -252,7 +256,7 @@ class ModalViewerData:
     """Hold strict result data and implement all scientific display transforms."""
 
     def __init__(self, result_dir: str | Path, device: str = "cuda", *,
-                 coordinates=None, work_dir=None) -> None:
+                 coordinates=None, work_dir=None, with_spectrum=True) -> None:
         requested_device = torch.device(device)
         if requested_device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("Modal Gaussian Viser requires a CUDA device")
@@ -290,7 +294,7 @@ class ModalViewerData:
         self._load_graph_display(0)
         self.projections = None
         self.spectrum = None
-        if all("selected_modal_supervision" in m.artifact.manifest for m in modes):
+        if with_spectrum and all("selected_modal_supervision" in m.artifact.manifest or m.artifact.manifest.get("version") in (17, 19) for m in modes):
             self.projections = ViewerProjections(self.result, work_dir)
             self.spectrum = SpectrumComparisonController(self.result, projections=self.projections)
         self.gpu_lock = self.projections.gpu_lock if self.projections else threading.RLock()
@@ -300,7 +304,7 @@ class ModalViewerData:
         mode = self.result.modes[index]
         arrays = mode.artifact.arrays
         self.control_point_gaussian_index = _control_point_gaussian_indices(arrays, self.scene.foreground.count)
-        self.control_point_colors = (_component_colors(arrays["g_component_index"][self.control_point_gaussian_index])
+        self.control_point_colors = (_component_colors(arrays.get("g_component_index", np.zeros(self.scene.foreground.count, np.int64))[self.control_point_gaussian_index])
             if len(self.control_point_gaussian_index) else np.empty((0, 3), np.float32))
         self.control_positions = np.asarray(arrays.get("c_positions", np.empty((0, 3), np.float32)))
         self.control_displacement = mode.artifact.control_displacement
@@ -319,6 +323,15 @@ class ModalViewerData:
         mode_index = 0 if mode_index is None else mode_index
         completed = self.result.modes[mode_index].artifact
         self.structure_graph = None
+        self.reference_graph_points = None
+        if completed.manifest.get("version") == 19:
+            self.reference_graph_points = completed.arrays["reference_points"]
+            self.graph_edge_gaussian_index = completed.arrays["reference_edges"]
+            self.graph_edge_colors = np.tile(np.array([[.3, .7, .9]], np.float32), (len(self.graph_edge_gaussian_index), 1))
+            self.graph_mode_index = mode_index
+            self.graph_edge_colors_by_mode = None
+            self.graph_legend = '**Fixed motion reference graph:** original canonical nodes; independent of refined Gaussian indices.'
+            return
         self.graph_edge_gaussian_index, self.graph_edge_colors = _neural_graph_display(
             completed.arrays, self.scene.foreground.count)
         self.graph_mode_index = mode_index
@@ -579,10 +592,15 @@ class ModalViserViewer:
             self.playback = add_gui_playback_group(
                 self.server,
                 num_frames=self._active_frame_count(),
-                initial_fps=30.0 if self.data.coordinates is None else 15.0,
+                initial_fps=self.data.result.coordinate_views.get(str(self.playback_view.value), {}).get('fps_hz', 30.),
+                max_fps=max(60., max((v.get('fps_hz', 30.) for v in self.data.result.coordinate_views.values()), default=30.)),
                 num_frames_getter=self._active_frame_count,
             )
             self.timestep = self.playback[0]
+            self.follow_camera = self.server.gui.add_checkbox("Follow recorded frame camera", False)
+            self.follow_camera.on_update(self._follow_frame_camera)
+            self.timestep.on_update(self._follow_frame_camera)
+            self.playback_view.on_update(self._follow_frame_camera)
             self.canonical = self.server.gui.add_checkbox("Canonical", False)
             self.timestep.on_update(self.request_render)
             self.playback_view.on_update(self._on_playback_view)
@@ -628,6 +646,8 @@ class ModalViserViewer:
             self.timestep.max = maximum
         if int(self.timestep.value) > maximum:
             self.timestep.value = maximum
+        if hasattr(self, 'playback'):
+            self.playback[-1].value = self.data.result.coordinate_views.get(str(self.playback_view.value), {}).get('fps_hz', 30.)
         self.request_render(event)
 
     def _on_canonical(self, event: Any) -> None:
@@ -764,6 +784,8 @@ class ModalViserViewer:
         """Build RGB, projected phase, and observation-support color controls."""
 
         with self.server.gui.add_folder("Gaussian color"):
+            if any(m.artifact.manifest.get("version") == 19 for m in self.data.result.modes):
+                self.server.gui.add_markdown("Observation counts and roles are inherited from the original mode sources; refined points have no new modal supervision.")
             self.color_mode = self.server.gui.add_dropdown(
                 "Render color mode",
                 options=((COLOR_RGB, COLOR_PHASE, COLOR_OBSERVATIONS) if self.data.spectrum is not None
@@ -1084,8 +1106,12 @@ class ModalViserViewer:
             self._remove_component_graph()
             return
         gaussian_edges = self.data.graph_edge_gaussian_index[selected]
-        points = means[torch.as_tensor(gaussian_edges, device=means.device)]
-        points_numpy = points.detach().cpu().numpy()
+        reference = getattr(self.data, "reference_graph_points", None)
+        if reference is None:
+            points = means[torch.as_tensor(gaussian_edges, device=means.device)]
+            points_numpy = points.detach().cpu().numpy()
+        else:
+            points_numpy = reference[gaussian_edges]
         if (
             self._component_graph_handle is None
             or not np.array_equal(selected, self._component_graph_edge_indices)
@@ -1153,6 +1179,21 @@ class ModalViserViewer:
             client.camera.look_at = self._orbit_center
             client.camera.wxyz = wxyz
             client.camera.fov = camera.fov
+
+    def _recorded_frame_camera(self):
+        from modal_gaussians.coordinates.sequences import frame_camera
+        view = self.data.result.coordinate_views.get(str(self.playback_view.value))
+        if view is None:
+            return self.data.camera_by_label[str(self.playback_view.value)].camera
+        cameras = {c.name: c for c in cameras_from_scene_manifest(self.data.scene.manifest)}
+        return frame_camera(cameras, view, min(int(self.timestep.value), view['frame_count'] - 1))
+
+    def _follow_frame_camera(self, event=None):
+        if self.follow_camera.value:
+            camera = ViewerCamera.from_camera(self._recorded_frame_camera())
+            for client in self.server.get_clients().values():
+                self._apply_camera(client, camera)
+        self.request_render(event)
 
     def _build_camera_controls(self) -> None:
         """Build calibrated frustums, camera-jump buttons, and orbit reset."""
@@ -1301,6 +1342,10 @@ class ModalViserViewer:
         q, scale = self._current_coordinate()
         means = self.data.deformed_means(q, scale)
         camera = self._render_camera(client)
+        if self.follow_camera.value:
+            from modal_gaussians.coordinates.rendering import scaled_camera
+            saved = self._recorded_frame_camera()
+            camera = scaled_camera(saved, min(1., int(self.viewer_resolution.value) / max(saved.width, saved.height))).to(self.data.device)
         only_controls = self._controls_only_enabled()
         if only_controls:
             self._remove_support_cloud()
@@ -1350,13 +1395,15 @@ def run_modal_viewer(
     port: int = 8080,
     viewer_resolution: int = 2048,
     coordinates: str | Path | None = None,
+    with_spectrum: bool = True,
 ) -> None:
     """Load one complete modal result and run its full Viser interface."""
 
     # Load the CUDA backend synchronously. Deferring this to a render worker
     # leaves a connected but blank Viewer when compiler activation fails.
     _load_gsplat_rasterization()
-    data = ModalViewerData(result_dir, coordinates=coordinates, work_dir=work_dir)
+    data = ModalViewerData(result_dir, coordinates=coordinates, work_dir=work_dir,
+                           with_spectrum=with_spectrum)
     viewer = ModalViserViewer(
         data,
         work_dir=work_dir,

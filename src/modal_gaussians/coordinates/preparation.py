@@ -48,7 +48,7 @@ def _bank_identity(m):
                     "static_scene_identity", "foreground_identity", "modes", "views", "counts", "files")})
 
 
-def load_mode_bank(path):
+def load_mode_bank(path, *, validate=False):
     root = resolve_path(path, strict=True)
     m = _json(root / "manifest.json")
     if (m.get("format") != COMPLETED_MODES_FORMAT or m.get("version") != 17
@@ -56,6 +56,13 @@ def load_mode_bank(path):
             or m.get("completed_modes_identity") != _bank_identity(m)):
         raise ValueError("Unsupported or inconsistent mode bank")
     _validate_modes(m["modes"])
+    if ([{k: s[k] for k in ('identity', 'slot', 'frequency_hz')} for s in m['sources']]
+            != m['contract']['sources'] or m['views'] != m['contract']['views']):
+        raise ValueError('Mode-bank source contract differs')
+    if validate:
+        for record in m["files"].values():
+            if Path(record["file"]).name != record["file"] or sha256(root / record["file"]) != record["sha256"]:
+                raise ValueError("Mode-bank checksum differs")
     arrays = {}
     for name in ("phi", "rotation"):
         if m["files"][name]["file"] != f"{name}.npy":

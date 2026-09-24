@@ -16,7 +16,8 @@ import torch
 from modal_gaussians.preprocessing.frames import media_executable, _process_options
 from modal_gaussians.common.progress import Progress
 from modal_gaussians.results.artifact import load_modal_result
-from modal_gaussians.coordinates.rendering import make_rgb_renderer
+from modal_gaussians.coordinates.rendering import make_sequence_renderer
+from modal_gaussians.coordinates.sequences import frame_camera
 from modal_gaussians.common.scene_store import resolve_path
 from modal_gaussians.geometry.scene import cameras_from_scene_manifest
 
@@ -27,7 +28,7 @@ def export_result_video(*, result_dir, view_label, output_dir, device="cuda") ->
     if destination.exists():
         raise FileExistsError(f"Video output already exists: {destination}")
     result = load_modal_result(result_dir)
-    if result.manifest["coordinate_source"]["kind"] != "rgb":
+    if result.manifest["coordinate_source"]["kind"] not in ("rgb", "refined_rgb", "sweep_rgb", "mixed_rgb"):
         raise ValueError("Video comparison requires an RGB-fitted result with recorded input images")
     views = {view["label"]: view for view in result.manifest["views"]}
     if view_label not in views:
@@ -55,12 +56,15 @@ def export_result_video(*, result_dir, view_label, output_dir, device="cuda") ->
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError("Video FPS must be finite and positive")
     cameras = {camera.name: camera for camera in cameras_from_scene_manifest(result.scene.manifest)}
-    camera = cameras[view["camera_name"]]
+    frame_cameras = [frame_camera(cameras, view, i) for i in range(count)]
+    camera = frame_cameras[0]
     height, width = view["shape_hw"]
     if [camera.height, camera.width] != [height, width]:
         raise ValueError("Video camera dimensions differ from the recorded RGB frames")
     ffmpeg = media_executable("ffmpeg")
-    render = make_rgb_renderer(result.scene, camera, result.completed_modes.arrays["phi"],
+    if count > 1 and not np.allclose(np.diff([f['timestamp_seconds'] for f in view['frames']]), 1 / fps):
+        raise ValueError("Video export requires a uniform recorded time grid matching FPS")
+    render = make_sequence_renderer(result.scene, frame_cameras, result.completed_modes.arrays["phi"],
                                result.completed_modes.rotation, device)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f".{destination.name}.", dir=destination.parent) as temporary:
@@ -89,7 +93,7 @@ def export_result_video(*, result_dir, view_label, output_dir, device="cuda") ->
                         # Fitted q already includes the pose offset; never re-zero or amplify it.
                         q = torch.tensor(result.coordinates.coordinates[offset + index],
                                          dtype=torch.complex64, device=device)
-                        prediction = render(q, 1.0)
+                        prediction = render(index, q, 1.0)
                         if tuple(prediction.shape) != (height, width, 3) or not torch.isfinite(prediction).all():
                             raise ValueError(f"Invalid reconstructed RGB frame: {record['name']}")
                         reconstructed = prediction.clamp(0, 1).mul(255).round().to(torch.uint8).cpu().numpy()

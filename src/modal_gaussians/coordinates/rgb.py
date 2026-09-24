@@ -48,6 +48,18 @@ class RGBModalCoordinatesArtifact:
     coordinates: np.ndarray
 
 
+def load_rgb_frame(path, shape_hw, expected_sha256=None):
+    """Decode the recorded PNG grid and optionally verify its immutable bytes."""
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise ValueError(f"RGB source changed since fitting: {path}")
+    bgr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if bgr is None or list(bgr.shape[:2]) != list(shape_hw):
+        raise ValueError(f"RGB frame cannot be decoded at the recorded shape: {path}")
+    return torch.from_numpy(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)).float() / 255., digest
+
+
 def _identity(manifest: Mapping[str, Any]) -> str:
     # Paths and command lines may change when the same immutable artifacts move.
     fields = ("format", "version", "direct_coordinates_identity", "rendered_design_identity",
@@ -181,15 +193,8 @@ def build_rgb_modal_coordinates_artifact(
         @lru_cache(maxsize=8)
         def target(frame: int, scale: float) -> torch.Tensor:
             path = paths[frame]
-            raw = path.read_bytes()
-            digest = hashlib.sha256(raw).hexdigest()
-            if path.name in hashes and hashes[path.name] != digest:
-                raise ValueError(f"RGB source changed during fitting: {path}")
+            rgb, digest = load_rgb_frame(path, view["shape_hw"], hashes.get(path.name))
             hashes[path.name] = digest
-            bgr = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if bgr is None or list(bgr.shape[:2]) != view["shape_hw"]:
-                raise ValueError(f"RGB frame cannot be decoded at the recorded shape: {path}")
-            rgb = torch.from_numpy(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)).float() / 255.0
             return resize_rgb(rgb, scale)
 
         render = make_rgb_renderer(scene, camera, completed.arrays["phi"], completed.rotation, device)

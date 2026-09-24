@@ -10,6 +10,7 @@ import numpy as np
 from modal_gaussians.motion.common.completed_modes import CompletedModesArtifact, load_completed_modes
 from modal_gaussians.coordinates.design import load_rendered_modal_design
 from modal_gaussians.results.artifact import _load_coordinate_artifact
+from modal_gaussians.common.cache import identity, sha256
 from modal_gaussians.common.scene_store import library_root, resolve_path
 from modal_gaussians.geometry.scene import cameras_from_scene_manifest, load_static_scene
 
@@ -26,10 +27,11 @@ class ViewerMode:
     design_slot: int = 0
     settings: dict = field(default_factory=dict)
     prepared: Path | None = None
+    observation_source: dict | None = None
 
     @property
     def key(self):
-        return self.artifact.manifest["completed_modes_identity"], self.slot
+        return _model_keys(self.artifact.manifest)[self.slot]
 
     @property
     def frequency(self):
@@ -37,7 +39,9 @@ class ViewerMode:
 
     @cached_property
     def modal_views(self):
-        model = self.artifact.manifest
+        model = self.observation_source or self.artifact.manifest
+        if model.get("version") == 19:
+            model = model["mode_sources"][self.slot]
         dense = read_json(resolve_path(model["complex_2d_modes"]) / "manifest.json")
         if dense["complex_2d_modes_identity"] != model["complex_2d_modes_identity"]:
             raise ValueError("Saved modal image source identity differs")
@@ -62,6 +66,11 @@ class ViewerInput:
     def coordinate_views(self):
         return {} if self.coordinates is None else {
             v["label"]: v for v in self.coordinates.manifest["views"]}
+
+    @property
+    def observation_views(self):
+        labels = {v['label'] for v in self.modes[0].artifact.manifest['views']}
+        return [v for v in self.views if v['label'] in labels]
 
 
 def _model_keys(manifest):
@@ -90,6 +99,7 @@ def load_viewer_input(path, *, coordinates=None):
     root = resolve_path(path, strict=True)
     header = read_json(root if root.is_file() else root / "manifest.json")
     models, designs = {}, {}
+    bound_result = None
 
     def model(path):
         physical = resolve_path(path, strict=True)
@@ -120,17 +130,44 @@ def load_viewer_input(path, *, coordinates=None):
         result = []
         for k in selected:
             original, slot = artifact, k
+            observation = None
             if m.get("version") == 17:
                 source = m["sources"][k]
-                original, slot = model(source["path"]), source["slot"]
-                if (type(slot) is not int or not 0 <= slot < len(original.manifest["modes"])
-                        or original.manifest["completed_modes_identity"] != source["identity"]
-                        or original.manifest["modes"][slot]["frequency_hz"] != m["modes"][k]["frequency_hz"]
-                        or any(original.manifest[key] != m[key] for key in
+                source_path = resolve_path(source['path'], strict=True)
+                observation = read_json(source_path / 'manifest.json')
+                source_slot = source['slot']
+                if (type(source_slot) is not int or not 0 <= source_slot < len(observation["modes"])
+                        or observation["completed_modes_identity"] != source["identity"]
+                        or observation["modes"][source_slot]["frequency_hz"] != m["modes"][k]["frequency_hz"]
+                        or any(observation[key] != m[key] for key in
                                ("static_scene_identity", "foreground_identity"))):
                     raise ValueError("Mode-bank source identity, slot or frequency differs")
+                if observation.get('version') == 18:
+                    original, slot = model(source_path), source_slot
+                    observation = None
+                else:
+                    # Only diagnostic metadata is inherited; rendering uses the bank's baked fields.
+                    from modal_gaussians.motion.training import _artifact_identity_payload
+                    if (observation.get('version') != 16
+                            or identity(_artifact_identity_payload(observation)) != source['identity']):
+                        raise ValueError('Unsupported or inconsistent bank observation source')
+                    array_path = source_path / observation['arrays_file']
+                    if array_path.name != observation['arrays_file'] or sha256(array_path) != observation['arrays_file_sha256']:
+                        raise ValueError('Mode-bank diagnostic source checksum differs')
+                    arrays = dict(artifact.arrays)
+                    with np.load(array_path, allow_pickle=False) as saved:
+                        if not np.array_equal(saved['g_points'], artifact.arrays['g_points']):
+                            raise ValueError('Mode-bank diagnostic Gaussian order differs')
+                        for name in ('g_edge_index', 'g_edge_weight', 'g_component_index',
+                                     'c_control_point_index', 'c_positions', 't_host_gaussian_index'):
+                            if name in saved: arrays[name] = saved[name]
+                        # The selected slot is the only row consumed from this diagnostic view.
+                        for name in ('alphas', 'alpha_identifiable_mask'):
+                            arrays[name] = np.broadcast_to(saved[name][source_slot], (len(m['modes']), len(m['views'])))
+                    original = CompletedModesArtifact(artifact.path, m, arrays, artifact.rotation)
             result.append(ViewerMode(original, slot, projection, k,
-                dict(projection.manifest["settings"] if projection is not None else settings or {})))
+                dict(projection.manifest["settings"] if projection is not None else settings or {}),
+                observation_source=observation))
         return result
 
     indexed = isinstance(header, list)
@@ -141,19 +178,14 @@ def load_viewer_input(path, *, coordinates=None):
         if format_name == "modal_gaussians.completed_modes":
             records = [{"completed_modes": str(root)}]
         elif format_name == "modal_gaussians.modal_result":
-            if header.get("version") != 1:
-                raise ValueError("Unsupported result version")
             if coordinates is not None:
                 raise ValueError("A result already binds coordinates; --coordinates cannot override them")
-            sources = header["sources"]
-            record = {}
-            for name in ("completed_modes", "rendered_design"):
-                source = sources[name]
-                if source["identity_name"] != name + "_identity":
-                    raise ValueError(f"Result {name} identity name differs")
-                record[name], record[name + "_identity"] = source["path"], source["identity"]
+            from modal_gaussians.results.artifact import load_modal_result
+            bound_result = load_modal_result(root)
+            record = {'completed_modes': str(bound_result.completed_modes.path)}
+            if bound_result.rendered_design is not None:
+                record['rendered_design'] = str(bound_result.rendered_design.path)
             records = [record]
-            coordinates = sources["coordinates"]["path"]
         else:
             raise ValueError("Viewer input must be a model, result index or result")
     else:
@@ -224,7 +256,7 @@ def load_viewer_input(path, *, coordinates=None):
         if camera is None or camera.to_manifest_record()["camera_identity"] != source["camera_identity"]:
             raise ValueError("Viewer camera differs from the saved mode")
         view = {**source, "camera_name": camera.name}
-        if "selected_modal_supervision" in first:
+        if "selected_modal_supervision" in first or first.get("version") in (17, 19):
             exported = modes[0].exports[source["label"]]
             view.setdefault("fps_hz", exported["fps_hz"])
             view.setdefault("flow_reference_frame_name", exported["reference_frame_name"])
@@ -249,24 +281,42 @@ def load_viewer_input(path, *, coordinates=None):
             raise ValueError("Viewer model Gaussian domain differs")
 
     result = ViewerInput(root, scene, modes, views)
+    if bound_result is not None:
+        result.coordinates = bound_result.coordinates
+        keys = _model_keys(bound_result.completed_modes.manifest)
+        result.coordinate_columns = tuple(keys.index(m.key) for m in modes)
+        result.views.extend(v for v in bound_result.manifest['views'] if v['label'] not in {x['label'] for x in views})
+        return result
     if coordinates is not None:
         _, fitted = _load_coordinate_artifact(coordinates)
         cm = fitted.manifest
-        projection = load_rendered_modal_design(cm["rendered_design"])
-        source_manifest = read_json(resolve_path(projection.manifest["completed_modes"]) / "manifest.json")
-        if (projection.manifest["rendered_design_identity"] != cm["rendered_design_identity"]
-                or source_manifest["completed_modes_identity"] != cm["completed_modes_identity"]
-                or projection.manifest["completed_modes_identity"] != cm["completed_modes_identity"]
-                or source_manifest["modes"] != cm["modes"]):
-            raise ValueError("Coefficient model/projection binding differs")
-        if any(source_manifest[k] != scene.manifest[k] or projection.manifest[k] != scene.manifest[k]
-               for k in ("static_scene_identity", "foreground_identity")):
-            raise ValueError("Coefficient scene/foreground binding differs")
+        if cm.get("format") in ("modal_gaussians.refined_rgb_coordinates", "modal_gaussians.sweep_rgb_coordinates"):
+            from modal_gaussians.results.artifact import _load_sources
+            _, _, source_modes, _, _, _, _, _ = _load_sources(scene_dir=first["static_scene"],
+                completed_modes_dir=cm["completed_modes"], coordinates_dir=coordinates)
+            source_manifest = source_modes.manifest
+            projection = None
+        else:
+            projection = load_rendered_modal_design(cm["rendered_design"])
+            source_manifest = read_json(resolve_path(projection.manifest["completed_modes"]) / "manifest.json")
+            if (projection.manifest["rendered_design_identity"] != cm["rendered_design_identity"]
+                    or source_manifest["completed_modes_identity"] != cm["completed_modes_identity"]
+                    or projection.manifest["completed_modes_identity"] != cm["completed_modes_identity"]
+                    or source_manifest["modes"] != cm["modes"]):
+                raise ValueError("Coefficient model/projection binding differs")
+            if any(source_manifest[k] != scene.manifest[k] or projection.manifest[k] != scene.manifest[k]
+                   for k in ("static_scene_identity", "foreground_identity")):
+                raise ValueError("Coefficient scene/foreground binding differs")
         keys = _model_keys(source_manifest)
         if len(set(keys)) != len(keys) or set(keys) != {m.key for m in modes}:
             raise ValueError("Coefficient source models/slots differ from Viewer modes")
         available = {v["label"]: v for v in views}
-        projected = {v["label"]: v for v in projection.manifest["views"]}
+        projected = {v["label"]: v for v in projection.manifest["views"]} if projection else {}
+        if projection is None:
+            result.coordinates = fitted
+            result.coordinate_columns = tuple(keys.index(m.key) for m in modes)
+            result.views.extend(v for v in cm['views'] if v['label'] not in available)
+            return result
         for view in cm["views"]:
             label = view["label"]
             if label not in available or label not in projected:
@@ -284,8 +334,4 @@ def load_viewer_input(path, *, coordinates=None):
                 raise ValueError("Coefficient view timing/reference differs")
         result.coordinates = fitted
         result.coordinate_columns = tuple(keys.index(m.key) for m in modes)
-        if isinstance(header, dict) and header.get("format") == "modal_gaussians.modal_result":
-            source = header["sources"]["coordinates"]
-            if cm[source["identity_name"]] != source["identity"]:
-                raise ValueError("Result coefficient identity differs")
     return result

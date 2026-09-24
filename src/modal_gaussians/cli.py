@@ -309,6 +309,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override a view's recorded/stabilized RGB directory; preserve frame names and geometry",
     )
     rgb_fit.add_argument("--device", default="cuda")
+    sweep_fit = coordinates_commands.add_parser("fit-sweep", help="Fit independent sweep coefficients using registered per-frame cameras")
+    for name in ("scene", "modes", "scale-source", "metadata", "output"):
+        sweep_fit.add_argument("--" + name, required=True, type=Path)
+    sweep_fit.add_argument("--config", type=Path)
+    sweep_fit.add_argument("--device", default="cuda")
+    sweep_fit.add_argument("--fps", type=float, default=30)
+    sweep_subset = coordinates_commands.add_parser("downsample-sweep", help="Publish an integer FPS subset of fitted sweep coefficients")
+    sweep_subset.add_argument("--input", required=True, type=Path)
+    sweep_subset.add_argument("--output", required=True, type=Path)
+    sweep_subset.add_argument("--fps", type=float, default=30)
+    refinement_prepare = coordinates_commands.add_parser("prepare-refinement", help="Freeze reference graph and validate RGB initialization")
+    refinement_prepare.add_argument("--scene", required=True, type=Path)
+    refinement_prepare.add_argument("--modes", required=True, type=Path)
+    refinement_prepare.add_argument("--coordinates", required=True, action="append", type=Path)
+    refinement_prepare.add_argument("--output", required=True, type=Path)
+    refinement_prepare.add_argument("--view", action="append")
+    refinement_prepare.add_argument("--sweep-coordinates", type=Path)
+    refinement_prepare.add_argument("--reference", type=Path)
+    refinement_fit = coordinates_commands.add_parser("refine-scene", help="Joint foreground and per-recording coefficient refinement")
+    refinement_fit.add_argument("--prepared", required=True, type=Path)
+    refinement_fit.add_argument("--config", type=Path)
+    refinement_fit.add_argument("--work-dir", required=True, type=Path)
+    refinement_fit.add_argument("--output", required=True, type=Path)
+    refinement_fit.add_argument("--resume", action="store_true")
+    refinement_fit.add_argument("--device", default="cuda")
     result_parser = command_parsers.add_parser(
         "result", help="Bind one immutable static/mode/coordinate result"
     )
@@ -321,7 +346,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     result_materialize.add_argument("--scene", required=True, type=Path)
     result_materialize.add_argument("--modes", required=True, type=Path)
-    result_materialize.add_argument("--coordinates", required=True, type=Path)
+    result_materialize.add_argument("--coordinates", required=True, action="append", type=Path)
     result_materialize.add_argument("--output", required=True, type=Path)
     result_video = result_commands.add_parser(
         "export-video", help="Export one RGB-fitted view: original above reconstruction"
@@ -330,6 +355,15 @@ def build_parser() -> argparse.ArgumentParser:
     result_video.add_argument("--view", required=True, help="Recorded view label, e.g. view1")
     result_video.add_argument("--output", required=True, type=Path, help="New export directory")
     result_video.add_argument("--device", default="cuda")
+    result_evaluate = result_commands.add_parser(
+        "evaluate", help="Measure full-resolution reconstruction against fitted input PNGs"
+    )
+    result_evaluate.add_argument("--result", required=True, type=Path)
+    result_evaluate.add_argument("--output", required=True, type=Path)
+    result_evaluate.add_argument("--view", action="append", help="Repeat to select views; default all fitted views")
+    result_evaluate.add_argument("--lpips", action="store_true", help="Also measure pretrained LPIPS-Alex (evaluation extra)")
+    result_evaluate.add_argument("--device", default="cuda")
+    result_evaluate.add_argument("--baseline", type=Path, help="Matching evaluation directory; save per-frame metric deltas")
     viewer = command_parsers.add_parser(
         "viewer", help="Inspect modal results, geometry graphs, or select a 3D subject in Viser"
     )
@@ -347,6 +381,8 @@ def build_parser() -> argparse.ArgumentParser:
     viewer.add_argument("--host", default="0.0.0.0")
     viewer.add_argument("--port", type=_positive_int, default=8080)
     viewer.add_argument("--viewer-res", type=_positive_int, default=2048)
+    viewer.add_argument("--no-spectrum", action="store_true",
+                        help="Show 3D motion without loading the optional Spectrum panel or FFT sources")
     return parser
 
 
@@ -636,6 +672,40 @@ def _dispatch(
             print(f"views/frames/modes: {counts['views']}/{counts['frames']}/{counts['modes']}")
             print(f"identity: {artifact.manifest['rgb_coordinates_identity']}")
             return 0
+        if args.command == "coordinates" and args.coordinates_command == "fit-sweep":
+            from dataclasses import fields
+            from modal_gaussians.coordinates.sweep import fit_sweep
+            from modal_gaussians.coordinates.fitting import RGBFitConfig
+            payload = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
+            if not isinstance(payload, dict) or set(payload) - {f.name for f in fields(RGBFitConfig)}:
+                raise ValueError('RGB config must contain only RGBFitConfig fields')
+            artifact = fit_sweep(scene_dir=args.scene, completed_modes_dir=args.modes,
+                scale_source=args.scale_source, metadata_path=args.metadata, output_dir=args.output,
+                config=RGBFitConfig(**payload), device=args.device, fps=args.fps)
+            print(f"Sweep RGB coordinates: {artifact.path}")
+            return 0
+        if args.command == "coordinates" and args.coordinates_command == "downsample-sweep":
+            from modal_gaussians.coordinates.sweep import downsample_sweep
+            artifact = downsample_sweep(input_dir=args.input, output_dir=args.output, fps=args.fps)
+            print(f"Sweep frame subset: {artifact.path}")
+            return 0
+        if args.command == "coordinates" and args.coordinates_command == "prepare-refinement":
+            from modal_gaussians.coordinates.refinement_artifacts import prepare_refinement
+            output = prepare_refinement(scene_dir=args.scene, completed_modes_dir=args.modes,
+                coordinates_dirs=args.coordinates, output_dir=args.output, view_labels=args.view,
+                sweep_coordinates_dir=args.sweep_coordinates, reference_dir=args.reference)
+            print(f"Refinement inputs prepared: {output}")
+            return 0
+        if args.command == "coordinates" and args.coordinates_command == "refine-scene":
+            from dataclasses import fields
+            from modal_gaussians.coordinates.refinement import RefinementConfig, refine_scene
+            payload = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
+            if not isinstance(payload, dict) or set(payload) - {f.name for f in fields(RefinementConfig)}:
+                raise ValueError("Refinement config must contain only RefinementConfig fields")
+            output = refine_scene(prepared_dir=args.prepared, config=RefinementConfig(**payload),
+                work_dir=args.work_dir, output_dir=args.output, resume=args.resume, device=args.device)
+            print(f"Refined scene bundle: {output}")
+            return 0
         if args.command == "result" and args.result_command == "materialize":
             from modal_gaussians.results.artifact import materialize_modal_result
 
@@ -665,6 +735,13 @@ def _dispatch(
             video = export_result_video(result_dir=args.result, view_label=args.view,
                                         output_dir=args.output, device=args.device)
             print(f"comparison video: {video}")
+            return 0
+        if args.command == "result" and args.result_command == "evaluate":
+            from modal_gaussians.results.evaluation import evaluate_result
+
+            output = evaluate_result(result_dir=args.result, output_dir=args.output,
+                                     view_labels=args.view, with_lpips=args.lpips, device=args.device, baseline_dir=args.baseline)
+            print(f"reconstruction metrics: {output / 'metrics.json'}")
             return 0
         if args.command == "viewer":
             if args.coordinates is not None and args.scene is not None:
@@ -696,6 +773,7 @@ def _dispatch(
             from modal_gaussians.vis.viewer import run_modal_viewer
 
             run_modal_viewer(
+                with_spectrum=not args.no_spectrum,
                 result_dir=args.input,
                 work_dir=args.work_dir,
                 host=str(args.host),

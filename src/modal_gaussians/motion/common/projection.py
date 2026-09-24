@@ -155,9 +155,10 @@ def candidate_pixels(
 def uses_visible_subject(scene: ForegroundBackgroundScene) -> bool:
     """Manual 3D selections use visibility, without inherited image masks."""
 
-    return (getattr(scene, "manifest", None) or {}).get("partition", {}).get(
-        "method"
-    ) == "manual_subject_selection_v1"
+    manifest = getattr(scene, "manifest", None) or {}
+    return (manifest.get("partition", {}).get("method") == "manual_subject_selection_v1"
+            or (manifest.get("version") == 4
+                and manifest.get("refinement", {}).get("observation_region") == "visible_subject"))
 
 
 def render_motion_features(

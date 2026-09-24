@@ -24,7 +24,7 @@ class ViewerProjections:
         self.gpu_lock = threading.RLock()
         self._samples = {}
         self._prepared = {}
-        self.views = result.views
+        self.views = result.observation_views
         fallback = work_dir or (result.path.parent if result.path.is_file() else result.path)
         self.cache_dir = scene_cache(result.scene.manifest, resolve_path(fallback) / "cache") / "viewer_projection"
 

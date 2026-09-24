@@ -16,16 +16,19 @@ class CompletedModesArtifact:
     rotation: np.ndarray | None = None
     control_displacement: np.ndarray | None = None
 
-def load_completed_modes(path):
+def load_completed_modes(path, *, validate=False):
     root = resolve_path(path, strict=True)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("format") != COMPLETED_MODES_FORMAT:
         raise ValueError("Expected completed modes")
     if manifest.get("version") == 17:
         from modal_gaussians.coordinates.preparation import load_mode_bank
-        return load_mode_bank(root)
+        return load_mode_bank(root, validate=validate)
+    if manifest.get("version") == 19:
+        from modal_gaussians.coordinates.refinement_artifacts import load_refined_modes
+        return load_refined_modes(root)
     if manifest.get("version") != 18:
         raise ValueError("Unsupported mode version; rebuild with the mainline pipeline")
     from modal_gaussians.motion.artifacts import load_neural_completed_modes
-    value = load_neural_completed_modes(root)
+    value = load_neural_completed_modes(root, validate=validate)
     return CompletedModesArtifact(root, value.manifest, value.arrays, value.rotation, value.control_displacement)
