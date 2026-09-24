@@ -170,7 +170,6 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--num-fg", type=_positive_int, default=40_000)
     train.add_argument("--num-bg", type=_positive_int, default=80_000)
     train.add_argument("--seed", type=_non_negative_int, default=42)
-    train.add_argument("--mask-weight", type=_non_negative_float, default=1.0)
     train.add_argument(
         "--fg-densify-stop-step", type=_positive_int, default=9_000
     )
@@ -524,7 +523,6 @@ def _dispatch(
                     num_foreground=int(args.num_fg),
                     num_background=int(args.num_bg),
                     seed=int(args.seed),
-                    mask_loss_weight=float(args.mask_weight),
                     foreground_densify_stop_step=int(args.fg_densify_stop_step),
                     background_densify_stop_step=int(args.bg_densify_stop_step),
                     max_background_gaussians=int(args.max_bg_gaussians),

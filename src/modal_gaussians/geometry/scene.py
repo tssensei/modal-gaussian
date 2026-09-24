@@ -228,15 +228,16 @@ class StaticDataset:
     dataset_identity: str
     file_identities: Mapping[str, str]
 
-    def load_rgb(self, camera: Camera) -> Tensor:
-        """Read one canonical RGB image as float32 RGB in [0, 1]."""
+    def load_rgb(self, camera: Camera, *, as_uint8: bool = False) -> Tensor:
+        """Read canonical RGB, optionally retaining compact bytes for a pixel cache."""
 
         path = self.root / camera.image_relative_path
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None:
             raise FileNotFoundError(path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        return torch.from_numpy(image.copy()).float() / 255.0
+        pixels = torch.from_numpy(image)
+        return pixels if as_uint8 else pixels.float() / 255.0
 
     def load_binary_mask(self, camera: Camera) -> np.ndarray:
         """Read one semantic mask with positive pixels treated as foreground."""
@@ -377,6 +378,7 @@ class ForegroundBackgroundScene(nn.Module):
         composition: Composition = "all",
         retain_screen_grad: bool = False,
         return_foreground_mask: bool = False,
+        include_depth: bool = True,
     ) -> tuple[dict[str, Tensor], Mapping[str, Tensor]]:
         """Rasterize cameras, optionally carrying FG identity through compositing."""
 
@@ -436,7 +438,7 @@ class ForegroundBackgroundScene(nn.Module):
             height=height,
             packed=False,
             backgrounds=backgrounds,
-            render_mode="RGB+ED",
+            render_mode="RGB+ED" if include_depth else "RGB",
             rasterize_mode="classic",
             camera_model="pinhole",
         )
@@ -447,10 +449,11 @@ class ForegroundBackgroundScene(nn.Module):
             means2d.retain_grad()
         rgb = rendered[..., :3]
         alpha = alphas[..., 0]
-        depth_index = 4 if return_foreground_mask else 3
-        depth = rendered[..., depth_index]
-        depth = torch.where(alpha > 1e-8, depth, torch.zeros_like(depth))
-        outputs = {"rgb": rgb, "alpha": alpha, "expected_depth": depth}
+        outputs = {"rgb": rgb, "alpha": alpha}
+        if include_depth:
+            depth_index = 4 if return_foreground_mask else 3
+            depth = rendered[..., depth_index]
+            outputs["expected_depth"] = torch.where(alpha > 1e-8, depth, torch.zeros_like(depth))
         if return_foreground_mask:
             outputs["foreground_mask"] = rendered[..., 3]
         return outputs, info

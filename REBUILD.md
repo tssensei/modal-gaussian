@@ -1,5 +1,53 @@
 # Cleanup and required rebuilds — 2026-09-23
 
+## Remove static mask supervision — 2026-09-24
+
+Static optimization now uses only `L1_RGB + 0.2 * (1 - SSIM)`. The trimmed mask
+loss, erosion/quantile/weight configuration, `--mask-weight`, per-step target mask
+loading/caching, membership rendering and mask-loss logs have been deleted. Masks
+are still required for initial point classification and other stages; valid-pixel
+support in stabilization, modal learning and coefficient fitting is unchanged.
+
+This changes the method, not just performance. Static resume is v3 and training
+summary is v2; earlier checkpoints cannot resume. Use new static work/output
+directories and bind any newly trained scene's downstream products to its new
+identity. Existing published scene tensors remain valid v5/v6/v7 sources; no old
+manifest is rewritten, no catalog redirected and no experiment automatically run.
+Batch 4, 3,000 updates, SH/density/LR settings and pixel/grid caching are retained.
+
+## Static execution optimization — 2026-09-24 (before mask-loss removal)
+
+After commit `5f53bdb`, static training adds a bounded CPU pixel/mask cache and
+requests RGB/membership without unused expected depth. The shared radial renderer
+reuses device sampling grids including batch-dependent padding. Batch 4, 3,000
+updates, SH schedule, RGB/mask losses, sampling, Adam and density rules are unchanged.
+
+- No artifact format changes: existing compatible SH scenes, references, modes and
+  coordinates remain readable; this optimization alone does not mandate rebuilding
+  published artifacts. Existing raw frames, masks and COLMAP inputs remain reusable.
+- Static checkpoint identity now includes the radial-render implementation in
+  addition to training/scene/density. Use new work directories for prior checkpoints.
+  Refinement also hashes the shared scene/rendering modules and cannot resume an
+  older implementation. Normal implementation-keyed cache misses must not be bypassed.
+- When deliberately retraining a new static scene, publish into a new directory;
+  downstream products must bind that new scene, as usual. No catalog or real
+  experiment was changed or run for this optimization.
+
+Synthetic benchmark: RTX 5090, batch 4, 960x540, 12,288 Gaussians, SH degree 2,
+four synthetic PNGs, three warm-up and eight measured updates, synchronized stage
+timings. Median update time was 61.63 ms before versus 23.50 ms after; loading
+24.40 -> 4.90 ms, rendering 19.81 -> 4.53 ms, peak allocated GPU memory
+803.63 -> 690.62 MiB. This is a warm-cache synthetic measurement, not a Bush
+speedup estimate; checkpoints/density topology changes are outside that timing.
+Loss, all Gaussian gradients, screen-gradient statistics, first Adam update and
+optimizer state matched at `rtol=2e-5, atol=1e-7`. Pixel and cached-grid values
+match exactly. Local reproducible checks/results are in ignored
+`tests/benchmark_static_training.py`, `tests/static_perf_before.json`,
+`tests/static_perf_after.json`, and `tests/test_static_performance.py`.
+These saved before/after timings include the former mask loss. They do not measure
+the subsequent RGB-only objective above; rerunning the local benchmark now uses
+the current RGB-only trainer and must write a new result filename.
+
 ## SH coarse bootstrap — 2026-09-24
 
 This supersedes the direct-RGB scene versions mentioned in historical sections

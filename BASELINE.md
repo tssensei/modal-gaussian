@@ -24,7 +24,6 @@ groups may end with smaller batches).
 | Opacity / scale / rotation LR | 0.05 / 0.005 / 0.001, constant |
 | Adam epsilon | `1e-15` |
 | RGB objective | Full-frame `L1 + 0.2 * (1 - SSIM)` |
-| Mask objective | Existing trimmed foreground-membership L1, weight 1 |
 | Depth objective | Disabled; no predicted depth supervision yet |
 | Density | After step 500, every 100 updates, before step 9,000 or training end |
 | Densify gradient / split scale | `2e-4` / `0.01 * camera_extent` |
@@ -39,7 +38,7 @@ the highest SH band further; use `--iterations 30000` when explicitly requested.
 Training uses all registered sweep/reference cameras at their input resolution.
 
 Retained project-specific choices: foreground/background partitions, initial
-40k/80k point caps, 160k background cap, mask supervision and shuffled camera
+40k/80k point caps, 160k background cap and shuffled camera
 passes. We do not introduce the author's learned Gaussian retain-mask or depth
 pretraining. His supplied launch uses an 80k coarse loop but its optimizer gate
 stops at the global 30k budget; our budget counts actual updates and does not copy
@@ -50,6 +49,20 @@ Gaussian position and camera center. The basis stays in world coordinates;
 Gaussian covariance rotation does not rotate SH. Fixed-mode coefficient fitting
 freezes SH; joint refinement optimizes DC at `color_lr`, higher bands at
 `color_lr / 20`. Coefficient/refinement RGB loss keeps its existing 0.8/0.2 weights.
+
+Static training uses only full-frame `L1 + 0.2 * (1 - SSIM)`. Mask loss, its
+erosion/quantile settings and `--mask-weight` have been removed. Original masks
+still define the initial foreground/background partition and serve other stages;
+the optimization loop does not read them or render foreground-membership targets.
+
+Static execution caches decoded RGB bytes in a per-run 2 GiB
+CPU LRU; larger inputs remain loadable without caching. RGB normalization stays
+on CPU to preserve the original float32 pixel values. The shared radial renderer
+caches up to 16 device sampling grids, keyed by intrinsics, distortion, dimensions,
+batch padding, device and dtype. Static training requests RGB without expected
+depth; normal scene/depth render calls retain depth. Caching is an execution
+optimization; removal of mask supervision is a separate loss change.
+Caches are transient and are rebuilt lazily after restoring a checkpoint.
 
 ## Video stabilization baseline — accepted 2026-09-24
 

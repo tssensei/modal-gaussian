@@ -63,9 +63,13 @@ manually selected), and **v7** (jointly refined). Each partition stores `means`,
 `sh_rest [G,15,3]`. The manifest declares `spherical_harmonics_world` and the active
 SH degree (0..3), which also participates in scene identity. Repartitioning and
 density changes preserve/remap every SH row; refined publication preserves degree.
-Static resume v2 binds tensors, optimizers, sampler state, iteration budget and
-training/scene/density implementation hashes. Earlier direct-RGB scenes and resume
-v1 are not current inputs. Preserve them and publish new outputs as described in
+Static resume v3 binds tensors, optimizers, sampler state, iteration budget and
+training/scene/density/radial-render implementation hashes. Pixel and device-grid
+caches are transient process memory and are not checkpoint or artifact fields.
+Earlier direct-RGB scenes and resume
+v1/v2 are not current inputs. Training summary v2 and epoch/checkpoint statistics
+contain RGB losses only, with no removed mask-loss fields. Scene tensor formats
+remain v5/v6/v7. Preserve old outputs as described in
 [REBUILD](REBUILD.md); never rewrite their manifests.
 
 ## Stabilized recording artifacts

@@ -33,24 +33,32 @@ def _warp_grid(width: int, height: int, intrinsics: tuple[float, ...], k: float)
     return u.astype(np.float32), v.astype(np.float32), (left, top, right, bottom)
 
 
+@lru_cache(maxsize=16)
+def _device_warp_grid(width, height, intrinsics, k, padding, device, dtype):
+    """Reuse fixed sampling coordinates; padding belongs to the whole batch."""
+    u, v, _ = _warp_grid(width, height, intrinsics, k)
+    left, top, right, bottom = padding
+    grid = np.stack((2 * (u + left + 0.5) / (width + left + right) - 1,
+                     2 * (v + top + 0.5) / (height + top + bottom) - 1), axis=-1)
+    return torch.as_tensor(grid, device=device, dtype=dtype)
+
+
 def rasterize_cameras(rasterization, cameras, **kwargs: Any):
     """Keep one batched gsplat call and means2d gradients for density control."""
     ks = [camera.radial_distortion for camera in cameras]
     if not any(ks):
         return rasterization(**kwargs)
     width, height = kwargs["width"], kwargs["height"]
-    maps = [_warp_grid(width, height, tuple(c.K.detach().cpu().double().numpy().ravel()), k)
-            for c, k in zip(cameras, ks)]
+    intrinsics = [tuple(c.K.detach().cpu().double().numpy().ravel()) for c in cameras]
+    maps = [_warp_grid(width, height, K, k) for K, k in zip(intrinsics, ks)]
     padding = np.max([m[2] for m in maps], axis=0)
     left, top, right, bottom = map(int, padding)
     padded_w, padded_h = width + left + right, height + top + bottom
     if padded_w * padded_h > 4 * width * height or max(padded_w, padded_h) > 32768:
         raise ValueError("Radial render overscan exceeds 4x image area; check COLMAP calibration")
     device, dtype = kwargs["means"].device, kwargs["means"].dtype
-    grid = np.stack([np.stack((2 * (u + left + 0.5) / padded_w - 1,
-                              2 * (v + top + 0.5) / padded_h - 1), axis=-1)
-                     for u, v, _ in maps])
-    grid = torch.as_tensor(grid, device=device, dtype=dtype)
+    grid = torch.stack([_device_warp_grid(width, height, K, k,
+        (left, top, right, bottom), device, dtype) for K, k in zip(intrinsics, ks)])
     K = kwargs["Ks"].clone()
     K[:, 0, 2] += left
     K[:, 1, 2] += top

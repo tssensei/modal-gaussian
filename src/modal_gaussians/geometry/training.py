@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from collections import OrderedDict
 import hashlib
 import json
 import math
@@ -26,6 +27,9 @@ from modal_gaussians.common.camera_geometry import PROJECTION_CONVENTION
 from modal_gaussians.geometry.density import densify_parameters, remap_parameters
 
 
+_IMAGE_CACHE_BYTES = 2 * 1024**3
+
+
 @dataclass(frozen=True)
 class StaticTrainConfig:
     """Hold the intentionally small accepted static-training configuration."""
@@ -35,9 +39,6 @@ class StaticTrainConfig:
     num_foreground: int = 40_000
     num_background: int = 80_000
     seed: int = 42
-    mask_loss_weight: float = 1.0
-    mask_erosion_kernel_size: int = 7
-    mask_trim_quantile: float = 0.98
     checkpoint_every_steps: int = 200
     max_lr_steps: int = 20_000
     density_warmup_steps: int = 500
@@ -61,7 +62,6 @@ class StaticTrainConfig:
             "batch_size": self.batch_size,
             "num_foreground": self.num_foreground,
             "num_background": self.num_background,
-            "mask_erosion_kernel_size": self.mask_erosion_kernel_size,
             "checkpoint_every_steps": self.checkpoint_every_steps,
             "max_lr_steps": self.max_lr_steps,
             "density_control_every": self.density_control_every,
@@ -76,8 +76,6 @@ class StaticTrainConfig:
             raise ValueError(f"Static training values must be positive: {invalid}")
         if self.density_warmup_steps < 0:
             raise ValueError("density_warmup_steps must be non-negative")
-        if self.mask_erosion_kernel_size % 2 == 0:
-            raise ValueError("mask_erosion_kernel_size must be odd")
         if self.max_background_gaussians < self.num_background:
             raise ValueError(
                 "max_background_gaussians must not be smaller than num_background"
@@ -93,7 +91,6 @@ class StaticTrainConfig:
                 "foreground stop <= control stop"
             )
         finite_nonnegative = {
-            "mask_loss_weight": self.mask_loss_weight,
             "densify_gradient_threshold": self.densify_gradient_threshold,
             "densify_scale_threshold": self.densify_scale_threshold,
             "cull_opacity_threshold": self.cull_opacity_threshold,
@@ -107,10 +104,6 @@ class StaticTrainConfig:
         ]
         if invalid_float:
             raise ValueError(f"Static training values must be finite/non-negative: {invalid_float}")
-        if not math.isfinite(self.mask_trim_quantile) or not (
-            0.0 < self.mask_trim_quantile <= 1.0
-        ):
-            raise ValueError("mask_trim_quantile must be finite and in (0, 1]")
 
     def resolved(self) -> dict[str, Any]:
         """Serialize configuration together with fixed loss and LR conventions."""
@@ -125,10 +118,6 @@ class StaticTrainConfig:
             "loss": {
                 "rgb_l1_weight": 1.0,
                 "rgb_dssim_weight": 0.2,
-                "mask_weight": self.mask_loss_weight,
-                "mask_type": "trimmed_l1_foreground_membership",
-                "mask_trim_quantile": self.mask_trim_quantile,
-                "mask_erosion_kernel_size": self.mask_erosion_kernel_size,
                 "alpha_coverage_weight": 0.0,
                 "depth_weights": [0.0, 0.0, 0.0],
             },
@@ -136,8 +125,11 @@ class StaticTrainConfig:
             "sh_degree": 3, "sh_degree_interval": 1000,
             "schedule": "position_exponential_extent_scaled; other_fields_constant",
             "density_units": "world_thresholds_times_camera_extent; screen_radius_pixels",
-            "implementation": {name: _sha256_file(Path(__file__).with_name(name))
-                               for name in ("training.py", "scene.py", "density.py")},
+            "implementation": {
+                **{name: _sha256_file(Path(__file__).with_name(name))
+                   for name in ("training.py", "scene.py", "density.py")},
+                "camera_rendering.py": _sha256_file(Path(__file__).parents[1] / "common" / "camera_rendering.py"),
+            },
         }
 
 
@@ -162,17 +154,6 @@ def _learning_rates() -> dict[str, dict[str, float]]:
             "sh_rest": 0.000125,
         },
     }
-
-
-def _trimmed_l1_loss(prediction: Tensor, target: Tensor, quantile: float) -> Tensor:
-    """Average per-pixel L1 errors after discarding the largest tail."""
-
-    errors = torch.abs(prediction - target)
-    if errors.numel() == 0 or quantile >= 1.0:
-        return errors.mean()
-    threshold = torch.quantile(errors.detach(), quantile)
-    retained = errors[errors <= threshold]
-    return retained.mean() if retained.numel() > 0 else errors.mean()
 
 
 def _sha256_file(path: Path) -> str:
@@ -282,6 +263,8 @@ class StaticTrainer:
         self.epoch_accumulator = self._empty_epoch_accumulator()
         self.elapsed_seconds_before_resume = 0.0
         self.started_at = time.time()
+        self.image_cache: OrderedDict[str, Tensor] = OrderedDict()
+        self.image_cache_bytes = 0
 
     def elapsed_seconds(self) -> float:
         """Return active training-process time accumulated across resume boundaries."""
@@ -335,7 +318,6 @@ class StaticTrainer:
             "batch_count": 0.0,
             "loss_sum": 0.0,
             "rgb_loss_sum": 0.0,
-            "mask_loss_sum": 0.0,
             "psnr_sum": 0.0,
             "ssim_sum": 0.0,
         }
@@ -356,42 +338,47 @@ class StaticTrainer:
         random.shuffle(batches)
         return batches
 
+    def _camera_pixels(self, camera: Camera) -> Tensor:
+        """Cache immutable RGB bytes within a 2 GiB CPU budget."""
+        cached = self.image_cache.get(camera.name)
+        if cached is not None:
+            self.image_cache.move_to_end(camera.name)
+            return cached
+        image = self.dataset.load_rgb(camera, as_uint8=True)
+        size = image.numel() * image.element_size()
+        if size > _IMAGE_CACHE_BYTES:
+            return image
+        while self.image_cache and self.image_cache_bytes + size > _IMAGE_CACHE_BYTES:
+            _, removed = self.image_cache.popitem(last=False)
+            self.image_cache_bytes -= removed.numel() * removed.element_size()
+        self.image_cache[camera.name] = image
+        self.image_cache_bytes += size
+        return image
+
     def _load_batch(
         self, indices: Sequence[int]
-    ) -> tuple[list[Camera], Tensor, Tensor]:
-        """Load full-frame RGB and eroded foreground targets."""
+    ) -> tuple[list[Camera], Tensor]:
+        """Load full-frame RGB targets."""
 
         cameras = [self.dataset.cameras[index] for index in indices]
-        images = torch.stack(
-            [self.dataset.load_rgb(camera) for camera in cameras], dim=0
-        ).to(self.device)
-        kernel_size = self.config.mask_erosion_kernel_size
-        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-        foreground_masks: list[Tensor] = []
-        for camera in cameras:
-            foreground = self.dataset.load_binary_mask(camera)
-            foreground_eroded = cv2.erode(
-                foreground.astype(np.uint8), kernel, iterations=1
-            ).astype(bool)
-            foreground_masks.append(torch.from_numpy(foreground_eroded))
-        foreground_targets = torch.stack(foreground_masks, dim=0).to(
-            self.device, dtype=images.dtype
-        )
-        return cameras, images, foreground_targets
+        pixels = [self._camera_pixels(camera) for camera in cameras]
+        # Normalize on CPU as before: CUDA's reciprocal differs by an ULP for
+        # some bytes, which can change the RGB gradient comparison.
+        images = (torch.stack(pixels).float() / 255.0).to(self.device)
+        return cameras, images
 
     def _compute_loss(
         self,
         cameras: Sequence[Camera],
         targets: Tensor,
-        foreground_targets: Tensor,
     ) -> tuple[Tensor, dict[str, float], Mapping[str, Tensor]]:
-        """Compute RGB and semantic foreground-mask supervision."""
+        """Compute full-frame RGB L1 and SSIM supervision."""
 
         rendered, info = self.scene.render_batch(
             cameras,
             composition="all",
             retain_screen_grad=True,
-            return_foreground_mask=True,
+            include_depth=False,
         )
         predictions = rendered["rgb"]
         try:
@@ -406,22 +393,15 @@ class StaticTrainer:
             size_average=True,
         )
         rgb_loss = l1 + 0.2 * (1.0 - structural)
-        mask_loss = _trimmed_l1_loss(
-            rendered["foreground_mask"],
-            foreground_targets,
-            self.config.mask_trim_quantile,
-        )
-        loss = rgb_loss + self.config.mask_loss_weight * mask_loss
         mse = F.mse_loss(predictions.detach(), targets)
         psnr = -10.0 * torch.log10(mse.clamp_min(1e-12))
         stats = {
-            "loss": float(loss.detach().item()),
+            "loss": float(rgb_loss.detach().item()),
             "rgb_loss": float(rgb_loss.detach().item()),
-            "mask_loss": float(mask_loss.detach().item()),
             "psnr": float(psnr.item()),
             "ssim": float(structural.detach().item()),
         }
-        return loss, stats, info
+        return rgb_loss, stats, info
 
     @torch.no_grad()
     def _accumulate_density_stats(
@@ -715,7 +695,6 @@ class StaticTrainer:
         self.epoch_accumulator["batch_count"] += 1.0
         self.epoch_accumulator["loss_sum"] += stats["loss"]
         self.epoch_accumulator["rgb_loss_sum"] += stats["rgb_loss"]
-        self.epoch_accumulator["mask_loss_sum"] += stats["mask_loss"]
         self.epoch_accumulator["psnr_sum"] += stats["psnr"]
         self.epoch_accumulator["ssim_sum"] += stats["ssim"]
 
@@ -730,7 +709,6 @@ class StaticTrainer:
             "global_step": self.global_step,
             "loss": self.epoch_accumulator["loss_sum"] / count,
             "rgb_loss": self.epoch_accumulator["rgb_loss_sum"] / count,
-            "mask_loss": self.epoch_accumulator["mask_loss_sum"] / count,
             "psnr": self.epoch_accumulator["psnr_sum"] / count,
             "ssim": self.epoch_accumulator["ssim_sum"] / count,
             "foreground_gaussians": self.scene.foreground.count,
@@ -770,7 +748,7 @@ class StaticTrainer:
         path = self.work_dir / "resume.pt"
         payload = {
             "format": "modal_gaussians.static_training_resume",
-            "version": 2,
+            "version": 3,
             "dataset_identity": self.dataset.dataset_identity,
             "config_identity": self.config_identity,
             "resolved_config": self.config.resolved(),
@@ -842,11 +820,11 @@ class StaticTrainer:
             while self.next_batch_index < len(self.current_batches) and self.global_step < self.config.iterations:
                 self.scene.sh_degree = min((self.global_step + 1) // 1000, 3)
                 batch = self.current_batches[self.next_batch_index]
-                cameras, targets, foreground_targets = self._load_batch(
+                cameras, targets = self._load_batch(
                     batch
                 )
                 loss, stats, info = self._compute_loss(
-                    cameras, targets, foreground_targets
+                    cameras, targets
                 )
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError(f"Non-finite static loss at step {self.global_step}")
@@ -867,7 +845,7 @@ class StaticTrainer:
                     self.global_step,
                     f"epoch={self.epoch + 1} "
                     f"batch={self.next_batch_index}/{len(self.current_batches)} "
-                    f"loss={stats['loss']:.6f} mask={stats['mask_loss']:.6f} "
+                    f"loss={stats['loss']:.6f} "
                     f"psnr={stats['psnr']:.3f} "
                     f"ssim={stats['ssim']:.4f} "
                     f"fg={self.scene.foreground.count} bg={self.scene.background.count}",
@@ -878,7 +856,7 @@ class StaticTrainer:
             report_progress(
                 "static epoch "
                 f"{summary['epoch'] + 1}: "
-                f"loss={summary['loss']:.6f}, mask={summary['mask_loss']:.6f}, "
+                f"loss={summary['loss']:.6f}, "
                 f"psnr={summary['psnr']:.3f}, "
                 f"fg={summary['foreground_gaussians']}, "
                 f"bg={summary['background_gaussians']}"
@@ -895,7 +873,6 @@ class StaticTrainer:
             "global_step": self.global_step,
             "final_loss": final["loss"],
             "final_rgb_loss": final["rgb_loss"],
-            "final_mask_loss": final["mask_loss"],
             "final_psnr": final["psnr"],
             "final_ssim": final["ssim"],
         }
@@ -1011,7 +988,7 @@ def export_static_bundle(
         )
         summary = {
             "format": "modal_gaussians.static_training_summary",
-            "version": 1,
+            "version": 2,
             "static_scene_identity": static_scene_identity,
             "dataset_identity": trainer.dataset.dataset_identity,
             "result": dict(training_result),
@@ -1053,7 +1030,7 @@ def _load_resume_payload(path: Path) -> Mapping[str, Any]:
     if (
         not isinstance(payload, dict)
         or payload.get("format") != "modal_gaussians.static_training_resume"
-        or payload.get("version") != 2
+        or payload.get("version") != 3
     ):
         raise ValueError(f"Unsupported static resume checkpoint: {path}")
     return payload

@@ -22,6 +22,9 @@ The static pass is coarse geometry: 3,000 updates at batch 4, progressively acti
 to degree 3, and no depth supervision. `--iterations` replaces `--epochs`; the
 author-aligned numerical defaults are in BASELINE. Use new static/work paths:
 old direct-RGB bundles/checkpoints cannot be resumed into SH training.
+Static training now uses RGB L1 + 0.2 DSSIM only, without mask loss or a
+`--mask-weight` option. Masks remain required for initial point classification.
+Use a new work directory for earlier static checkpoints (current resume v3).
 
 Stabilization is the default: background PnP poses plus static-depth reprojection.
 The raw reference PNG hash/resolution must match the registered camera. Only when

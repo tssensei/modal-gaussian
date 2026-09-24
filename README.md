@@ -40,6 +40,9 @@ coefficient fitting, refinement and playback. See [BASELINE](BASELINE.md) for
 the author-aligned learning rates/density rules and retained project differences.
 Depth supervision remains disabled. Old direct-RGB scenes require a new static
 run and downstream rebuild; no data is migrated automatically.
+Static training uses full-frame RGB L1 + 0.2 DSSIM only; the mask loss and
+`--mask-weight` option are removed. Masks remain inputs for initial partitioning,
+stabilization and modal observation support.
 
 ## Pipeline and source map
 
