@@ -39,7 +39,7 @@ class RefinementConfig:
     rigidity_weight: float = 1e-3
     rotation_weight: float = 1e-3
     checkpoint_interval: int = 200
-    query_block_size: int = 4096
+    query_block_size: int = 32768
     seed: int = 1729
     early_stop_patience: int = 0
     early_stop_joint_interval: int = 25

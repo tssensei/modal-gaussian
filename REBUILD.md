@@ -1,5 +1,73 @@
 # Cleanup and required rebuilds — 2026-09-23
 
+## Joint motion-update stencil cache and block size — 2026-09-26
+
+`FixedField` now caches the immutable CSR expansion and segment lengths per
+device/frequency/block. Only control IDs, weights, levers and donor weights are
+uploaded as shared tables; unused GPU row pointers/root arrays are removed.
+The cache contains no learned fields, parameters or optimizer state. The default
+training `query_block_size` changes from 4096 to 32768; four-frequency groups,
+ordered donor sums, complex signs, correction gauge, losses, sampling and Adam
+clocks remain unchanged. Gradient checkpoint recomputation remains supported.
+
+Prepared reference/operator v5/v2, static scenes, flow initialization, frame
+bindings and previously published modes/coordinates remain readable and reusable
+under their existing identities. No disk format changes or persistent cache are
+introduced. Runtime caches are recreated for new instances/devices/block ranges.
+The fixed-field/refinement source hashes and default settings change run identity:
+use a new refinement work directory, never relabel a historical checkpoint to
+resume it. To produce a new optimized result, run refinement and requested
+downstream publication/evaluation in new directories. No ancestor rebuild is
+needed solely for this execution change.
+
+Validation uses local synthetic tests plus the independent short experiment
+`scene_library/bush/experiments/joint_optimization_20260926_001`. It compares the
+6000-step field/gradients and fresh flow-initialized joint updates against commit
+`bbf0fe6`; it does not resume the 6000-step run or publish replacement modes.
+Independent gsplat RGB backwards have pre-existing atomic accumulation noise:
+even old versus old exceeds the strict elementwise Adam-update tolerance for a
+few near-zero gradients. These failures remain recorded, not reclassified as
+passes. A shared real RGB/regularization VJP isolates field and Adam equivalence
+with the original strict tolerances. See the experiment report for measured
+performance, memory, repeated RGB losses and numerical error bounds.
+On the RTX 5090, three independent 25-step runs (five warmup steps each) gave
+a combined steady-state median of 5.751 s -> 0.469 s per joint update (12.26x),
+with peak allocated memory increasing by 0.550 GiB. The 25-step shared-VJP
+control-update maximum difference was 4.68e-8. All 222 local tests passed;
+no full 6000-step rerun or replacement publication was performed.
+
+## Alpha TRF QR compression — 2026-09-26
+
+Alpha alignment now orthogonally reduces the augmented Jacobian and residual
+together before the exact SVD. This avoids constructing tall left singular
+vectors without normal equations or changed loss, finite differences, bounds,
+convergence tolerances or view-exclusion rules. Arrays and artifact schemas are
+unchanged; floating-point execution order changes.
+
+The alpha algorithm identity is `scipy_1.17.1_trf_exact_2point_qr_v2`; its existing
+source hashes also change. New alignment/preparation and batch runs must use new
+output/work paths. Implementation-bound alpha geometry caches miss normally;
+do not relabel old entries or resume an old batch under the new alpha revision.
+Raw/static/selection inputs, stabilized references, flow, FFT/modal images and
+matching base geometry preparation remain reusable. Existing completed spatial
+modes, coefficients and the 6000-step result remain historical usable outputs.
+To obtain outputs using the new alpha implementation, rebuild selected-modal
+alignment/preparation and its dependent graph, frequency weights, spatial modes
+and reconstruction stages only when requested. No existing artifacts or catalog
+pointers are rewritten, and no real-scene stage was rerun for this change.
+
+Synthetic CUDA verification compares the previous commit's full alpha solve with
+the new implementation, including gain-bound exclusion and weak geometry; local
+`tests/benchmark_alpha_qr.py` records warm-run timings and numerical checks in
+`tests/alpha_qr_benchmark.json`. These are not measurements of a rerun of the
+20-frequency scene batch. Local alpha tests also cover rank-deficient and
+underdetermined TRF problems, allocation recovery and geometry cache handoff.
+On the RTX 5090, the three-run warm median for 100,000 synthetic points, three
+views and 1,200,000 real residuals fell from 3.704 s to 2.146 s (1.73x).
+All five old/new cases retained identical published complex64 alpha values and
+view exclusions; derived diagnostics passed tolerance checks, including a
+matrix-relative check for finite-difference information-matrix cancellation.
+
 ## Retire Gaussian-refinement remnants — 2026-09-26
 
 Removed the historical static-scene v7 reader, unused deformed-render density-gradient

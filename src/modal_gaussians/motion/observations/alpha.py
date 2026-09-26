@@ -249,7 +249,7 @@ def backend_identity(backend):
     from pathlib import Path
     from modal_gaussians.common.cache import identity, sha256
     root = Path(__file__).parent
-    return {"backend": "cupy", "algorithm": "scipy_1.17.1_trf_exact_2point_v1",
+    return {"backend": "cupy", "algorithm": "scipy_1.17.1_trf_exact_2point_qr_v2",
             "revision": identity({name: sha256(root / name) for name in
                                   ("alpha.py", "alpha_gpu.py", "_alpha_trf.py")})}
 

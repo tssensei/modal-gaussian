@@ -336,9 +336,12 @@ def trf_bounds(fun, jac, x0, f0, J0, lb, ub, ftol, xtol, gtol, max_nfev, x_scale
         J_augmented[:m] = J * d
         J_h = J_augmented[:m]
         J_augmented[m:] = np.diag(diag_h ** 0.5)
-        U, s, V = svd(J_augmented, full_matrices=False)
+        # Orthogonally compress J and f together: preserve singular values and
+        # U.T @ f without forming the tall left singular vectors. No J.T @ J.
+        reduced = np.linalg.qr(np.column_stack((J_augmented, f_augmented)), mode='r')
+        U, s, V = svd(reduced[:, :n], full_matrices=False)
         V = V.T
-        uf = U.T.dot(f_augmented)
+        uf = U.T.dot(reduced[:, n])
         theta = max(0.995, 1 - g_norm)
         actual_reduction = -1
         while actual_reduction <= 0 and nfev < max_nfev:

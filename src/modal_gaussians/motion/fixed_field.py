@@ -2,7 +2,7 @@
 import numpy as np
 import torch
 from torch.utils.checkpoint import checkpoint
-from .reference_field import ReferenceField, _device_rows, _segment_sum
+from .reference_field import ReferenceField, expand_rows, _segment_sum
 
 
 @torch.no_grad()
@@ -76,18 +76,30 @@ class FixedField:
                 or qw.dtype != np.float32 or qw.shape != qr.shape or not np.isfinite(qw).all() or np.any(qw<=0)):
             raise ValueError('Invalid fixed donor interpolation operator')
         self.tables = {}
+        self.stencils = {}
 
     def _tables(self, device):
         if device not in self.tables:
-            self.tables[device] = {k:torch.as_tensor(v,device=device) for k,v in self.operator.items()}
+            self.tables[device] = {k:torch.as_tensor(self.operator[k],device=device)
+                                  for k in ('control','weight','lever','query_weight')}
         return self.tables[device]
+
+    def _stencil(self, device, k, lo, hi):
+        key = (device, k, lo, hi)
+        if key not in self.stencils:
+            # The operator and row order are immutable. Expand once on the CPU,
+            # avoiding repeat_interleave's CUDA size synchronization on every query.
+            p, qp = self.operator['ptr'][k], self.operator['query_ptr'][k]
+            queries = np.arange(qp[lo], qp[hi], dtype=np.int64)
+            roots = self.operator['query_root'][queries]
+            ids, _ = expand_rows(p, roots)
+            self.stencils[key] = tuple(torch.as_tensor(v, device=device) for v in
+                (queries, ids, p[roots+1]-p[roots], np.diff(qp[lo:hi+1])))
+        return self.stencils[key]
 
     def block(self, displacement, angular, k, lo, hi):
         t = self._tables(displacement.device)
-        queries, _ = _device_rows(t['query_ptr'][k], torch.arange(lo,hi,device=displacement.device))
-        roots = t['query_root'][queries]
-        ids, _ = _device_rows(t['ptr'][k],roots)
-        counts = t['ptr'][k,roots+1]-t['ptr'][k,roots]
+        queries, ids, counts, donor_counts = self._stencil(displacement.device, k, lo, hi)
         controls = t['control'][ids]
         weight = t['weight'][ids,None].to(displacement.real.dtype)
         lever = t['lever'][ids].to(displacement.dtype)
@@ -97,7 +109,6 @@ class FixedField:
         phi = _segment_sum(weight*(displacement[k,controls]+torch.linalg.cross(omega,lever)),counts)
         angle = _segment_sum(weight*omega,counts)
         donor_weight = t['query_weight'][queries,None].to(displacement.real.dtype)
-        donor_counts = t['query_ptr'][k,lo+1:hi+1]-t['query_ptr'][k,lo:hi]
         return (_segment_sum(donor_weight*phi,donor_counts),_segment_sum(donor_weight*angle,donor_counts))
 
     def deform(self, q, displacement, angular):

@@ -166,9 +166,13 @@ Recipients then mix those donor fields with the original donor weights. Retain
 both sum stages and each donor's canonical lever: coalescing the weights changes
 float32 accumulation and can exceed the original-field tolerance.
 Unresolved rows stay zero. Original displacement/angular fields must be reproduced
-within `1e-5` after per-frequency amplitude normalization. Training uses blocks of
-4096 Gaussians and at most four modes per group, with checkpoint recomputation;
-it never executes the GNN or shortest-path query.
+within `1e-5` after per-frequency amplitude normalization. Training defaults to
+32768 Gaussians per block (`query_block_size`) and at most four modes per group,
+with checkpoint recomputation. Fixed CSR query/control indices and segment
+lengths are expanded once on the CPU and cached per device and block boundary;
+weights and lever arms remain in shared device tables. This cache contains no
+learned values, so joint updates and checkpoint loading cannot make it stale.
+It never executes the GNN or shortest-path query.
 
 Write `B0 = [d0, radius*omega0]`. A real/imag correction parameter is normalized by
 the original valid-control RMS of B0 and projected onto B0's complex orthogonal

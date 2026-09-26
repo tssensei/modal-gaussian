@@ -229,6 +229,9 @@ Historical reconstruction baselines and source artifacts remain unchanged.
   Shared control geometry can be reused; one frequency's soft weights cannot.
 - GPU alpha fitting and GPU soft propagation use CuPy. There is no CPU fallback.
   The resident preparation worker exits before GNN training starts.
+  Alpha's bounded TRF solver QR-reduces the augmented Jacobian and residual
+  together before its exact SVD. Float64, two-point differences, block Huber
+  loss, gain bounds, stopping tolerances and view-identifiability rules are unchanged.
 - Control radius fraction 0.015; maximum 32,768 controls. GNN hidden dimension 256,
   local feature dimension 32, three message layers, maximum 5,000 updates.
 - Per-view RMS-normalized modal-image loss, deformation weight 0.03,
@@ -302,6 +305,11 @@ joint clock. Preserve per-frame Adam state across all phases. Warmup-end q is th
 anchor. RGB weights 0.8/0.2; q anchor 1e-4, field anchor 1e-2, dynamic rigidity and
 relative rotation each 1e-3. Frame-zero skips temporal regularizers. The previous
 frame's q is detached. No modal-image/alpha loss, density, depth, carrier or damping.
+
+Joint field execution caches fixed stencil indices/segment lengths and defaults
+to `query_block_size=32768`; frequency groups remain four modes. The two-stage
+donor sum and checkpoint recomputation are retained. This is an execution change,
+not a new loss or sampling recipe; smaller blocks remain configurable for memory.
 
 Group weighting remains equal fixed/sweep, with fixed views averaged. Exhaustive
 updates correct for unequal sequence lengths. See [the reconstruction contract](COEFFICIENT_FITTING.md#fixed-scene-motion-refinement) for exact regularizers,
