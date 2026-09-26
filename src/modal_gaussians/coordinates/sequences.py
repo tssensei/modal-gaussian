@@ -7,6 +7,44 @@ from modal_gaussians.common.scene_store import resolve_path
 from modal_gaussians.geometry.scene import cameras_from_scene_manifest
 
 
+def fixed_sequences(scene, bank, labels):
+    """Bind only selected recordings; preserve the bank's complete observation set."""
+    from .sources import load_coordinate_flow
+    from .rgb import _image_directory
+    from modal_gaussians.common.cache import sha256
+    cameras = {c.label:c for c in cameras_from_scene_manifest(scene.manifest) if c.role == 'reference'}
+    available = [v['label'] for v in bank.manifest['views']]
+    labels = available if labels is None else labels
+    if not labels or len(set(labels)) != len(labels) or not set(labels) <= set(available):
+        raise ValueError('Select unique fixed recordings from the mode bank')
+    views,images = [],[]
+    for i,original in enumerate(bank.manifest['views']):
+        if original['label'] not in labels:
+            continue
+        camera = cameras.get(original['label'])
+        if camera is None or camera.to_manifest_record()['camera_identity'] != original['camera_identity']:
+            raise ValueError('Fixed recording camera identity differs')
+        flow_path = bank.manifest['flow_artifacts'][i]
+        flow = load_coordinate_flow(flow_path)
+        try:
+            if flow.identity != original['flow_identity']:
+                raise ValueError('Fixed recording flow identity differs')
+            names = flow.manifest['frame_names']
+            if any(Path(name).name != name or not name for name in names):
+                raise ValueError('Invalid fixed frame name')
+            view = dict(original, camera_name=camera.name, frame_names=names, frame_count=len(names),
+                        fps_hz=flow.manifest['fps_hz'], frame_offset=0,
+                        reference_frame_name=flow.manifest['reference_frame_name'],
+                        reference_frame_index=flow.manifest['reference_frame_index'])
+        finally:
+            flow.arrays.flow.store.close()
+        directory,validity = _image_directory(flow_path,view)
+        image = dict(label=view['label'],directory=str(directory),validity=validity,
+                     files=[dict(name=f'{n}.png',sha256=sha256(directory/f'{n}.png')) for n in names])
+        views.append(bind_fixed_view(view,image)); images.append(image)
+    return reindex_views(views),images
+
+
 def bind_fixed_view(view, image):
     """Normalize a validated fixed-camera coordinate view without changing its source."""
     result = copy.deepcopy(view)

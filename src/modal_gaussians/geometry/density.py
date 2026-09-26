@@ -1,4 +1,4 @@
-"""Gaussian row operations shared by static training and scene refinement."""
+"""Static-training Gaussian row operations and shared quaternion math."""
 import math
 
 import torch

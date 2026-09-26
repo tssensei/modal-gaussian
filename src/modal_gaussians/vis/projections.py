@@ -110,8 +110,9 @@ class ViewerProjections:
                 from modal_gaussians.motion.prepared import load_prepared
                 if mode.prepared not in self._prepared:
                     prepared = load_prepared(mode.prepared)
-                    prepared.arrays = {f"v{i}_mask": prepared.arrays[f"v{i}_mask"]
-                                       for i in range(len(prepared.manifest["flows"]))}
+                    prepared.arrays = {f"v{i}_{name}": prepared.arrays[f"v{i}_{name}"]
+                                       for i in range(len(prepared.manifest["flows"]))
+                                       for name in ("mask", "valid")}
                     self._prepared[mode.prepared] = prepared
                 flow = self._prepared[mode.prepared].flow(dense["flow_artifact"])
             else:

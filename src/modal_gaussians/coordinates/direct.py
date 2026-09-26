@@ -24,6 +24,18 @@ SOLVER_CONVENTION = {
 }
 SAMPLE_BLOCK_SIZE = 4096
 
+
+def mode_pair_scales(diagonal, sample_count):
+    """Pixel-space RMS shared by ridge initialization and zero-start refinement."""
+    diagonal = np.asarray(diagonal, np.float64)
+    if diagonal.ndim != 1 or len(diagonal) % 2 or not len(diagonal) or sample_count < 1 or np.any(diagonal < 0):
+        raise ValueError('Invalid modal design diagonal')
+    scales = np.sqrt((diagonal[0::2]+diagonal[1::2]) / (2*sample_count))
+    if not np.isfinite(scales).all():
+        raise ValueError('Direct-coordinate mode-pair scales are non-finite')
+    scales[scales <= np.finfo(np.float64).eps] = 1.
+    return scales
+
 DIRECT_COORDINATES_FORMAT = "modal_gaussians.direct_modal_coordinates"
 @dataclass(frozen=True)
 class DirectCoordinateConfig:
@@ -181,16 +193,7 @@ def solve_direct_coordinates_view(
         if not np.isfinite(block).all():
             raise ValueError("Direct-coordinate design contains NaN or Inf")
         raw_gram += block.T @ block
-    pair_scales = np.sqrt(
-        (
-            np.diag(raw_gram)[0::2]
-            + np.diag(raw_gram)[1::2]
-        )
-        / normalizer
-    )
-    if not np.isfinite(pair_scales).all():
-        raise ValueError("Direct-coordinate mode-pair scales are non-finite")
-    pair_scales[pair_scales <= np.finfo(np.float64).eps] = 1.0
+    pair_scales = mode_pair_scales(np.diag(raw_gram), sample_count)
     column_scales = np.repeat(pair_scales, 2)
     normalized_gram = raw_gram / normalizer
     normalized_gram /= column_scales[:, None]

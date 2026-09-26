@@ -1,5 +1,57 @@
 # Current numerical recipe
 
+## Accepted coefficient visual baseline — 2026-09-25
+
+The user selected **reference-only flow coordinates + one shared reference-frame
+RGB pose offset** (bottom-left panel) as the new visual baseline. In the user's
+review, both flow-based reconstructions looked better than the earlier zero-start
+per-frame RGB fit; adding adjacent-flow constraints gave no obvious visual benefit.
+Use the simpler reference-only method as the comparison target for subsequent
+coefficient experiments. This acceptance covers **Bush view1 frames 0–299 only**:
+960x540, 30 FPS, original fixed 20-mode bank and unchanged Gaussian scene.
+
+- Experiment: `scene_library/bush/experiments/flow_coordinates540_view1_10s_20260925_001`.
+- Selected coordinates: `solution/reference_only.npy`, complex64 [300,20], already
+  containing the shared offset. **Do not add `reference_offset.npy` again.**
+- Coordinate SHA-256: `ab8128c7874a5cd01016b6314d1ee90bfcfb1aa9d516c1e2504d49a7f3d5dcba`.
+- Method: reference frame index 853 (`00854`), projected-pixel RMS normalization,
+  ridge 1e-4, no adjacent-flow term, no temporal centering or per-frame RGB refinement.
+  Shared offset uses 200 full-resolution RGB Adam updates, LR .01 -> .001,
+  keeping the best loss including zero initialization.
+- Visual evidence: `comparison/comparison.mp4`, bottom-left panel. Preserve all
+  other panels, coefficients and diagnostics as experimental comparisons.
+- Valid-image frame-mean metrics in `evaluation_001/`: PSNR **22.310178 dB**,
+  SSIM **0.753528**, RMSE **0.077343**, LPIPS-Alex **0.167549**. All 300 native PNGs
+  use the existing evaluation kernels with float predictions clamped to [0,1],
+  valid SSIM windows and spatial masked LPIPS. Earlier video diagnostics used
+  unclipped RGB, explaining their slightly different PSNR/RMSE values.
+  Visual preference is not a claim of superior framewise metrics: the previous RGB
+  fit measured 22.635570 dB / 0.768559 SSIM / 0.166089 LPIPS. Full-video,
+  other-view and refinement acceptance remain untested.
+
+This records a visual baseline; it does not replace the production `fit-rgb` or
+`refine-motion` implementation. The diagnostic still computes both alternatives;
+no isolated reference-only runtime was measured. Original artifacts remain frozen.
+
+The explicit `refine-motion --flow-initialization` option can now initialize a new
+motion-refinement experiment from this solution, selecting only its 300 frames,
+retaining the included offset/scales and skipping zero-q warmup. It remains a
+candidate refinement, not an automatically accepted replacement for this baseline.
+
+## Motion subject selection — 2026-09-24
+
+Use an explicitly saved union of one or more oriented 3D boxes on the current static scene, applied with
+`static apply-selection`, as the authoritative motion foreground for subsequent
+graph/control construction and modal learning. XMem masks do not define this final
+subject. They remain inputs for bootstrap partitioning and background-only camera
+stabilization. Never reuse selection indices across static scenes.
+The user-saved Bush 540p union was tested at 0.744 Hz with deformation weight
+0.03 unchanged in `pipeline540_box0744_20260924_001` (completed 2026-09-25).
+It has 322,162 foreground Gaussians and 4,085 controls; training stopped at step
+1,009 under the existing convergence rule. Publication/checksum loading passed;
+visual acceptance and reconstruction quality remain unverified. See the experiment's
+`RUN_REPORT.md`. Future scenes still require the user's saved subject selection.
+
 Configuration: [`configs/neural_component_field.json`](configs/neural_component_field.json).
 Pipeline/entry points: [README](README.md). Cleanup compatibility: [REBUILD](REBUILD.md).
 
@@ -24,7 +76,7 @@ groups may end with smaller batches).
 | Opacity / scale / rotation LR | 0.05 / 0.005 / 0.001, constant |
 | Adam epsilon | `1e-15` |
 | RGB objective | Full-frame `L1 + 0.2 * (1 - SSIM)` |
-| Depth objective | Disabled; no predicted depth supervision yet |
+| Depth objective | With `--depth`: camera-Z L2, weight 0.01, first 3,000 updates; otherwise disabled |
 | Density | After step 500, every 100 updates, before step 9,000 or training end |
 | Densify gradient / split scale | `2e-4` / `0.01 * camera_extent` |
 | Cull opacity | Below 0.005 |
@@ -47,10 +99,9 @@ that gate. Numerical alignment is therefore not an exact reproduction.
 All photometric renderers evaluate SH from the current (possibly deformed)
 Gaussian position and camera center. The basis stays in world coordinates;
 Gaussian covariance rotation does not rotate SH. Fixed-mode coefficient fitting
-freezes SH; joint refinement optimizes DC at `color_lr`, higher bands at
-`color_lr / 20`. Coefficient/refinement RGB loss keeps its existing 0.8/0.2 weights.
+and motion refinement freeze every SH coefficient and the active degree. Coefficient/refinement RGB loss keeps its existing 0.8/0.2 weights.
 
-Static training uses only full-frame `L1 + 0.2 * (1 - SSIM)`. Mask loss, its
+Static training uses full-frame `L1 + 0.2 * (1 - SSIM)` and optional depth L2. Mask loss, its
 erosion/quantile settings and `--mask-weight` have been removed. Original masks
 still define the initial foreground/background partition and serve other stages;
 the optimization loop does not read them or render foreground-membership targets.
@@ -59,10 +110,58 @@ Static execution caches decoded RGB bytes in a per-run 2 GiB
 CPU LRU; larger inputs remain loadable without caching. RGB normalization stays
 on CPU to preserve the original float32 pixel values. The shared radial renderer
 caches up to 16 device sampling grids, keyed by intrinsics, distortion, dimensions,
-batch padding, device and dtype. Static training requests RGB without expected
-depth; normal scene/depth render calls retain depth. Caching is an execution
+batch padding, device and dtype. Static training requests expected depth only
+while depth supervision is active; normal scene/depth render calls retain depth. Caching is an execution
 optimization; removal of mask supervision is a separate loss change.
 Caches are transient and are rebuilt lazily after restoring a checkpoint.
+
+### COLMAP-conditioned DA3 depth supervision
+
+`static prepare-depth` uses the exact registered sweep/reference PNGs and raw
+COLMAP world-to-camera poses. A local multi-view DA3 model runs in an isolated
+Python environment (upstream requires NumPy < 2). Inference receives undistorted
+images and pinhole K, including the half-pixel conversion from the renderer to
+DA3's integer-center convention. Returned K handles DA3 resizing/cropping; depth
+is mapped back to the original distorted training grid. Source pixels/cameras
+are never replaced by predicted cameras. Camera-Z depth aligned by DA3 to raw
+input translation scale is divided by the existing scene-normalization scale once.
+It is COLMAP-scale supervision, not a claim of metric ground truth.
+
+Defaults: processing long side 1008, 16 target images per group plus at most
+three spatially spread context cameras; every target is published once. Each
+group is pose-conditioned and scale-aligned. This bounds memory and is not one
+global all-images attention pass. The lowest 10% confidence is excluded per image,
+as are invalid/nonpositive depth and undistortion/resize padding. These inference
+and confidence settings are recorded experimental starting points, not tuned results.
+
+With `static train --depth DEPTH`, the default objective is
+`L1_RGB + 0.2 * (1 - SSIM) + 0.01 * mean_images(mean_valid_pixels((ED - DA3_Z)^2))`.
+`ED` is alpha-normalized expected depth from all foreground/background Gaussians.
+Targets and valid support are fixed; predicted opacity does not gate the loss.
+`--depth-weight` and `--depth-until-step` configure weight and number of supervised
+updates (defaults 0.01 and 3000). Later updates request RGB only. No per-image
+scale/shift is fitted during training, and no inverse-depth or mask loss is added.
+
+The author code in `summer2023/x3d/experimental/forestGaussians/train.py` uses
+coarse-stage depth L2 before `depth_iterations` (and a separate optional disparity
+L2). We retain that objective family, replacing its input with posed DA3 depth and
+filtering unreliable predictions. The weight 0.01 is our starting setting, not
+the author's validated setting; his generic `lambda_depth` defaults to zero.
+Moving foliage and group-dependent predictions remain pseudo-depth limitations.
+Bush input preparation has now completed with DA3-LARGE-1.1: 362 sweep frames at
+30 FPS plus three raw reference images, all 960x540, under
+`scene_library/bush/experiments/static540_da3_20260924_001/`. Existing COLMAP
+poses were reused with resized intrinsics/observations; this was not a new SfM
+run. All depth/input contracts passed preflight. The first RGB-D static run then
+completed 3,000 updates at batch 4: 280.4 seconds training, 299.1 seconds including
+input loading/initialization/publication. It published `static_scene/` with 375,410
+foreground and 159,915 background Gaussians. Reload/checksum/source-identity checks
+passed; no formal reconstruction evaluation, viewer or downstream stage was run.
+See the experiment's `training_verification.json`. Completion does not establish
+depth accuracy or visual reconstruction quality.
+
+References: [DA3 API](https://github.com/ByteDance-Seed/Depth-Anything-3/blob/main/docs/API.md),
+[depth backprojection](https://github.com/ByteDance-Seed/Depth-Anything-3/blob/main/src/depth_anything_3/utils/export/glb.py).
 
 ## Video stabilization baseline — accepted 2026-09-24
 
@@ -186,79 +285,30 @@ are v16. The explicit fixed-reference import passed network/full-field equivalen
 with zero error on all 20 modes on 2026-09-24; see the Bush experiment
 `refinement20_view1_sweep_20260924_001/verification.json`. General loaders remain current.
 
-## Optional joint scene refinement
+## Optional fixed-scene motion refinement
 
-`configs/scene_refinement.json` defines two alternating rounds, all at image scale
-1.0. Initialize selected bank recordings (`--view`; default all) and sweep with
-compatible RGB coefficients; retain pose offsets and amplitude scales. Sweep must
-be a genuine 30 FPS subset. Existing 60 FPS coefficients can be selected without
-re-fitting. This method is separate from fixed-mode RGB fitting.
+`configs/motion_refinement.json` replaces geometry/density refinement. All static
+Gaussian attributes and counts remain fixed; learn valid control displacement/
+angular corrections and free per-frame complex q. Cameras, graph, control layout,
+frequency weights and donor rules remain fixed. Control corrections use the original
+field RMS, complex-orthogonal gauge and anchor; q keeps the original **2D projection
+pair scales**, with sweep inheriting the first selected fixed view's scale.
 
-Freeze the original graph, frequency-specific paths/donors, control positions and
-fields, cameras, normalization and background. Foreground appearance, orientation
-and scale are trainable during geometry phases; only non-control positions move.
-Controls never split/clone/cull. No depth, temporal smoothing, frequency locking,
-GNN training or global position anchor is added.
+Full resolution only: ten zero-start full-frame RGB warmup passes (q LR 0.01 to
+0.001), then two rounds of sparse joint motion/q updates (fixed 5 FPS, sweep 10 FPS)
+and one exhaustive coefficient pass. Post-warmup q LR is 0.001 to 0.0001 on the
+post-warmup update clock; control LR decays exponentially 0.001 to 0.0001 on the
+joint clock. Preserve per-frame Adam state across all phases. Warmup-end q is the
+anchor. RGB weights 0.8/0.2; q anchor 1e-4, field anchor 1e-2, dynamic rigidity and
+relative rotation each 1e-3. Frame-zero skips temporal regularizers. The previous
+frame's q is detached. No modal-image/alpha loss, density, depth, carrier or damping.
 
-Constrain each canonical center to the union of tubes around its permanent root's
-original incident **line segments**. The fixed tube radius is
-`shape_radius_fraction * median(original incident edge lengths)`, default **0.25**.
-This is an experimental starting value, independent of frequency weights and
-motion radius `2h`. Isolated nodes have zero radius and cannot move. Children
-inherit the root and radius; movement never rebuilds KNN or expands the region.
-This bounds center drift; it does not constrain Gaussian scale/opacity or guarantee
-unchanged rendered silhouettes.
-
-Each round has two phases:
-
-1. **Geometry:** one sample per 6-frame fixed-view bin (30 to 5 FPS) and 3-frame
-   sweep bin (30 to 10 FPS). Keep first/last frames in their endpoint bins; seeded
-   random selection in other bins. A one-bin sequence retains its first frame.
-   Shuffle sequences independently; shorter sequences cycle. Each shared update
-   renders one frame per sequence with one shared differentiable field query.
-2. **Coefficient:** freeze every Gaussian parameter, bake displacement/angular modes
-   once on GPU, then visit every reconstruction frame once in random order. Only
-   that frame's q and its existing Adam state update. The next round rebakes after
-   geometry changes. Publish the final cache without another graph query.
-
-Fixed-view losses average within their group; fixed and sweep groups have equal
-weight. The loss per frame is `0.8*L1 + 0.2*(1-SSIM) + 1e-4*mean(|s*(q-q0)|²)`.
-The original q0 and scales s remain fixed across phases and rounds. Coefficient
-LR decays linearly 0.001 to 0.0001 over **all optimization updates**. Gaussian LRs
-are means 4e-5, quaternion 2.5e-4, log-scale 1.25e-3, color/opacity 2.5e-3;
-exponential decay to 0.1 over **geometry updates only**.
-
-Density changes run only in round 1's geometry phase: warmup 34 geometry updates,
-interval 17, newborn protection 17. Require five visible records; cap foreground
-at twice its initial count; no opacity reset. Thresholds remain gradient 2e-4,
-split world/screen scale 0.01/0.05, cull opacity 0.005 and world/screen scale
-0.5/0.15. Undo the actual loss weight in density statistics. Cancel a split if
-either child violates shape or motion support. Backtrack invalid position updates
-up to eight midpoints toward the previous accepted position, then restore it if
-necessary. Clear position Adam moments on every initially rejected row.
-
-For Bush's fixed 20-mode experiment:
-
-| Budget | Per round | Two rounds |
-| --- | ---: | ---: |
-| view1 / sweep reconstruction frames | 1170 / 362 | same frames |
-| Geometry candidate frames | 195 / 121 | reselect per round |
-| Shared geometry updates | 195 | 390 |
-| Coefficient-only updates | 1532 | 3064 |
-| Total optimizer updates | 1727 | 3454 |
-| RGB renders | 1922 | 3844 |
-
-Density events are geometry steps 51, 68, ..., 187 (nine events). Gaussian LR uses
-`geometry_step/389`; coefficient LR uses `step/3453` before each update. Checkpoint
-every 200 total updates and every phase boundary. These are operation counts,
-not runtime estimates or evidence of reconstruction improvement.
-
-The verified reference, historical sweep `[724,20]` fit and 60 FPS common baseline
-remain immutable in `refinement20_view1_sweep_20260924_001/`. Historical training
-attempts were paused; no refined scene was published. Logs/measurements remain in
-that experiment. The new recipe requires a 30 FPS sweep subset, new prepared
-inputs, matching 30 FPS baseline and new work directory; see [REBUILD](REBUILD.md).
-This implementation does not run those stages.
+Group weighting remains equal fixed/sweep, with fixed views averaged. Exhaustive
+updates correct for unequal sequence lengths. See [the reconstruction contract](COEFFICIENT_FITTING.md#fixed-scene-motion-refinement) for exact regularizers,
+gauge, equations and commands. Seed 1729; checkpoints every 200 updates and phase
+boundaries. For view1 1170 + sweep 362 frames: 15,320 warmup updates plus two rounds
+of 195 joint + 1532 coefficient updates = 18,774 updates, 19,164 RGB renders.
+These defaults and counts do not establish runtime, convergence or real quality.
 
 ## Resume boundaries
 

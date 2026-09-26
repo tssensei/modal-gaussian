@@ -1,4 +1,4 @@
-# Coefficient fitting and optional scene refinement
+# Coefficient fitting and optional motion refinement
 
 Spatial mode learning and temporal fitting are separate stages. Input modes are
 immutable complex displacement and angular fields. The static scene, appearance,
@@ -23,6 +23,34 @@ completed batch index
 `coordinates.npy` is `complex64 [total_selected_frames, mode_count]`.
 Displacement is `Re(sum_k(q_k(t) * phi_k))`. Saved angular fields drive the
 exponential-map rotation of static Gaussian orientations.
+
+## Reference + adjacent flow diagnostic
+
+`tools/compare_flow_coordinates.py` is an independent frozen-scene experiment,
+not a replacement for `fit-rgb` or motion-refinement warmup. Run its explicit
+`--stage design`, `pairs`, `solve`, `export`, then `plot` with the same
+`--prepared PREPARED --flow REFERENCE_FLOW --rgb-preview CHECKPOINT_PREVIEW
+--output NEW_EXPERIMENT --view view1 --frames 300` arguments. The plotting
+interpreter needs Matplotlib; numerical/rendering stages use the CUDA environment.
+The comparison preview must bind the exact same scene, modes, frames and cameras.
+
+The experiment uses existing reference-to-frame flow and new adjacent forward /
+backward SEA-RAFT flow. Adjacent flow is sampled at `x + F_ref_to_previous(x)`,
+with valid bilinear footprints and forward/backward consistency. A float64 sparse
+block-tridiagonal ridge solve compares adjacent weights 0 and 1 (ridge `1e-4`),
+normalizing each frame/pair by its valid real-component count. Missing pair support
+adds no constraint; missing reference support is an error. This constrains observed
+motion increments, not a zero-velocity or fixed-frequency prior.
+
+Both solutions share one RGB-fitted reference-frame offset (200 full-resolution
+Adam updates, LR `.01 -> .001`, best loss including zero initialization). Coordinates
+are `offset + relative_q`, without temporal mean subtraction or per-frame RGB
+refinement. Static canonical projection remains a small-deformation approximation;
+flow design does not model covariance-rotation appearance changes. Video diagnostics
+use the full displacement/angular fields and SH. The four panels are input, previous
+RGB fit, reference-only solve, and reference-plus-adjacent solve. Uncompressed RGB
+errors use stabilization-valid pixels; these are used-frame diagnostics, not an
+equal-budget or novel-view benchmark. No FFT, catalog or production artifact changes.
 
 ## Valid pixels after stabilization
 
@@ -76,7 +104,7 @@ of every result view; repeat `--view LABEL` to select a subset. This does not fi
 missing recordings or modify any input. Ordinary RGB and refined RGB results
 use the same evaluator and saved coefficient offsets.
 
-The fixed protocol is full-frame RGB at native PNG resolution, using the recorded
+The fixed protocol is valid-support RGB at native PNG resolution, using the recorded
 camera and distortion. Predictions are float32 clamped to [0,1], without video
 compression, quantization, resizing, exposure alignment or reference subtraction.
 PSNR uses an MSE floor of 1e-12 (120 dB ceiling); SSIM uses the existing static-QA
@@ -115,196 +143,174 @@ does not establish a three-view baseline.
   metrics. RMSE/PSNR/SSIM/LPIPS reports require a separate requested evaluation.
 - Fitting does not start exports, metrics or Viser automatically.
 
-## Joint scene refinement
+## Fixed-scene motion refinement
 
-Use fixed-mode RGB fits as initialization for an explicit second method.
-`prepare-refinement` freezes reference inputs; `refine-scene` alternates sparse
-geometry/coefficient updates and exhaustive coefficient-only passes. There are
-two rounds, entirely at image scale 1.0. The replaced all-frame joint schedule and
-multiscale refinement configuration are no longer supported.
+`coordinates refine-motion` is a separate method from fixed-mode `fit-rgb` and
+`fit-sweep`. It freezes **all Gaussian positions, rotations, scales, world-frame
+SH, opacity and counts**, including the background. Cameras and normalization also
+remain fixed. It learns shared complex control-point displacement/angular
+corrections and independent free complex coefficients for every video frame.
+Frequency labels/order stay fixed; q has no carrier lock, oscillator or damping model.
+There is no Gaussian optimizer, densify/cull, position rollback or new scene output.
 
-In each geometry phase, select one frame per temporal bin: six source frames for
-30 FPS fixed views (5 FPS geometry density), three for sweep (10 FPS). Preserve
-first/last frames in endpoint bins; choose other bins with the seeded RNG. A single
-bin retains its first frame. Reselect each round, shuffle independently, and cycle
-shorter sequences. A shared update consumes one frame per sequence. Average fixed
-views within their group; fixed and sweep groups have equal weight (view1+sweep:
-0.5/0.5). Videos remain asynchronous and retain their own coefficients/cameras.
+Preparation accepts selected bank recordings (`--view`, repeatable; default all)
+directly, with optional registered sweep metadata. No pre-fitted coefficient input
+is required. Original modal observation views remain intact for Spectrum; sweep
+has no FFT/modal-image role. Preparation runs no training.
 
-In each coefficient phase, freeze every Gaussian attribute and query the final
-geometry's modes once into detached GPU tensors. Visit every reconstruction frame
-once, including sparse geometry frames. Each step renders one frame and updates
-only its q and persistent Adam state; it performs no reference-field query,
-Gaussian update, support check or density operation. Geometry changes invalidate
-the basis; checkpoint load reconstructs it once. Final publication reuses it.
+The reference graph, frequency-specific propagation weights, controls and their
+canonical positions remain fixed. Preparation collapses canonical path queries into
+a sparse control operator. Own fields obey
+`phi = sum(W*(d + omega cross lever))` and `Omega = sum(W*omega)`.
+Recipients then mix those donor fields with the original donor weights. Retain
+both sum stages and each donor's canonical lever: coalescing the weights changes
+float32 accumulation and can exceed the original-field tolerance.
+Unresolved rows stay zero. Original displacement/angular fields must be reproduced
+within `1e-5` after per-frequency amplitude normalization. Training uses blocks of
+4096 Gaussians and at most four modes per group, with checkpoint recomputation;
+it never executes the GNN or shortest-path query.
 
-The commands below are independent stages. Preparation requires RGB
-fits for selected bank views (`--view LABEL`, repeatable; default all bank views), rejects duplicate/missing recordings and mismatched
-scenes/mode order, and preserves each fitted pose offset. No reference subtraction
-or mean removal occurs again. Preparation re-evaluates saved GNNs without
-gradients to extract fixed control displacement/angular fields, checks them against
-the bank, computes sparse path tables and releases its CuPy workspace.
+Write `B0 = [d0, radius*omega0]`. A real/imag correction parameter is normalized by
+the original valid-control RMS of B0 and projected onto B0's complex orthogonal
+complement per mode (`<B0, delta B> = 0`). This fixes the overall complex scale/phase
+ambiguity with q. Invalid controls remain unchanged. The correction anchor is a
+soft penalty, not a hard per-control motion limit. All-zero/non-finite modes fail.
+Coefficient normalization is the **original rendered-design pixel-pair RMS**, not
+3D displacement RMS. Preparation reuses projection kernels and the direct solver's
+scale formula without solving ridge coordinates. Every fixed view gets its own
+frozen scale; sweep uses the first selected fixed view in bank order (recorded).
 
-Each live Gaussian carries a permanent UID and original reference root. Its local
-portals are that root and its original one-hop neighbors. Current positions attach
-to these fixed portals; geometric distances and frequency-weighted shortest paths
-determine Wendland weights with radius `2h` and attenuation `d0/dk` (zero/zero = 1).
-All portal-to-candidate distances are retained, including lower-cost detours.
-Control fields, graph nodes and weights stay fixed; distances, normalized weights
-and angular lever arms differentiate with respect to current position.
+### Schedule and objective
 
-Propagation is inherited, never re-estimated after moving or adding a render point:
+All stages use resolution 1.0 and independent video clocks:
 
-- Original edge `i-j` keeps geometric length `ell_ij` and each mode's propagation
-  cost `L_ij[k]`; attenuation is `a_ij[k] = ell_ij / L_ij[k]`.
-- A point rooted at `i` connects only to `i` and its original neighbors. Its
-  connector to `i` has attenuation 1; to neighbor `j` it inherits `a_ij[k]`.
-  Connector costs are `|x-p_j|` geometrically and `|x-p_j|/a_ij[k]` per mode.
-  Minimize connector-plus-cached-path cost independently for geometric and modal
-  distance, then apply the existing normalized Wendland rule.
-- These are query connectors, not new reference edges or routes for other points.
-  GNN degree weights are not renormalized: refinement never runs the GNN.
-  Each mode retains its control-valid mask and root's own/donor/unresolved roles.
-- Clone/split children inherit roots, donor indices/weights and these same rules;
-  they get new UIDs. Culling removes only live rows. Neither a parent's modal
-  amplitude nor per-frame coefficients are divided between its children.
+1. Initialize every q to zero. Freeze original control fields and run **10 full
+   shuffled passes** over all reconstruction frames, RGB loss only. Update just
+   the sampled q row and its Adam state. No shared offset or reference subtraction.
+   Snapshot normalized q after warmup as the fixed anchor for subsequent stages.
+2. Each joint round selects fixed-view frames at 5 FPS and sweep frames at 10 FPS.
+   Preserve first/last frames in endpoint bins, select other bins with seeded RNG,
+   shuffle independently and cycle shorter sequences. One shared update samples
+   one frame per sequence and updates control corrections and sampled q together.
+   There is no inner solve of q to convergence. Compose shared field blocks once,
+   render frames sequentially, then backpropagate accumulated output gradients once.
+3. Freeze fields, bake one detached GPU displacement/angular basis, and visit
+   **every reconstruction frame once** to update only q. Preserve each row's Adam
+   state across all phases. Run two joint/coefficient rounds. Invalidate the baked
+   basis after joint updates and checkpoint load.
 
-Canonical position updates also obey a frequency-independent **shape bound**.
-For root `i`, let `S_i` be the union of the original segments `[p_i,p_j]` over
-its original neighbors. Require
-`distance(x,S_i) <= epsilon_i`, where
-`epsilon_i = shape_radius_fraction * median_j(ell_ij)`, default fraction **0.25**.
-Closest points are clamped to segment endpoints, not infinite lines. Isolated
-roots have `S_i={p_i}` and zero tolerance. Original edges/lengths define the bound
-once; root assignment and tolerance never follow a moving parent or its children.
-There is no global nearest-neighbor reassignment or frequency-dependent shape.
-This allows local redistribution along graph edges while bounding off-graph center
-drift. Gaussian scale, orientation and opacity remain trainable; this is not a
-guarantee of unchanged silhouettes or preserved surface coverage after culling.
+RGB loss remains `0.8*L1 + 0.2*(1-SSIM)` on valid PNG support. After warmup add:
+`lambda_q * mean(|s*(q-q_warmup)|^2)`, local dynamic rigidity, neighbor relative
+rotation, and (once per joint update) normalized control-field correction penalty.
+No original modal-image/alpha loss or depth loss is added.
 
-The query engine keeps fixed sparse tables on the computation device, batches up
-to four frequencies within each Gaussian block, and recomputes activations for
-backpropagation. Path distances and weight normalization retain float64 precision.
-Ordered segmented sums preserve the original control/donor accumulation order,
-avoiding CUDA atomic-sum rounding drift. Support checks skip field composition;
-bisection rechecks only rejected points. These changes preserve the model and loss.
+Dynamic regularizers compare the current frame with its immediately preceding
+frame **in the same reconstruction sequence**, even if that predecessor is not a
+sparse joint sample. Previous q is detached; control fields at both times remain
+differentiable in joint phases. Frame zero skips these terms. For each original
+geometric edge, rotate the current edge back by its center's relative rotation,
+compare with the previous edge, and normalize squared error by original squared
+edge length. Relative rotations are compared as rotation matrices (quaternion
+sign invariant), squared Frobenius distance divided by three. Evaluate both edge
+directions; average neighbors per node, then average supported nonisolated nodes.
+Use original geometry edges whose endpoints have motion support, never one mode's
+soft weights. Previous-frame regularization adds deformation work but no RGB render.
 
-Each shared update queries every Gaussian/frequency block once for all sampled
-sequences, applying their independent coefficients to the same block fields.
-Rendering/backpropagation remains sequential. Detached dynamic-position/angular
-leaves collect the render gradients, then one backward traverses the shared query
-graph (including its checkpoint recomputation). This preserves the direct position,
-interpolation, coefficient and anchor gradients; optimizers step only afterward.
-The shared graph lasts one update and is rebuilt after movement or density changes.
+Average fixed views within their group and weight fixed/sweep groups equally.
+An exhaustive single-frame update uses `group_sequence_weight * total_frames /
+sequence_frames`, so uniform frame sampling preserves this same objective.
 
-Own-field displacement is `sum(w * (d + omega × (x-control_position)))`; angular
-displacement is `sum(w * omega)`. Recipients query their frozen donors at
-`x + donor_position - root_position`, preserving original copied-field semantics.
-Unresolved frequency components remain zero. Both the shape bound and all previously
-valid motion supports must hold after an update. On failure, try up to eight
-midpoints toward the previous accepted position, then restore that position if
-needed; clear position Adam moments for every initially rejected point. Failure
-of either child cancels its parent's entire split. This is a hard acceptance check,
-not an added RGB loss. Checkpoints and final publication also validate the bound.
+| Default | Value |
+| --- | --- |
+| Warmup passes; q LR | 10; linear 0.01 to 0.001 |
+| Joint rounds; exhaustive passes per round | 2; 1 |
+| Fixed/sweep joint sampling | 5 / 10 FPS |
+| Post-warmup q LR | linear 0.001 to 0.0001 over post-warmup updates |
+| Normalized control LR | exponential 0.001 to 0.0001 over joint updates |
+| q anchor / field anchor | 1e-4 / 1e-2 |
+| Rigidity / relative rotation | 1e-3 / 1e-3 |
+| Checkpoint / seed | every 200 updates and phase boundaries / 1729 |
 
-Control Gaussian canonical positions remain exact through gradient/momentum masks
-and restoration. Their orientation, scale, color and opacity may change, and they
-still move dynamically with q. Other foreground Gaussians may move/clone/split/cull;
-background and cameras remain fixed. Shared density operations remap all Gaussian
-parameters and Adam rows; newborns receive zero moments and inherited roots.
+For 1170 view1 and 362 sweep frames: warmup 15,320 updates, then two rounds of
+195 joint + 1532 coefficient-only updates. Total **18,774 updates and 19,164 RGB
+renders**. These are operation counts, not runtime estimates or convergence claims.
+Defaults live in `configs/motion_refinement.json` and are experimental starting values.
 
-Each sequence loss is `0.8*L1 + 0.2*(1-SSIM) + 1e-4*mean_k(|s*(q-q0)|²)`, using
-the actual full-frame PNGs and frozen direct-fit scales `s`. Defaults and density
-thresholds are in [BASELINE.md](BASELINE.md) and `configs/scene_refinement.json`.
-The original q0 and scales remain fixed for both rounds; no offset reinitialization
-or anchor reset occurs. Gaussian LR/density/newborn age use geometry-update counts;
-coefficient LR uses all updates. Density is permitted only in round 1's geometry
-phase (warmup 34, interval 17, newborn protection 17); round 2 keeps point count
-fixed. No time smoothing,
-oscillator constraint, depth loss or GNN refinement is included.
+### Commands, recovery and outputs
 
-Every 200 total updates and at each phase boundary, save a complete atomic
-checkpoint: Gaussian/q parameters and Adam state, density/identity arrays, total
-and per-phase counters, per-round selected rows, samplers and all RNG state.
-`training.jsonl` records per-view RGB/coefficient loss, count/density decisions,
-`support_backtracks`, `shape_backtracks` and their union `position_backtracks`
-(initially rejected point counts, not bisection iterations), control-position error,
-round/phase/update counters and timings. `query_seconds` and
-`query_backward_seconds` separate shared deformation from `render_seconds` and
-`backward_seconds` (render/loss forward and backward). These runtime wall-clock
-fields are diagnostic; synchronized CUDA timing belongs in local benchmarks.
-Non-finite values
-stop the run before final publication. `bake_seconds` records coefficient-cache
-preparation separately. Final cached fields are saved as complex64
-`[K,G_new,3]`; viewer/export use ordinary modal superposition without graph queries.
-Spectrum shows inherited modal observations with new-geometry projections; its
-reference-graph overlay retains original node coordinates.
-`viewer --no-spectrum` skips the optional Spectrum panel and its FFT dependencies;
-saved-mode and coefficient playback still use the same scene and motion arrays.
+Optional early stopping uses `early_stop_patience` (0 disables it),
+`early_stop_joint_interval` (default 25 joint updates), and
+`early_stop_min_relative_improvement` (default 0.001 = 0.1%). It measures mean
+RGB loss on **all supervised frames** with the original sequence-group weights,
+after initialization/warmup, at interior joint intervals, and after each complete
+coefficient phase. The joint/coeff boundary waits for the coefficient phase instead
+of counting two adjacent checks. This is training-set convergence, not validation.
+Small gains accumulate relative to the last significant improvement; every true
+minimum is independently retained. On plateau or budget completion, publish the
+best checked state, which can precede the last update. `work/checkpoint.pt` keeps
+the latest state and plateau history; `work/best/` keeps atomic best checkpoints.
+Resume restores both counters and best-file hashes. Final coordinates record
+`training_selection` with actual/published steps and the selection loss.
 
-Synthetic checks cover graph equivalence/gradients, density identities, GPU
-optimization/resume, publication/reload and short-video export. They do not
-establish real reconstruction quality. Supported improvement is local to the fixed
-control/reference support; wholly missing unsupported structure needs a later method.
+To start from the reference-only flow diagnostic, pass `--flow-initialization
+DIAGNOSTIC_ROOT` to `coordinates refine-motion`. This selects only the diagnostic's
+exact fixed-view prefix (Bush frames 0–299), even if preparation also contains
+sweep or later frames. The loader checks scene/mode/preparation identities, PNGs,
+cameras, timestamps, validity, reference binding and consumed solution checksums.
+It uses `solution/reference_only.npy` **including the shared offset**; no second
+offset, reference subtraction or temporal centering is applied. The diagnostic's
+pixel-pair scales are frozen, q is converted into normalized parameters and copied
+as the anchor. Warmup is skipped regardless of `warmup_passes`; fresh Adam states
+start directly in joint refinement. Without the option, zero-start behavior stays.
 
-### Fixed 20-mode view1 + dynamic sweep
-
-The existing Bush bank retains all three modal observation views. Only view1 and
-sweep supervise this experiment. Sweep does not acquire flow/FFT/modal-image roles.
-The 724 registered 60 FPS sweep frames are decimated to rows 0,2,...,722: 362
-frames at 30 FPS for fitting, refinement, evaluation and export. View1 retains
-1170 frames at 30 FPS. Each selected frame keeps its original PNG, camera, source
-index and timestamp; the sequences are never paired in time. `sequences.py` owns
-the shared selector and rejects irregular grids, upsampling and noninteger ratios.
-
-For v16 component-field sources, first use the isolated importer. It verifies
-manifests, network/array hashes, Gaussian/control order and frequency bindings,
-then extracts frozen controls and prepares frequency-specific path tables.
-Both network replay and complete reference queries must reproduce the bank's
-displacement/angular fields within 1e-5 after per-frequency amplitude normalization.
-Failure stops publication; no automatic retraining or approximate replacement.
-Current v18 sources share this builder inside preparation when `--reference` is
-omitted. General completed-model loaders still reject v16.
+Selection and initialization hashes enter the run contract and final coordinate
+provenance. Prepared and diagnostic files remain immutable. Resume requires the
+same argument/source/config/implementation; importing q starts a new experiment,
+not a continuation of an old warmup optimizer. One round consists of sparse joint
+updates followed by an exhaustive q pass.
 
 ```sh
+# Only v16 sources need the explicit importer; current sources can build during prepare.
 python tools/import_refinement_reference.py --scene STATIC --modes BANK20 --output EXP/motion_reference
-modal-gaussians coordinates fit-sweep --scene STATIC --modes BANK20 --scale-source RGB_VIEW1 --metadata SWEEP_EXTRACTION_METADATA --fps 30 --config configs/rgb_coordinates.json --output EXP/sweep_coordinates
-# If a valid 60 FPS fit already exists, use this INSTEAD of fit-sweep:
-modal-gaussians coordinates downsample-sweep --input SWEEP60 --fps 30 --output EXP/sweep_coordinates
-modal-gaussians result materialize --scene STATIC --modes BANK20 --coordinates RGB_VIEW1 --coordinates EXP/sweep_coordinates --output EXP/baseline_result
-modal-gaussians result evaluate --result EXP/baseline_result --lpips --output EXP/baseline_evaluation
-modal-gaussians coordinates prepare-refinement --scene STATIC --modes BANK20 --coordinates RGB_VIEW1 --view view1 --sweep-coordinates EXP/sweep_coordinates --reference EXP/motion_reference --output EXP/prepared
-modal-gaussians coordinates refine-scene --prepared EXP/prepared --config configs/scene_refinement.json --work-dir EXP/work --output EXP/refined
-modal-gaussians result materialize --scene EXP/refined/scene --modes EXP/refined/mode_bank --coordinates EXP/refined/coordinates --output EXP/result
-modal-gaussians result evaluate --result EXP/result --lpips --baseline EXP/baseline_evaluation --output EXP/evaluation
+modal-gaussians coordinates prepare-refinement --scene STATIC --modes BANK20 --view view1 --sweep-metadata SWEEP_METADATA --reference EXP/motion_reference --output EXP/prepared
+modal-gaussians coordinates refine-motion --prepared EXP/prepared --config configs/motion_refinement.json --work-dir EXP/work --output EXP/refined
+modal-gaussians result materialize --scene STATIC --modes EXP/refined/mode_bank --coordinates EXP/refined/coordinates --output EXP/result
+modal-gaussians result evaluate --result EXP/result --lpips --output EXP/evaluation
 modal-gaussians result export-video --result EXP/result --view sweep --output EXP/exports/sweep
 ```
 
-`fit-sweep` shares the fixed RGB optimizer and a single resident scene/mode basis.
-It initializes q to zero, fits a shared pose offset, then independent frame q;
-it does not subtract a reference or temporal mean. `--scale-source` must be a
-compatible single-view RGB fit: only its direct-fit `mode_pair_scales` are reused,
-never its q. Defaults are 0.25/0.5/1 scales, ten epochs each, LR 0.01 to 0.001,
-anchor 1e-4 to 1e-6, 30 offset steps, accumulation of four frames, seed 1729.
-There is no sweep optimizer resume; failed fits publish nothing.
+For calibrated resized/subsampled sweep inputs, pass the original extraction
+metadata. The loader validates the saved derivation and parent camera hashes,
+uses the scene's resized PNGs/cameras, and preserves original source indices and
+timestamps. An already selected 30 FPS sweep is not subsampled a second time.
 
-`downsample-sweep` publishes a new immutable sweep v1 artifact with selected q,
-all selected bindings, parent identity and row indices. It runs no fitting and
-records zero newly optimized frames. Preserve the original 60 FPS fit and baseline.
-Rebuild preparation and materialize/evaluate a matching 30 FPS baseline in new
-paths; comparing to a 724-frame sweep mean would mix different frame sets.
+Omit sweep metadata for fixed-view-only refinement. The registered 60 FPS sweep is
+actually decimated to 30 FPS, with PNGs, source indices, timestamps and cameras kept
+together. Do not merely relabel FPS. Fixed views retain their original frame grids.
+Standalone `fit-sweep` and `downsample-sweep` remain fixed-mode baseline tools;
+they are not prerequisites for motion refinement.
 
-Each round now has 195 shared geometry updates (195 view1 / 121 sweep candidate
-frames) followed by 1532 coefficient updates. Totals: 390 geometry updates, 3064
-coefficient updates, 3454 optimizer steps and 3844 renders. Checkpoints bind all
-frame/camera identities, normalization, initialization, weights and samplers. Old
-60 FPS preparations and old trainer checkpoints cannot enter the new schedule;
-use new preparation/work directories. The verified fixed reference is reusable.
-These counts do not predict real runtime; the new recipe has not run on real data.
+Prepared v5 contains reference, fixed operator and normalization inputs. Work owns
+atomic checkpoint/log/run state. Final output has only manifest, `mode_bank/`
+(completed modes v20) and `coordinates/` (refined RGB v5); it references the unchanged
+static scene. Save original/final controls, operator, final complex64 `[K,G,3]`
+displacement/angular arrays and original observation provenance. Result v3 directly
+binds these with the original scene, without a ridge design. Viewer/Spectrum use
+the new baked fields; observation roles remain inherited sources, not new modal
+supervision. No stage automatically starts a later stage.
 
-Result v3 accepts repeatable disjoint `--coordinates` inputs. Evaluation reports
-view1 and sweep separately. Export preserves each sequence's FPS; viewer offers
-sweep coefficient playback with free viewing or **Follow recorded frame camera**.
-Spectrum retains only original view1/view2/view3 modal images. No command above
-automatically starts the next stage. Preserve the frozen historical view1 baseline
-and remeasure its rematerialized result separately before real comparisons.
+`--resume` requires identical prepared/config/code/device contracts. Checkpoints
+include corrections, q, every Adam state, post-warmup anchor, phase counters,
+per-round sparse selections, exhaustive permutations, cursors and NumPy/PyTorch/
+CUDA RNG. Transient GPU basis/render graphs are rebuilt. Non-finite loss/gradient
+stops without final publication. Logs separate query/render/regularization/backward
+times and record per-view losses, correction/q magnitudes and displacement/angular
+RMS. Synchronized CUDA timing belongs in the local benchmark, not daily logging.
+
+The old `refine-scene`, density/shape configuration and fitted-coordinate preparation
+arguments are removed. Old preparations/checkpoints cannot resume this method;
+use new prepared/work/output directories. Preserve historical artifacts/baselines.
+Matching static scenes, original banks and verified references remain reusable.
+This method can change the span of the existing control-supported fields but adds
+neither modes nor support for unresolved structure. Real quality requires a separate
+authorized comparison with fixed-mode free-q fitting on the same inputs and budget.

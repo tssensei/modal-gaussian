@@ -156,7 +156,7 @@ def uses_visible_subject(scene: ForegroundBackgroundScene) -> bool:
     """Manual 3D selections use visibility, without inherited image masks."""
 
     manifest = getattr(scene, "manifest", None) or {}
-    return (manifest.get("partition", {}).get("method") == "manual_subject_selection_v1"
+    return (manifest.get("partition", {}).get("method") == "manual_subject_selection_v3"
             or (manifest.get("version") == 4
                 and manifest.get("refinement", {}).get("observation_region") == "visible_subject"))
 

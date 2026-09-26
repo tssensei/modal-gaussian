@@ -25,6 +25,7 @@ from modal_gaussians.geometry.scene import GAUSSIAN_FIELDS, Camera, ForegroundBa
 from modal_gaussians.common.progress import Progress, report_progress
 from modal_gaussians.common.camera_geometry import PROJECTION_CONVENTION
 from modal_gaussians.geometry.density import densify_parameters, remap_parameters
+from modal_gaussians.geometry.depth import DepthTargets, depth_l2
 
 
 _IMAGE_CACHE_BYTES = 2 * 1024**3
@@ -36,6 +37,8 @@ class StaticTrainConfig:
 
     iterations: int = 3_000
     batch_size: int = 4
+    depth_weight: float = 0.0
+    depth_until_step: int = 3_000
     num_foreground: int = 40_000
     num_background: int = 80_000
     seed: int = 42
@@ -60,6 +63,7 @@ class StaticTrainConfig:
         positive_integers = {
             "iterations": self.iterations,
             "batch_size": self.batch_size,
+            "depth_until_step": self.depth_until_step,
             "num_foreground": self.num_foreground,
             "num_background": self.num_background,
             "checkpoint_every_steps": self.checkpoint_every_steps,
@@ -91,6 +95,7 @@ class StaticTrainConfig:
                 "foreground stop <= control stop"
             )
         finite_nonnegative = {
+            "depth_weight": self.depth_weight,
             "densify_gradient_threshold": self.densify_gradient_threshold,
             "densify_scale_threshold": self.densify_scale_threshold,
             "cull_opacity_threshold": self.cull_opacity_threshold,
@@ -119,7 +124,9 @@ class StaticTrainConfig:
                 "rgb_l1_weight": 1.0,
                 "rgb_dssim_weight": 0.2,
                 "alpha_coverage_weight": 0.0,
-                "depth_weights": [0.0, 0.0, 0.0],
+                "depth_l2_weight": self.depth_weight,
+                "depth_until_step": self.depth_until_step,
+                "depth_convention": "camera_z_normalized_world",
             },
             "learning_rates": _learning_rates(),
             "sh_degree": 3, "sh_degree_interval": 1000,
@@ -127,7 +134,7 @@ class StaticTrainConfig:
             "density_units": "world_thresholds_times_camera_extent; screen_radius_pixels",
             "implementation": {
                 **{name: _sha256_file(Path(__file__).with_name(name))
-                   for name in ("training.py", "scene.py", "density.py")},
+                   for name in ("training.py", "scene.py", "density.py", "depth.py")},
                 "camera_rendering.py": _sha256_file(Path(__file__).parents[1] / "common" / "camera_rendering.py"),
             },
         }
@@ -240,12 +247,16 @@ class StaticTrainer:
         device: torch.device,
         work_dir: Path,
         classification_summary: Mapping[str, int],
+        depth_targets: DepthTargets | None = None,
     ) -> None:
         """Create optimizers, schedulers, and resumable running statistics."""
 
         self.scene = scene.to(device)
         self.dataset = dataset
         self.config = config
+        self.depth_targets = depth_targets
+        if (depth_targets is not None) != (config.depth_weight > 0):
+            raise ValueError("Positive depth_weight requires --depth; depth inputs require positive weight")
         self.device = device
         self.work_dir = work_dir
         self.classification_summary = dict(classification_summary)
@@ -318,6 +329,7 @@ class StaticTrainer:
             "batch_count": 0.0,
             "loss_sum": 0.0,
             "rgb_loss_sum": 0.0,
+            "depth_loss_sum": 0.0,
             "psnr_sum": 0.0,
             "ssim_sum": 0.0,
         }
@@ -372,13 +384,14 @@ class StaticTrainer:
         cameras: Sequence[Camera],
         targets: Tensor,
     ) -> tuple[Tensor, dict[str, float], Mapping[str, Tensor]]:
-        """Compute full-frame RGB L1 and SSIM supervision."""
+        """Compute full-frame RGB and optional fixed, COLMAP-aligned depth L2."""
 
+        use_depth = self.depth_targets is not None and self.global_step < self.config.depth_until_step
         rendered, info = self.scene.render_batch(
             cameras,
             composition="all",
             retain_screen_grad=True,
-            include_depth=False,
+            include_depth=use_depth,
         )
         predictions = rendered["rgb"]
         try:
@@ -393,15 +406,23 @@ class StaticTrainer:
             size_average=True,
         )
         rgb_loss = l1 + 0.2 * (1.0 - structural)
+        depth_loss = rgb_loss.new_zeros(())
+        if use_depth:
+            values = [self.depth_targets.load(camera.name) for camera in cameras]
+            depth = torch.stack([item[0] for item in values]).to(self.device)
+            valid = torch.stack([item[1] for item in values]).to(self.device)
+            depth_loss = depth_l2(rendered["expected_depth"], depth, valid)
+        loss = rgb_loss + self.config.depth_weight * depth_loss
         mse = F.mse_loss(predictions.detach(), targets)
         psnr = -10.0 * torch.log10(mse.clamp_min(1e-12))
         stats = {
-            "loss": float(rgb_loss.detach().item()),
+            "loss": float(loss.detach().item()),
             "rgb_loss": float(rgb_loss.detach().item()),
+            "depth_loss": float(depth_loss.detach().item()),
             "psnr": float(psnr.item()),
             "ssim": float(structural.detach().item()),
         }
-        return rgb_loss, stats, info
+        return loss, stats, info
 
     @torch.no_grad()
     def _accumulate_density_stats(
@@ -695,6 +716,7 @@ class StaticTrainer:
         self.epoch_accumulator["batch_count"] += 1.0
         self.epoch_accumulator["loss_sum"] += stats["loss"]
         self.epoch_accumulator["rgb_loss_sum"] += stats["rgb_loss"]
+        self.epoch_accumulator["depth_loss_sum"] += stats.get("depth_loss", 0.0)
         self.epoch_accumulator["psnr_sum"] += stats["psnr"]
         self.epoch_accumulator["ssim_sum"] += stats["ssim"]
 
@@ -709,6 +731,7 @@ class StaticTrainer:
             "global_step": self.global_step,
             "loss": self.epoch_accumulator["loss_sum"] / count,
             "rgb_loss": self.epoch_accumulator["rgb_loss_sum"] / count,
+            "depth_loss": self.epoch_accumulator["depth_loss_sum"] / count,
             "psnr": self.epoch_accumulator["psnr_sum"] / count,
             "ssim": self.epoch_accumulator["ssim_sum"] / count,
             "foreground_gaussians": self.scene.foreground.count,
@@ -748,8 +771,9 @@ class StaticTrainer:
         path = self.work_dir / "resume.pt"
         payload = {
             "format": "modal_gaussians.static_training_resume",
-            "version": 3,
+            "version": 4,
             "dataset_identity": self.dataset.dataset_identity,
+            "depth_identity": self.depth_targets.identity if self.depth_targets is not None else None,
             "config_identity": self.config_identity,
             "resolved_config": self.config.resolved(),
             "scene_tensors": self.scene.tensor_dictionary(),
@@ -779,6 +803,9 @@ class StaticTrainer:
     def load_resume_state(self, payload: Mapping[str, Any]) -> None:
         """Restore optimizer, scheduler, density, progress, metrics, and RNG state."""
 
+        expected_depth = self.depth_targets.identity if self.depth_targets is not None else None
+        if payload["depth_identity"] != expected_depth:
+            raise ValueError("Resume depth identity does not match requested targets")
         for name, optimizer in self.optimizers.items():
             optimizer.load_state_dict(payload["optimizers"][name])
         for name, scheduler in self.schedulers.items():
@@ -846,6 +873,7 @@ class StaticTrainer:
                     f"epoch={self.epoch + 1} "
                     f"batch={self.next_batch_index}/{len(self.current_batches)} "
                     f"loss={stats['loss']:.6f} "
+                    f"depth={stats.get('depth_loss', 0.):.6f} "
                     f"psnr={stats['psnr']:.3f} "
                     f"ssim={stats['ssim']:.4f} "
                     f"fg={self.scene.foreground.count} bg={self.scene.background.count}",
@@ -873,6 +901,7 @@ class StaticTrainer:
             "global_step": self.global_step,
             "final_loss": final["loss"],
             "final_rgb_loss": final["rgb_loss"],
+            "final_depth_loss": final["depth_loss"],
             "final_psnr": final["psnr"],
             "final_ssim": final["ssim"],
         }
@@ -982,13 +1011,15 @@ def export_static_bundle(
             },
             "cameras": camera_records,
             "training_config": trainer.config.resolved(),
+            "depth_supervision": ({"depth_identity": trainer.depth_targets.identity,
+                "path": str(trainer.depth_targets.root)} if trainer.config.depth_weight > 0 else None),
         }
         (temporary_root / "manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
         summary = {
             "format": "modal_gaussians.static_training_summary",
-            "version": 2,
+            "version": 3,
             "static_scene_identity": static_scene_identity,
             "dataset_identity": trainer.dataset.dataset_identity,
             "result": dict(training_result),
@@ -1030,7 +1061,7 @@ def _load_resume_payload(path: Path) -> Mapping[str, Any]:
     if (
         not isinstance(payload, dict)
         or payload.get("format") != "modal_gaussians.static_training_resume"
-        or payload.get("version") != 3
+        or payload.get("version") != 4
     ):
         raise ValueError(f"Unsupported static resume checkpoint: {path}")
     return payload
@@ -1044,6 +1075,7 @@ def run_static_training(
     config: StaticTrainConfig | None = None,
     resume: bool = False,
     device: str | torch.device | None = None,
+    depth_dir: str | Path | None = None,
 ) -> Path:
     """Validate inputs, train/resume and export; QA uses the explicit render command."""
 
@@ -1055,6 +1087,9 @@ def run_static_training(
     work_dir = Path(work_dir).expanduser().resolve()
     report_progress("static: loading and validating joint COLMAP inputs")
     dataset = load_static_dataset(input_dir)
+    if (depth_dir is not None) != (config.depth_weight > 0):
+        raise ValueError("Supply both --depth and a positive --depth-weight, or neither")
+    depth_targets = DepthTargets(depth_dir, dataset) if depth_dir is not None else None
     if device is None:
         selected_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
@@ -1071,6 +1106,8 @@ def run_static_training(
             raise ValueError("Resume dataset identity does not match current joint COLMAP input")
         if payload["config_identity"] != config_identity:
             raise ValueError("Resume config identity does not match requested static config")
+        if payload["depth_identity"] != (depth_targets.identity if depth_targets is not None else None):
+            raise ValueError("Resume depth identity does not match requested targets")
         scene = _scene_from_tensor_dictionary(payload["scene_tensors"])
         trainer = StaticTrainer(
             scene,
@@ -1079,6 +1116,7 @@ def run_static_training(
             selected_device,
             work_dir,
             payload["classification_summary"],
+            depth_targets=depth_targets,
         )
         trainer.load_resume_state(payload)
     else:
@@ -1101,6 +1139,7 @@ def run_static_training(
             selected_device,
             work_dir,
             classification,
+            depth_targets=depth_targets,
         )
         trainer.save_resume()
     result = trainer.train()

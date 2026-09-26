@@ -324,7 +324,6 @@ class SpectrumComparisonController:
             projected = np.empty(0, np.complex64)
             high = 1.0
             self._request(k, self.view_id)
-        self.modal_image_magnitude_hi = high if math.isfinite(high) and high > 0 else 1.0
         if self.original_image_region == "Cached region":
             original_pixels = self.state.selection_pixels_xy
         elif self.original_image_region == "Full image" or not ready:
@@ -333,6 +332,9 @@ class SpectrumComparisonController:
         else:
             original_pixels = self.state.display_pixels_xy
         raw = self._raw(self.view_id, k, original_pixels)[:, c]
+        if not ready:
+            high = float(np.percentile(np.abs(raw), PREVIEW_PERCENTILE)) if raw.size else 1.0
+        self.modal_image_magnitude_hi = high if math.isfinite(high) and high > 0 else 1.0
         self.raw_modal_image = self._modal_image(raw, self.modal_image_magnitude_hi, original_pixels)
         self.reconstructed_modal_image = self._modal_image(projected, self.modal_image_magnitude_hi, pixels, radius=1)
         count = int(np.isfinite(self.state.reconstructed_power).sum())
@@ -344,6 +346,7 @@ class SpectrumComparisonController:
             "**Projection:** fixed 3D mode with saved training view alignment; no display refit.  \n"
             + ('**Curve regions:** input = cached analysis region; projection = per-mode model-support samples.  \n')
             + (f"**Projection failed:** {error}" if error else ("" if ready else "**Projection pending.**"))
+            + ("" if ready else "  \n**Original brightness:** temporary input-only p99; shared scale awaits projection.")
             + ("" if self.state.alpha_identifiable[k] else "  \n**Projection unavailable:** saved view alignment is unidentifiable.")
             + ("  \n**Shared brightness pending:** waiting for all frequencies." if
                self.amplitude_normalization == "all saved modes" and count < len(self.frequencies_hz) else "")

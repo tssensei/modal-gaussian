@@ -39,14 +39,33 @@ def sweep_sequence(scene, metadata_path, fps=30):
     cameras.sort(key=lambda c:records[c.name]['source_index'])
     frames, files, directories = [], [], set()
     extraction_root = resolve_path(metadata['images'], strict=True)
+    derivation = original.get('derivation')
+    parent_records = None
+    if derivation is not None:
+        parent_file = resolve_path(derivation['parent'], strict=True)/'cameras.json'
+        factor = derivation.get('scale_factor', 0.)
+        if (derivation.get('method') != 'calibrated_resize_and_temporal_subset'
+                or derivation.get('source_metadata_sha256') != sha256(metadata_path)
+                or derivation.get('parent_cameras_sha256') != sha256(parent_file)
+                or derivation.get('source_fps_hz') != fps or not np.isfinite(factor) or factor <= 0
+                or derivation.get('resolution') != [round(metadata['width']*factor), round(metadata['height']*factor)]
+                or derivation.get('world_coordinates_unchanged') is not True):
+            raise ValueError('Invalid calibrated sweep derivation')
+        parent = json.loads(parent_file.read_text(encoding='utf-8'))
+        parent_records = {v['image_name']:v for v in parent['frames'] if v['role']=='sweep'}
     for i,c in enumerate(cameras):
         record = records[c.name]; index = record['source_index']
         path = root/c.image_relative_path
+        source_record = record if parent_records is None else parent_records.get(c.name, {})
+        shape = [metadata['height'],metadata['width']] if parent_records is None else derivation['resolution'][::-1]
         if (type(index) is not int or not 0 <= index < metadata['frame_count']
-                or resolve_path(record['source_image']).parent != extraction_root
-                or Path(record['source_image']).name != record['source_frame_name']
+                or source_record.get('source_index') != index
+                or resolve_path(source_record.get('source_image','')).parent != extraction_root
+                or Path(source_record.get('source_image','')).name != record['source_frame_name']
                 or Path(record['source_frame_name']).name != path.name
-                or [c.height,c.width] != [metadata['height'],metadata['width']]
+                or [c.height,c.width] != shape
+                or (parent_records is not None and (resolve_path(record['source_image']) != path
+                    or record.get('timestamp_seconds') != float(metadata['clip_start_seconds'])+index/fps))
                 or sha256(path) != c.image_sha256):
             raise ValueError(f'Sweep extraction/camera/image differs: {c.name}')
         directories.add(path.parent)

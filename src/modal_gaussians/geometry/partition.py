@@ -24,13 +24,13 @@ import torch
 from modal_gaussians.common.camera_geometry import PROJECTION_CONVENTION
 from modal_gaussians.common.progress import Progress
 from modal_gaussians.geometry.scene import GAUSSIAN_FIELDS, Camera, ForegroundBackgroundScene, _sha256_file, _sha256_json, cameras_from_scene_manifest, load_static_scene, tensor_dictionary_identity
+from modal_gaussians.geometry.selection import MANUAL_METHOD
 
 UNCERTAIN, SUBJECT, BACKGROUND = 0, 1, 2
 LABELS = {"0": "uncertain", "1": "subject", "2": "background"}
 REASONS = {"0": "resolved", "1": "insufficient_visibility",
            "2": "mixed_mask_evidence", "3": "conflicting_views"}
 METHOD = "full_scene_visible_mask_contribution_v2"
-MANUAL_METHOD = "manual_subject_selection_v1"
 
 
 @dataclass(frozen=True)
@@ -379,7 +379,7 @@ def _publish_partition(scene, output_dir, labels, arrays, partition_fields, sour
 def apply_subject_selection(*, scene_dir: str | Path, selection_path: str | Path,
                             output_dir: str | Path, command: Sequence[str] = ()) -> Path:
     """Apply saved global indices as the motion subject; no rendering or mask reads."""
-    from modal_gaussians.geometry.selection import read_subject_selection
+    from modal_gaussians.geometry.selection import box_arrays, read_subject_selection
 
     output = resolve_path(output_dir)
     if output.exists() or output.is_symlink():
@@ -387,10 +387,10 @@ def apply_subject_selection(*, scene_dir: str | Path, selection_path: str | Path
     source = resolve_path(scene_dir, strict=True)
     selection = resolve_path(selection_path, strict=True)
     scene = load_static_scene(source)
-    selection_manifest, indices, box = read_subject_selection(selection, scene)
+    selection_manifest, indices, boxes = read_subject_selection(selection, scene)
     labels = np.full(scene.count, BACKGROUND, np.uint8)
     labels[indices] = SUBJECT
-    arrays = dict(selected_indices=indices, box_position=box[0], box_wxyz=box[1], box_dimensions=box[2])
+    arrays = dict(selected_indices=indices, **box_arrays(boxes))
     return _publish_partition(scene, output, labels, arrays, {
         "method": MANUAL_METHOD, "selection_manifest": selection_manifest,
         "selection_source_path": str(selection), "selection_sha256": _sha256_file(selection),
@@ -492,7 +492,7 @@ def _validate_partition_mapping(manifest, tensors, partition, order, recorded_or
 
 
 def _validate_manual_partition(path, manifest, tensors):
-    from modal_gaussians.geometry.selection import _box_values
+    from modal_gaussians.geometry.selection import boxes_from_arrays, SELECTION_RULE, SELECTION_VERSION
 
     partition = manifest["partition"]
     cameras = cameras_from_scene_manifest(manifest)
@@ -507,7 +507,7 @@ def _validate_manual_partition(path, manifest, tensors):
     if _sha256_file(mapping) != partition["mapping_sha256"]:
         raise ValueError("Manual partition mapping checksum mismatch")
     with np.load(mapping, allow_pickle=False) as archive:
-        if set(archive.files) != {"selected_indices", "new_to_source_index", "box_position", "box_wxyz", "box_dimensions"}:
+        if set(archive.files) != {"selected_indices", "new_to_source_index", "box_positions", "box_wxyz", "box_dimensions"}:
             raise ValueError("Manual partition mapping schema mismatch")
         indices = archive["selected_indices"]
         count = partition["source_foreground_count"] + partition["source_background_count"]
@@ -515,16 +515,18 @@ def _validate_manual_partition(path, manifest, tensors):
                 or np.any(indices < 0) or np.any(indices >= count) or np.any(indices[1:] <= indices[:-1])):
             raise ValueError("Invalid manual partition indices")
         saved = partition["selection_manifest"]
-        if (saved.get("format") != "modal_gaussians.subject_selection" or saved.get("version") != 1
+        if (saved.get("format") != "modal_gaussians.subject_selection" or saved.get("version") != SELECTION_VERSION
                 or saved.get("index_order") != "foreground_then_background"
-                or saved.get("selection_rule") != "gaussian_center_in_oriented_box"
+                or saved.get("selection_rule") != SELECTION_RULE
                 or saved.get("selected_count") != len(indices)
                 or saved.get("source_counts") != {"foreground": partition["source_foreground_count"],
                                                   "background": partition["source_background_count"]}
                 or any(saved.get(key) != partition["source_" + key] for key in
                        ("static_scene_identity", "foreground_identity", "background_identity"))):
             raise ValueError("Manual partition selection source mismatch")
-        _box_values(archive["box_position"], archive["box_wxyz"], archive["box_dimensions"])
+        boxes = boxes_from_arrays(archive)
+        if saved.get("box_count") != len(boxes):
+            raise ValueError("Manual partition box count mismatch")
         labels = np.full(count, BACKGROUND, np.uint8)
         labels[indices] = SUBJECT
         if partition["counts"] != _partition_counts(labels):

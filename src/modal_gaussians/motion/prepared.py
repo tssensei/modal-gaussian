@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import os
 from pathlib import Path
 from modal_gaussians.common.scene_store import resolve_path, logical_path, scene_cache
 import tempfile
@@ -14,7 +13,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from modal_gaussians.common.cache import DEFAULT_CACHE, Timings, atomic_json, cached, identity, sha256, module_revision
+from modal_gaussians.common.cache import DEFAULT_CACHE, Timings, atomic_json, cached, identity, sha256, module_revision, publish_directory
 from modal_gaussians.common.numpy_io import save_named_arrays
 from modal_gaussians.preprocessing.reference import SequenceReference, reference_identity, load_reference
 from modal_gaussians.motion import training as nm
@@ -258,7 +257,7 @@ def prepare_neural(*, scene_dir, views, output_dir, cache_dir=DEFAULT_CACHE, con
         manifest['prepared_identity'] = identity(manifest)
         atomic_json(temporary / 'manifest.json', manifest)
         timer.save(temporary / 'timings.json')
-        os.rename(temporary, destination)
+        publish_directory(temporary, destination)
     except BaseException:
         if temporary.resolve().parent != destination.parent.resolve() or not temporary.name.startswith(f".{destination.name}."):
             raise RuntimeError("Temporary publication directory escaped its output parent")

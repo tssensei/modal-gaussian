@@ -10,6 +10,10 @@ import tempfile
 import numpy as np
 import viser.transforms as vtf
 
+SELECTION_VERSION = 3
+SELECTION_RULE = "gaussian_center_in_oriented_box_union"
+MANUAL_METHOD = "manual_subject_selection_v3"
+
 
 def _box_values(position, wxyz, dimensions):
     position, wxyz, dimensions = (np.asarray(value, dtype=np.float64).copy()
@@ -31,17 +35,48 @@ def points_in_box(points, position, wxyz, dimensions):
     return (np.abs(local) <= dimensions / 2 + 1e-8 * dimensions.max()).all(axis=1)
 
 
-def projected_box_pixels(camera, position, wxyz, dimensions):
-    """Return image pixels whose forward camera rays intersect the selected OBB."""
+def box_arrays(boxes):
+    """Validate a nonempty box collection and pack its explicit geometry."""
+    boxes = [_box_values(*box) for box in boxes]
+    if not boxes:
+        raise ValueError("Selection requires at least one box")
+    return {name: np.stack([box[i] for box in boxes]) for i, name in
+            enumerate(("box_positions", "box_wxyz", "box_dimensions"))}
+
+
+def boxes_from_arrays(arrays):
+    positions, rotations, dimensions = (np.asarray(arrays[name]) for name in
+                                       ("box_positions", "box_wxyz", "box_dimensions"))
+    if (positions.ndim != 2 or positions.shape[1:] != (3,) or len(positions) == 0
+            or rotations.shape != (len(positions), 4) or dimensions.shape != positions.shape):
+        raise ValueError("Invalid selection box array shapes")
+    return [_box_values(*box) for box in zip(positions, rotations, dimensions)]
+
+
+def points_in_boxes(points, boxes):
+    boxes = list(boxes)
+    if not boxes:
+        raise ValueError("Selection requires at least one box")
+    selected = np.zeros(len(points), dtype=bool)
+    for box in boxes:
+        selected |= points_in_box(points, *box)
+    return selected
+
+
+def projected_box_pixels(camera, boxes):
+    """Return each pixel once if its forward ray hits any selected box."""
     from modal_gaussians.common.camera_geometry import undistort_normalized
 
-    position, wxyz, dimensions = _box_values(position, wxyz, dimensions)
+    boxes = [_box_values(*box) for box in boxes]
+    if not boxes:
+        raise ValueError("Selection requires at least one box")
     K = camera.K.detach().cpu().numpy().astype(np.float64)
     c2w = np.linalg.inv(camera.world_to_camera.detach().cpu().numpy().astype(np.float64))
-    rotation = vtf.SO3(wxyz).as_matrix()
-    origin = (c2w[:3, 3] - position) @ rotation
-    camera_to_box = c2w[:3, :3].T @ rotation
-    half = dimensions / 2
+    ray_boxes = []
+    for position, wxyz, dimensions in boxes:
+        rotation = vtf.SO3(wxyz).as_matrix()
+        ray_boxes.append(((c2w[:3, 3] - position) @ rotation,
+                          c2w[:3, :3].T @ rotation, dimensions / 2))
     radial_k = camera.radial_distortion
     pixels = []
     count = camera.height * camera.width
@@ -49,40 +84,44 @@ def projected_box_pixels(camera, position, wxyz, dimensions):
         y, x = np.divmod(np.arange(start, min(start + 65_536, count)), camera.width)
         xy = np.column_stack(((x - K[0, 2]) / K[0, 0], (y - K[1, 2]) / K[1, 1]))
         xy = undistort_normalized(xy, radial_k)
-        directions = np.column_stack((xy, np.ones(len(x)))) @ camera_to_box
+        camera_rays = np.column_stack((xy, np.ones(len(x))))
         # Camera ray z is one: its parameter is camera-space depth, so the
         # positive lower bound also clips boxes crossing/behind the near plane.
-        enter, leave = np.full(len(x), 1e-8), np.full(len(x), np.inf)
-        valid = np.ones(len(x), dtype=bool)
-        for axis in range(3):
-            direction = directions[:, axis]
-            parallel = np.abs(direction) < 1e-12
-            valid &= ~(parallel & (abs(origin[axis]) > half[axis]))
-            first = np.divide(-half[axis] - origin[axis], direction,
-                              out=np.full(len(x), -np.inf), where=~parallel)
-            last = np.divide(half[axis] - origin[axis], direction,
-                             out=np.full(len(x), np.inf), where=~parallel)
-            enter = np.maximum(enter, np.minimum(first, last))
-            leave = np.minimum(leave, np.maximum(first, last))
-        hit = valid & (leave >= enter)
+        hit = np.zeros(len(x), dtype=bool)
+        for origin, camera_to_box, half in ray_boxes:
+            enter, leave = np.full(len(x), 1e-8), np.full(len(x), np.inf)
+            valid = np.ones(len(x), dtype=bool)
+            directions = camera_rays @ camera_to_box
+            for axis in range(3):
+                direction = directions[:, axis]
+                parallel = np.abs(direction) < 1e-12
+                valid &= ~(parallel & (abs(origin[axis]) > half[axis]))
+                first = np.divide(-half[axis] - origin[axis], direction,
+                                  out=np.full(len(x), -np.inf), where=~parallel)
+                last = np.divide(half[axis] - origin[axis], direction,
+                                 out=np.full(len(x), np.inf), where=~parallel)
+                enter = np.maximum(enter, np.minimum(first, last))
+                leave = np.minimum(leave, np.maximum(first, last))
+            hit |= valid & (leave >= enter)
         pixels.append(np.column_stack((x[hit], y[hit])))
     return np.concatenate(pixels).astype(np.int64, copy=False) if pixels else np.empty((0, 2), dtype=np.int64)
 
 
-def save_subject_selection(work_dir, scene_path, scene, points, position, wxyz, dimensions):
+def save_subject_selection(work_dir, scene_path, scene, points, boxes):
     """Publish a new selection without rewriting scene tensors or prior selections."""
-    position, wxyz, dimensions = _box_values(position, wxyz, dimensions)
-    indices = np.flatnonzero(points_in_box(points, position, wxyz, dimensions))
+    arrays = box_arrays(boxes)
+    indices = np.flatnonzero(points_in_boxes(points, boxes_from_arrays(arrays)))
     if not len(indices):
-        raise ValueError("The box contains no Gaussian centers; adjust it before saving")
+        raise ValueError("The box union contains no Gaussian centers; adjust it before saving")
     manifest = {
-        "format": "modal_gaussians.subject_selection", "version": 1,
+        "format": "modal_gaussians.subject_selection", "version": SELECTION_VERSION,
         "source_scene": str(Path(scene_path).resolve()),
         "static_scene_identity": scene.manifest["static_scene_identity"],
         "foreground_identity": scene.manifest["foreground_identity"],
         "background_identity": scene.manifest["background_identity"],
         "source_counts": {"foreground": scene.foreground.count, "background": scene.background.count},
-        "index_order": "foreground_then_background", "selection_rule": "gaussian_center_in_oriented_box",
+        "index_order": "foreground_then_background", "selection_rule": SELECTION_RULE,
+        "box_count": len(arrays["box_positions"]),
         "selected_count": len(indices),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -95,8 +134,7 @@ def save_subject_selection(work_dir, scene_path, scene, points, position, wxyz, 
         with tempfile.NamedTemporaryFile(dir=directory, prefix=prefix, suffix=".tmp", delete=False) as stream:
             temporary = Path(stream.name)
             np.savez_compressed(stream, manifest_json=np.asarray(json.dumps(manifest)),
-                                selected_indices=indices, box_position=position,
-                                box_wxyz=wxyz, box_dimensions=dimensions)
+                                selected_indices=indices, **arrays)
         output = temporary.with_suffix(".npz")
         if output.exists():
             raise FileExistsError(output)
@@ -113,9 +151,9 @@ def read_subject_selection(path, scene):
         manifest = json.loads(str(archive["manifest_json"].item()))
         indices = archive["selected_indices"]
         if (manifest.get("format") != "modal_gaussians.subject_selection"
-                or manifest.get("version") != 1
+                or manifest.get("version") != SELECTION_VERSION
                 or manifest.get("index_order") != "foreground_then_background"
-                or manifest.get("selection_rule") != "gaussian_center_in_oriented_box"):
+                or manifest.get("selection_rule") != SELECTION_RULE):
             raise ValueError("Unsupported subject selection")
         counts = {"foreground": scene.foreground.count, "background": scene.background.count}
         if (manifest.get("source_counts") != counts or any(
@@ -126,8 +164,10 @@ def read_subject_selection(path, scene):
                 or not len(indices) or np.any(indices < 0) or np.any(indices >= scene.count)
                 or np.any(indices[1:] <= indices[:-1]) or manifest.get("selected_count") != len(indices)):
             raise ValueError("Invalid selected Gaussian indices")
-        box = _box_values(archive["box_position"], archive["box_wxyz"], archive["box_dimensions"])
-        return manifest, indices.astype(np.int64, copy=True), box
+        boxes = boxes_from_arrays(archive)
+        if manifest.get("box_count") != len(boxes):
+            raise ValueError("Selection box count differs")
+        return manifest, indices.astype(np.int64, copy=True), boxes
 
 
 def load_subject_selection(path, scene):

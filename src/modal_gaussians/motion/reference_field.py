@@ -134,7 +134,6 @@ class ReferenceField:
         self.mode_count = len(arrays["displacement"])
         self._device = None
         self._tables = {}
-        self._shape_arrays = None
 
     def _on_device(self, device):
         if self._device != device:
@@ -146,7 +145,7 @@ class ReferenceField:
             self._device = device
         return self._tables
 
-    def _own(self, x, roots, k, *, support_only=False):
+    def _own(self, x, roots, k, *, support_only=False, stencil=False):
         a = self.a
         t = self._on_device(x.device)
         roots = torch.as_tensor(roots, device=x.device)
@@ -190,6 +189,8 @@ class ReferenceField:
         kind = torch.complex128 if x.dtype == torch.float64 else torch.complex64
         angular, displacement = angular.to(kind), displacement.to(kind)
         lever = (x[rows] - t["points"][t["controls"][controls]].to(x.dtype)).to(kind)
+        if stencil:
+            return counts, controls, weight, lever.real, good
         phi = _segment_sum(weight[:,None] * (displacement + torch.linalg.cross(angular, lever)), counts)
         omega = _segment_sum(weight[:,None] * angular, counts)
         return phi, omega, good
@@ -235,127 +236,3 @@ class ReferenceField:
             parts.append(checkpoint(query, block, use_reentrant=False) if recompute and block.requires_grad
                          else query(block))
         return tuple(torch.cat([part[i] for part in parts]) for i in range(3))
-
-    @torch.no_grad()
-    def bake(self, x, roots):
-        """One GPU basis for a frozen geometry phase and final publication."""
-        phi = torch.empty((self.mode_count, len(x), 3), dtype=torch.complex64, device=x.device)
-        omega = torch.empty_like(phi)
-        for k in range(self.mode_count):
-            p, o, valid = self.mode(x, roots, k)
-            if not bool(valid.all()) or not bool(torch.isfinite(p).all() & torch.isfinite(o).all()):
-                raise ValueError(f'Cannot bake unsupported/non-finite motion at mode {k}')
-            phi[k], omega[k] = p, o
-        return phi, omega
-
-    def deform(self, x, roots, q):
-        """Query once per block for q[K] or q[sequences,K]; preserve input batch rank."""
-        roots = np.asarray(roots, np.int64)
-        if x.shape != (len(roots),3) or np.any(roots < 0) or np.any(roots >= len(self.a["points"])):
-            raise ValueError("Reference query roots/positions differ")
-        if q.ndim not in (1, 2) or q.shape[-1] != self.mode_count or q.numel() == 0:
-            raise ValueError("Reference coefficients must have shape [K] or [sequences,K]")
-        single = q.ndim == 1
-        if single:
-            q = q.unsqueeze(0)
-        parts = []
-        for start in range(0, len(x), self.block_size):
-            block = x[start:start+self.block_size]
-            displacement = block.new_zeros((len(q), len(block), 3))
-            angular = torch.zeros_like(displacement)
-            # Small frequency groups amortize kernel launches without a dense [K,G,C] field.
-            for first in range(0, self.mode_count, 4):
-                count = min(4, self.mode_count-first)
-                ids = np.tile(roots[start:start+len(block)], count)
-                modes = np.repeat(np.arange(first, first+count), len(block))
-                def query(value, ids=ids, modes=modes, count=count):
-                    phi, omega, _ = self._mode(value.repeat(count, 1), ids, modes)
-                    return phi.reshape(count, len(value), 3), omega.reshape(count, len(value), 3)
-                phi, omega = (checkpoint(query, block, use_reentrant=False) if block.requires_grad
-                              else query(block))
-                for slot in range(count):
-                    coefficient = q[:, first+slot, None, None]
-                    displacement = displacement + (coefficient * phi[slot]).real
-                    angular = angular + (coefficient * omega[slot]).real
-            parts.append((displacement, angular))
-        means = x + torch.cat([p[0] for p in parts], dim=1)
-        angular = torch.cat([p[1] for p in parts], dim=1)
-        return (means[0], angular[0]) if single else (means, angular)
-
-    @torch.no_grad()
-    def valid(self, x, roots):
-        roots = np.asarray(roots, np.int64)
-        if x.shape != (len(roots),3) or np.any(roots < 0) or np.any(roots >= len(self.a["points"])):
-            raise ValueError("Reference query roots/positions differ")
-        good = torch.ones(len(x), dtype=torch.bool, device=x.device)
-        for start in range(0, len(x), self.block_size):
-            block = x[start:start+self.block_size]
-            for first in range(0, self.mode_count, 4):
-                count = min(4, self.mode_count-first)
-                ids = np.tile(roots[start:start+len(block)], count)
-                modes = np.repeat(np.arange(first, first+count), len(block))
-                good[start:start+len(block)] &= self._mode(block.repeat(count, 1), ids, modes,
-                    support_only=True).reshape(count, len(block)).all(0)
-        return good
-
-    @torch.no_grad()
-    def shape_valid(self, x, roots, radius_fraction):
-        """Distance to the root's fixed incident segments, independent of modal weights."""
-        roots = np.asarray(roots, np.int64)
-        if (x.shape != (len(roots), 3) or np.any(roots < 0) or np.any(roots >= len(self.a['points']))
-                or not np.isfinite(radius_fraction) or radius_fraction <= 0):
-            raise ValueError('Invalid graph shape query')
-        if self._shape_arrays is None:
-            a, b = self.a['edges'].T
-            lengths = self.a['lengths']
-            graph = coo_matrix((np.r_[lengths, lengths], (np.r_[a, b], np.r_[b, a])),
-                               shape=(len(self.a['points']),) * 2).tocsr()
-            degree = np.diff(graph.indptr)
-            spacing = np.zeros(len(degree), np.float64)
-            for count in np.unique(degree[degree > 0]):
-                rows = np.flatnonzero(degree == count)
-                entries = graph.indptr[rows, None] + np.arange(count)
-                spacing[rows] = np.median(graph.data[entries], axis=1)
-            self._shape_arrays = dict(shape_ptr=graph.indptr.astype(np.int64),
-                shape_neighbor=graph.indices.astype(np.int64), shape_spacing=spacing)
-        t = self._on_device(x.device)
-        if 'shape_ptr' not in t:
-            t.update({name: torch.as_tensor(value, device=x.device) for name, value in self._shape_arrays.items()})
-        good = torch.empty(len(x), dtype=torch.bool, device=x.device)
-        for start in range(0, len(x), self.block_size):
-            block = x[start:start+self.block_size].double()
-            ids = torch.as_tensor(roots[start:start+len(block)], device=x.device)
-            origin = t['points'][ids].double()
-            entries, rows = _device_rows(t['shape_ptr'], ids)
-            edge = t['points'][t['shape_neighbor'][entries]].double() - origin[rows]
-            offset = block - origin
-            fraction = ((offset[rows]*edge).sum(-1) / edge.square().sum(-1).clamp_min(
-                torch.finfo(edge.dtype).tiny)).clamp(0, 1)
-            distance2 = (offset[rows] - fraction[:, None]*edge).square().sum(-1)
-            # The root itself is an endpoint; isolated roots have zero tolerance.
-            nearest2 = offset.square().sum(-1).scatter_reduce(
-                0, rows, distance2, reduce='amin', include_self=True)
-            good[start:start+len(block)] = (torch.isfinite(block).all(-1)
-                & (nearest2 <= (radius_fraction*t['shape_spacing'][ids]).square()))
-        return good
-
-    @torch.no_grad()
-    def constrain(self, means, previous, roots, optimizer, *, shape_radius_fraction):
-        support = self.valid(means, roots)
-        shape = self.shape_valid(means, roots, shape_radius_fraction)
-        bad = ~(support & shape)
-        rejected = bad.clone()
-        for _ in range(8):
-            if not bool(bad.any()):
-                break
-            ids = bad.nonzero().flatten()
-            means[ids] = (means[ids] + previous[ids]) / 2
-            local_roots = roots[ids.cpu().numpy()]
-            bad[ids] = ~(self.valid(means[ids], local_roots)
-                         & self.shape_valid(means[ids], local_roots, shape_radius_fraction))
-        means[bad] = previous[bad]
-        for value in optimizer.state.get(means, {}).values():
-            if isinstance(value, torch.Tensor) and value.shape == means.shape:
-                value[rejected] = 0
-        return dict(support_backtracks=int((~support).sum()), shape_backtracks=int((~shape).sum()),
-                    position_backtracks=int(rejected.sum()))

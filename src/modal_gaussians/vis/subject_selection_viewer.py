@@ -8,7 +8,7 @@ import torch
 
 from modal_gaussians.common.camera_rendering import rasterize_cameras
 from modal_gaussians.geometry.scene import _load_gsplat_rasterization, cameras_from_scene_manifest, load_static_scene
-from modal_gaussians.geometry.selection import _box_values, load_subject_selection, points_in_box, save_subject_selection
+from modal_gaussians.geometry.selection import _box_values, load_subject_selection, points_in_boxes, save_subject_selection
 from modal_gaussians.vis.viewer import ModalViserViewer, ViewerCamera
 
 
@@ -22,11 +22,12 @@ class SubjectSelectionData:
         self.points = self.active["means"].detach().cpu().numpy()
         # Old foreground only places the initial box; selection always includes old background.
         foreground = self.points[:self.scene.foreground.count]
-        lower, upper = foreground.min(axis=0), foreground.max(axis=0)
+        # Initial editing bounds only: all Gaussians remain selectable.
+        lower, upper = np.percentile(foreground, [5, 95], axis=0)
         dimensions = np.maximum((upper - lower) * 1.1, 1e-4)
         self.initial_box = _box_values((lower + upper) / 2, (1, 0, 0, 0), dimensions)
-        self.box = (load_subject_selection(selection_path, self.scene)
-                    if selection_path is not None else self.initial_box)
+        self.boxes = (load_subject_selection(selection_path, self.scene)
+                      if selection_path is not None else [self.initial_box])
         cameras = cameras_from_scene_manifest(self.scene.manifest)
         references = [camera for camera in cameras if camera.role == "reference"] or list(cameras[:1])
         self.cameras = tuple(ViewerCamera.from_camera(camera) for camera in references)
@@ -56,31 +57,35 @@ class SubjectSelectionViewer(ModalViserViewer):
 
     def _build_gui(self):
         gui = self.server.gui
-        self._box_state = self.data.box
-        position, wxyz, dimensions = self._box_state
+        self._boxes = {f"Box {i+1}": box for i, box in enumerate(self.data.boxes)}
+        self._next_box_id = len(self._boxes) + 1
+        self._syncing_box = False
+        position, wxyz, dimensions = self.data.boxes[0]
         self._orbit_center = position.copy()
-        gui.add_markdown("**3D subject selection**\n\nDrag the axes to move the box; drag the rings to rotate. "
-                         "Adjust its local X/Y/Z sizes below. Cyan Gaussians are selected, "
-                         "including any from the old background. Selection uses Gaussian centers.")
+        gui.add_markdown("**3D subject selection — box union**\n\n"
+                         "Only Gaussian centers inside ANY box are selected (cyan), including old background. "
+                         "Choose Active box, drag its axes/rings, and adjust its X/Y/Z sizes. "
+                         "Add box duplicates the active box; move or resize it to include another part of the subject.")
         self.viewer_resolution = gui.add_slider(
             "Viewer Res", min=64, max=max(2048, self._viewer_resolution), step=1,
             initial_value=self._viewer_resolution)
         self.highlight = gui.add_checkbox("Highlight selection", True)
         self.only_selected = gui.add_checkbox("Only selected", False)
-        self.show_box = gui.add_checkbox("Show selection box", True)
+        self.show_box = gui.add_checkbox("Show selection boxes", True)
         self.selection_summary = gui.add_markdown("")
+        self.active_box = gui.add_dropdown("Active box", options=tuple(self._boxes), initial_value="Box 1")
+        add = gui.add_button("Add box")
+        self.remove_box = gui.add_button("Remove active box", disabled=len(self._boxes) == 1)
         self.box_controls = self.server.scene.add_transform_controls(
             "/subject_box", position=position, wxyz=wxyz, scale=float(dimensions.max()) * 0.4,
             depth_test=False, translation_limits=((-1e10, 1e10),) * 3)
-        self.box_outline = self.server.scene.add_box(
-            "/subject_box/outline", dimensions=dimensions, wireframe=True, color=(40, 240, 255))
-        step = max(min(dimensions.min(), self.data.initial_box[2].min()) * 0.001, 1e-7)
-        # ponytail: cap sliders at 4x subject size for fine control; add editable limits for larger selections.
-        maximum = 4 * max(float(dimensions.max()), float(self.data.initial_box[2].max()))
+        self._outlines = {label: self._add_outline(label, box) for label, box in self._boxes.items()}
+        # Each active box gets its own editing range; switching/resetting refreshes it.
         self.box_sizes = tuple(gui.add_slider(
-            f"Box size {axis}", min=step, max=maximum, step=step, initial_value=float(value))
-            for axis, value in zip("XYZ", dimensions))
-        reset = gui.add_button("Reset box to old foreground bounds")
+            f"Box size {axis}", min=1e-7, max=float(2 * span),
+            step=max(float(span) * 1e-4, 1e-7), initial_value=float(value))
+            for axis, value, span in zip("XYZ", dimensions, dimensions))
+        reset = gui.add_button("Reset active box to robust subject bounds")
         save = gui.add_button("Save selection")
         self.save_status = gui.add_markdown("Selection is not saved. Saving creates a separate NPZ; "
                                              "the source scene and existing experiments remain unchanged.")
@@ -92,25 +97,52 @@ class SubjectSelectionViewer(ModalViserViewer):
         for handle in self.box_sizes:
             handle.on_update(update_box)
 
+        @self.active_box.on_update
+        async def _select(_):
+            self._load_active_box()
+
+        @add.on_click
+        async def _add(_):
+            label = f"Box {self._next_box_id}"
+            self._next_box_id += 1
+            self._boxes[label] = tuple(value.copy() for value in self._boxes[self.active_box.value])
+            self._outlines[label] = self._add_outline(label, self._boxes[label])
+            self.active_box.options = tuple(self._boxes)
+            self.active_box.value = label
+            self.remove_box.disabled = False
+            self._load_active_box()
+            self.save_status.content = "Box added; press Save selection to keep all boxes."
+
+        @self.remove_box.on_click
+        async def _remove(_):
+            if len(self._boxes) == 1:
+                return
+            label = self.active_box.value
+            self._outlines.pop(label).remove()
+            del self._boxes[label]
+            self.active_box.options = tuple(self._boxes)
+            self.active_box.value = next(iter(self._boxes))
+            self.remove_box.disabled = len(self._boxes) == 1
+            self._load_active_box()
+            self.save_status.content = "Box removed; press Save selection to keep this union."
+
         @reset.on_click
         async def _reset(_):
-            position, wxyz, dimensions = self.data.initial_box
-            with self.server.atomic():
-                self.box_controls.position = position
-                self.box_controls.wxyz = wxyz
-                for handle, value in zip(self.box_sizes, dimensions):
-                    handle.value = float(value)
-            self._refresh_box()
+            self._boxes[self.active_box.value] = tuple(value.copy() for value in self.data.initial_box)
+            self._load_active_box()
+            self.save_status.content = "Active box reset; press Save selection to keep this union."
 
         @self.show_box.on_update
         async def _show(_):
             self.box_controls.visible = bool(self.show_box.value)
+            for outline in self._outlines.values():
+                outline.visible = bool(self.show_box.value)
 
         @save.on_click
         def _save(_):
             try:
                 path = save_subject_selection(self.work_dir, self.data.scene_path, self.data.scene,
-                                              self.data.points, *self._box_state)
+                                              self.data.points, list(self._boxes.values()))
                 self.save_status.content = f"Saved selection: `{path}`"
                 print(f"Subject selection saved: {path}")
             except (OSError, ValueError) as error:
@@ -120,19 +152,51 @@ class SubjectSelectionViewer(ModalViserViewer):
             handle.on_update(self.request_render)
         self._build_camera_controls()
 
+    def _add_outline(self, label, box):
+        position, wxyz, dimensions = box
+        return self.server.scene.add_box(f"/subject_boxes/{label.replace(' ', '_')}",
+            position=position, wxyz=wxyz, dimensions=dimensions, wireframe=True,
+            color=(40, 240, 255), visible=bool(self.show_box.value))
+
+    def _load_active_box(self):
+        self._syncing_box = True
+        try:
+            position, wxyz, dimensions = self._boxes[self.active_box.value]
+            with self.server.atomic():
+                self.box_controls.position = position
+                self.box_controls.wxyz = wxyz
+                for handle, value in zip(self.box_sizes, dimensions):
+                    handle.max = float(2 * value)
+                    handle.step = max(float(value) * 1e-4, 1e-7)
+                    handle.value = float(value)
+                for label, outline in self._outlines.items():
+                    box = self._boxes[label]
+                    outline.position, outline.wxyz, outline.dimensions = box[0], box[1], tuple(box[2])
+                    outline.color = (255, 200, 40) if label == self.active_box.value else (40, 240, 255)
+        finally:
+            self._syncing_box = False
+        self.request_render()
+
     def _refresh_box(self):
-        self._box_state = _box_values(self.box_controls.position, self.box_controls.wxyz,
-                                     [handle.value for handle in self.box_sizes])
-        self.box_outline.dimensions = tuple(self._box_state[2])
-        self.save_status.content = "Box changed; press Save selection to keep this selection."
+        if self._syncing_box:
+            return
+        label = self.active_box.value
+        box = _box_values(self.box_controls.position, self.box_controls.wxyz,
+                          [handle.value for handle in self.box_sizes])
+        if all(np.array_equal(a, b) for a, b in zip(box, self._boxes[label])):
+            return
+        self._boxes[label] = box
+        outline = self._outlines[label]
+        outline.position, outline.wxyz, outline.dimensions = box[0], box[1], tuple(box[2])
+        self.save_status.content = "Box changed; press Save selection to keep this union."
         self.request_render()
 
     @torch.inference_mode()
     def _render(self, client):
-        selected = points_in_box(self.data.points, *self._box_state)
+        selected = points_in_boxes(self.data.points, list(self._boxes.values()))
         old_fg = int(selected[:self.data.scene.foreground.count].sum())
         old_bg = int(selected[self.data.scene.foreground.count:].sum())
-        self.selection_summary.content = (f"**Selected: {old_fg + old_bg:,} / {len(selected):,}**\n\n"
+        self.selection_summary.content = (f"**Union of {len(self._boxes)} boxes: {old_fg + old_bg:,} / {len(selected):,}**\n\n"
                                           f"From old foreground: {old_fg:,}; old background: {old_bg:,}.")
         return self.data.render_selection(self._render_camera(client), selected,
             highlight=bool(self.highlight.value), only_selected=bool(self.only_selected.value))

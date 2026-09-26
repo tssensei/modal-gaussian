@@ -40,7 +40,7 @@ class ViewerMode:
     @cached_property
     def modal_views(self):
         model = self.observation_source or self.artifact.manifest
-        if model.get("version") == 19:
+        if model.get("version") == 20:
             model = model["mode_sources"][self.slot]
         dense = read_json(resolve_path(model["complex_2d_modes"]) / "manifest.json")
         if dense["complex_2d_modes_identity"] != model["complex_2d_modes_identity"]:
@@ -256,7 +256,7 @@ def load_viewer_input(path, *, coordinates=None):
         if camera is None or camera.to_manifest_record()["camera_identity"] != source["camera_identity"]:
             raise ValueError("Viewer camera differs from the saved mode")
         view = {**source, "camera_name": camera.name}
-        if "selected_modal_supervision" in first or first.get("version") in (17, 19):
+        if "selected_modal_supervision" in first or first.get("version") in (17, 20):
             exported = modes[0].exports[source["label"]]
             view.setdefault("fps_hz", exported["fps_hz"])
             view.setdefault("flow_reference_frame_name", exported["reference_frame_name"])
@@ -290,7 +290,8 @@ def load_viewer_input(path, *, coordinates=None):
     if coordinates is not None:
         _, fitted = _load_coordinate_artifact(coordinates)
         cm = fitted.manifest
-        if cm.get("format") in ("modal_gaussians.refined_rgb_coordinates", "modal_gaussians.sweep_rgb_coordinates"):
+        if cm.get("format") in ("modal_gaussians.refined_rgb_coordinates", "modal_gaussians.sweep_rgb_coordinates",
+                                "modal_gaussians.rgb_modal_coordinates"):
             from modal_gaussians.results.artifact import _load_sources
             _, _, source_modes, _, _, _, _, _ = _load_sources(scene_dir=first["static_scene"],
                 completed_modes_dir=cm["completed_modes"], coordinates_dir=coordinates)

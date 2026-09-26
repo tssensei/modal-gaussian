@@ -67,27 +67,30 @@ pipeline or remove recovery checkpoints speculatively.
   RGB coefficient fitting keeps static geometry, appearance, cameras, displacement
   modes and angular modes fixed. Changing these assumptions is an explicit method
   change, not routine cleanup.
-- `coordinates refine-scene` is the explicit joint-refinement method. Keep it
-  separate from fixed-mode `fit-rgb`. Freeze reference graph nodes/edges, per-mode
-  propagation costs, control positions and control fields; protect control
-  Gaussians from position updates and density operations. Only non-control live
-  Gaussians may move/split/cull; children inherit permanent reference roots.
-  Reference graph indices and live Gaussian indices are different domains.
-  Preserve support and the fixed-root incident-segment shape bound with checked
-  rollback. Derive its radius from original unweighted edge lengths, never from
-  moved children or frequency weights. Cancel splits with any invalid child;
-  validate the bound on restore/publication and bake final fields before publication.
-  Alternate sparse joint updates with exhaustive coefficient-only passes at full
-  resolution. During coefficient passes freeze every Gaussian parameter and reuse
-  one detached GPU basis; invalidate it after geometry changes or checkpoint load.
-  Use the geometry-update clock for Gaussian LR/density/newborn age and the total
-  update clock for coefficient LR. Keep each frame's Adam state across both phases.
+- `coordinates refine-motion` is the explicit motion-refinement method, separate
+  from fixed-mode `fit-rgb`/`fit-sweep`. Freeze every Gaussian attribute/count,
+  cameras, reference graph, propagation weights, controls/positions and donor roles.
+  Learn valid complex control displacement/angular corrections and free per-frame q.
+  Prepare a fixed sparse W/L operator, preserving donor lever arms and unresolved
+  zeros. Keep the original pixel-projection q normalization; control correction
+  normalization is separate and removes the original mode's complex scale/phase.
+  Start q at zero with in-training frozen-field RGB warmup, then alternate sparse
+  joint motion/q updates and exhaustive coefficient-only passes. The explicit
+  `--flow-initialization` route may import a validated reference-only
+  flow prefix, retain its shared offset/scales and use it as the anchor without warmup.
+  Bind source/selection identities to a new run; never fabricate a resumed optimizer.
+  Freeze fields and reuse one detached GPU basis during q passes; invalidate after joint changes/load.
+  Preserve row-local Adam and the post-warmup anchor. Dynamic KNN regularization
+  uses original geometry and the same sequence's previous frame with detached q.
+  Use the joint clock for control LR and post-warmup total clock for q LR. Publish
+  baked fields and coordinates referencing the unchanged static scene; never create
+  a new Gaussian scene or silently run geometry optimization/density control.
 - Keep original modal observation views separate from supervised sequences. Sweep
   has per-frame calibrated cameras and its own extraction clock; it is not an FFT
   observation or a synchronized recording. Use `coordinates/sequences.py` bindings
   throughout training, evaluation, export and playback. Average fixed views within
-  their group, then weight fixed and sweep groups equally; undo the actual sample
-  weight for density statistics. Never share per-frame coefficient Adam state.
+  their group, then weight fixed and sweep groups equally. Correct uniform exhaustive-frame sampling for
+  sequence lengths to preserve these group weights. Never share per-frame coefficient Adam state.
   Sweep fitting/refinement uses an actual 30 FPS frame subset. Preserve source
   indices, timestamps, PNG hashes and cameras together; never relabel 60 FPS as 30.
 - The explicit v16 reference importer in `tools/` is the authorized legacy boundary.

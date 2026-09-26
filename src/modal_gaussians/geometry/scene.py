@@ -482,7 +482,6 @@ class ForegroundBackgroundScene(nn.Module):
         foreground_quaternions: Tensor | None = None,
         foreground_colors: Tensor | None = None,
         include_background: bool = True,
-        density_grad: bool = False,
     ) -> dict[str, Tensor]:
         """Render deformed foreground and static background with one depth order.
 
@@ -543,7 +542,7 @@ class ForegroundBackgroundScene(nn.Module):
             active = combined
 
         rasterization = _load_gsplat_rasterization()
-        rendered, alphas, info = rasterize_cameras(rasterization, [camera],
+        rendered, alphas, _ = rasterize_cameras(rasterization, [camera],
             means=active["means"],
             quats=active["quaternions"],
             scales=active["scales"],
@@ -566,11 +565,7 @@ class ForegroundBackgroundScene(nn.Module):
             rendered[0, ..., 3],
             torch.zeros_like(rendered[0, ..., 3]),
         )
-        result = {"rgb": rendered[0, ..., :3], "alpha": alpha, "expected_depth": depth}
-        if density_grad:
-            info["means2d"].retain_grad()
-            result["info"] = info
-        return result
+        return {"rgb": rendered[0, ..., :3], "alpha": alpha, "expected_depth": depth}
 
     def render_features(
         self,
@@ -1384,15 +1379,13 @@ def load_static_scene(
     if not manifest_path.is_file() or not tensors_path.is_file():
         raise FileNotFoundError(f"Incomplete static scene bundle: {path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("format") != "modal_gaussians.static_scene" or manifest.get("version") not in (5, 6, 7):
+    if manifest.get("format") != "modal_gaussians.static_scene" or manifest.get("version") not in (5, 6):
         raise ValueError(f"Unsupported static scene manifest: {manifest_path}")
     if (manifest["representation"].get("color") != "spherical_harmonics_world"
             or type(manifest["representation"].get("sh_degree")) is not int
             or not 0 <= manifest["representation"]["sh_degree"] <= 3):
         raise ValueError("Static scene requires explicit SH degree 0..3")
     cameras = cameras_from_scene_manifest(manifest)
-    # Derived scenes always verify their new tensor and identity-map bindings.
-    validate = validate or manifest["version"] == 7
     if (not all(c.distortion_applied for c in cameras)
             or manifest["representation"].get("camera_projection") != PROJECTION_CONVENTION):
         raise ValueError("Static scene requires SIMPLE_RADIAL projection; rebuild the static scene")
@@ -1430,20 +1423,6 @@ def load_static_scene(
 
             validate_partition_bundle(path, manifest, loaded)
             static_identity_payload["partition_identity"] = manifest["partition_identity"]
-        if manifest["version"] == 7:
-            source = manifest["refinement"]
-            if _sha256_file(path / "identity_map.npz") != source["identity_map_sha256"]:
-                raise ValueError("Refined Gaussian identity map checksum differs")
-            with np.load(path / "identity_map.npz", allow_pickle=False) as mapping:
-                n = len(loaded["foreground.means"])
-                if (set(mapping.files) != {"uid", "root_id", "protected", "birth_step"}
-                        or any(mapping[k].shape != (n,) for k in mapping.files)
-                        or len(np.unique(mapping["uid"])) != n or np.any(mapping["root_id"] < 0)
-                        or np.any(mapping["root_id"] >= source["reference_count"])
-                        or any(mapping[k].dtype != np.int64 for k in ("uid", "root_id", "birth_step"))
-                        or mapping["protected"].dtype != np.bool_):
-                    raise ValueError("Refined Gaussian identity map is invalid")
-            static_identity_payload["refinement"] = source
         if _sha256_json(static_identity_payload) != manifest.get("static_scene_identity"):
             raise ValueError("Static scene identity does not match manifest contents")
     parts: dict[str, GaussianSet] = {}

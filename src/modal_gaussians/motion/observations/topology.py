@@ -7,7 +7,6 @@ import hashlib
 import importlib
 import json
 import math
-import os
 from pathlib import Path
 from modal_gaussians.common.scene_store import resolve_path
 import shutil
@@ -18,6 +17,7 @@ import cv2
 import numpy as np
 
 from modal_gaussians.common.numpy_io import save_named_arrays
+from modal_gaussians.common.cache import publish_directory
 from modal_gaussians.geometry.scene import Camera
 
 
@@ -717,7 +717,7 @@ def _publish_topology(
                      ObservationTopologyArtifact(temporary, manifest, arrays))
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"Topology output already exists: {destination}")
-        os.replace(temporary, destination)
+        publish_directory(temporary, destination)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise

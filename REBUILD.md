@@ -1,5 +1,221 @@
 # Cleanup and required rebuilds — 2026-09-23
 
+## Retire Gaussian-refinement remnants — 2026-09-26
+
+Removed the historical static-scene v7 reader, unused deformed-render density-gradient
+option and obsolete local geometry-refinement tests/benchmark. Current scene v5/v6
+formats and rendering math are unchanged. Static density control, fixed-mode sweep
+fitting and optional sweep supervision in motion refinement remain supported.
+
+Matching v5/v6 scenes, raw/stabilized frames, flow/FFT, mode banks and prepared v5
+inputs remain reusable under their contracts. Historical v7 scenes and descendants
+that require them are unsupported; preserve their files and use the original static
+scene for new fixed-scene motion refinement. Never relabel old manifests.
+
+Scene/density/refinement source hashes change, invalidating exact-code static and
+motion-refinement resume contracts and affected implementation-keyed caches.
+Use new work paths for subsequent training and let stages resolve new cache keys.
+No numerical downstream rebuild is required solely for this cleanup on v5/v6 inputs.
+No real-scene artifacts were validated, rebuilt, moved or redirected here.
+
+## Independent dynamic-depth stabilization trial rolled back — 2026-09-26
+
+Removed the standalone trial kernel, command and experiment-only local checks.
+Existing experiment artifacts in `dynamic_stabilization540_view1_10s_20260925_001`
+remain historical outputs, not production references; see their `review/REPORT.md`.
+Production stabilization, cache contracts and catalog pointers are unchanged.
+Existing references, flow, FFT/modal images, geometry, modes and coefficients remain
+reusable under their existing contracts; no downstream rebuild is required.
+
+## Optional motion-refinement early stopping — 2026-09-25
+
+Full-bound-frame RGB checks can now stop a plateau and select the best checkpoint.
+The default patience is zero, so existing recipe behavior remains unchanged.
+Enabling it changes stopping/publication semantics and records `training_selection`
+in the final coordinate manifest. Scene, modes, flow initialization and prepared
+operator are reusable; no upstream rebuild is required. The changed implementation
+identity requires a new work directory rather than resuming earlier checkpoints.
+New checkpoints retain early-stop history plus a hashed step-specific best state;
+the latest optimizer state and published best state are explicitly distinguished.
+
+## Flow-initialized motion refinement — 2026-09-25
+
+`refine-motion --flow-initialization DIAGNOSTIC_ROOT` starts a new run from the
+checked reference-only flow solution, on exactly its fixed-view prefix. Existing
+prepared v5/operator, scene, bank, reference flow/FFT and baseline remain reusable.
+No upstream rebuild is required. The run contract now binds the optional source,
+frame selection and skipped warmup; implementation hashes change, so previous
+training checkpoints cannot resume under this code. Use new work/output paths.
+Final mode v20 and coordinate v5 shapes/units/readers are unchanged; coordinates
+add initialization provenance. Source preparation identity still identifies the
+unchanged full preparation; output views describe the actual subset. Never edit
+the parent's manifest or relabel the diagnostic as an RGB-fitting artifact.
+
+## Reference/adjacent coefficient diagnostic — 2026-09-25
+
+The standalone flow comparison adds new experiment-only design, adjacent-flow,
+solve and diagnostic outputs. Existing scene, mode bank, reference flow, FFT,
+prepared supervision, RGB fits and checkpoints are unchanged and remain reusable
+under their existing contracts. No upstream rebuild or catalog change is required.
+New adjacent observations must be computed from the actual bound PNGs and cannot
+be substituted into the reference-flow/FFT contract. Never reuse a stage with a
+different input identity or relabel its output as production RGB coordinates.
+
+## Calibrated sweep resize binding — 2026-09-25
+
+Sweep sequence preparation now accepts the existing calibrated spatial resize and
+temporal subset, validating its parent camera and extraction-metadata hashes.
+Pass the original extraction metadata: retained source indices determine timestamps
+and effective FPS; resized PNGs and cameras come from the static scene. No source
+metadata is rewritten and no raw video is decoded. Matching static scenes, mode
+banks and references remain reusable. Rebuild prepared supervision and downstream
+fits/refinement in new directories; changed preparation implementation identities
+prevent accidental reuse. The 540p pilot records its own inputs and timing logs.
+
+The first real fixed-operator check exposed float32 reassociation error when
+coalescing donor/control weights. Operator internal version 2 keeps canonical
+control stencils and a separate donor CSR, preserving the original two-stage sum.
+Prepared v5 and mode v20 require that explicit operator version; rebuild older
+operators/preparations and use new work/checkpoints. Original banks, reference v1,
+frames and static scenes remain reusable. The validation threshold stays `1e-5`.
+
+
+## Fixed-scene control-motion refinement — 2026-09-25
+
+Replaces `refine-scene` with `refine-motion`: freeze all Gaussians/counts and learn
+valid control displacement/angular corrections plus free per-frame q. The original
+scene is the output scene; density, permanent-root lifecycle, shape-bound rollback
+and new scene publication are removed from refinement. Static training density
+helpers remain. Fixed `fit-rgb`/`fit-sweep` keep their existing behavior.
+
+New preparation v5 binds videos directly (`--view`, optional `--sweep-metadata`),
+not fitted-coordinate inputs. It publishes a fixed sparse W/L operator, verified
+against the original basis, and original 2D pixel-projection pair scales. New mode
+v20 and refined coordinates v5 reference the unchanged static scene. Result v3
+stays current. Version 4 remains reserved for the removed carrier experiment.
+
+Reuse matching raw/stabilized PNGs and validity, cameras, depth/static geometry,
+flow/FFT, original mode banks and verified fixed reference v1 under their existing
+contracts. No real data was checked in this implementation, so path existence is
+not a compatibility claim. Rebuild refinement preparation, use a new work directory
+and publish new mode/coordinate/result/evaluation/export outputs. Old preparation,
+scene-refinement outputs and checkpoints have no migration/compatibility path.
+Do not relabel versions or overwrite historical baselines. The new training code
+identity invalidates old optimizer resumes, including otherwise matching settings.
+
+Defaults: ten full-frame warmup passes from zero q, two sparse joint/exhaustive-q
+rounds, original pixel q scales, field anchor and dynamic geometric-KNN regularity.
+No carrier, damping, GNN retraining, Gaussian adjustment or mode-count increase.
+Implementation/verification uses local ignored synthetic data only; no real
+training, evaluation, export, viewer, catalog edit, commit or push is implied.
+Unrelated depth, manual-box and viewer changes remain in the worktree.
+
+Verification: 39 distinct focused synthetic/regression checks passed, including
+control interpolation/gauge/gradients, group weighting and row-local Adam, phase
+recovery, unchanged Gaussians, selected-view preparation, moving-camera sweep,
+publication/reload/materialization/evaluation/video, fixed RGB fitting and static
+SH/density behavior. Local ignored logs and the synchronized small CUDA benchmark
+are recorded in `tests/MOTION_REFINEMENT_VERIFICATION.md`. This is not a full-suite
+run or real-scene quality/performance evidence.
+
+## Restore free per-frame coefficients - 2026-09-25
+
+Reverted the fixed-carrier/positive-envelope experiment, including its displacement-
+RMS normalization and zero-start refinement warmup. RGB fitting again uses direct
+flow coordinates, reference subtraction, a shared RGB pose offset, projection-based
+pair scales and independent complex coefficients/Adam state for every frame.
+Sweep retains zero initial coordinates, shared offset fitting and its explicit
+`--scale-source`. Refinement again starts from compatible fitted RGB coordinates
+and preserves its sparse joint/exhaustive coefficient schedule, shared field query,
+30 FPS sweep subset and fixed-root shape constraint.
+
+Restored interfaces: `coordinates prepare` publishes bank/design/direct inputs;
+`fit-rgb` requires `--input` and accepts `--images`; `fit-sweep` requires
+`--scale-source`; `prepare-refinement` requires `--coordinates` and accepts
+`--sweep-coordinates`, not `--sweep-metadata`. No oscillator/damping model is added.
+
+Current contracts are again fixed RGB v2, sweep RGB v1, refinement preparation v3
+and refined coordinates v3. Result v3 and spatial scene/mode/reference formats are
+unchanged. Carrier/envelope fits, preparations and checkpoints remain preserved
+historical artifacts, but are not inputs to the restored loaders. Never relabel or
+overwrite them. The exported carrier preview remains a file, not a reusable fit.
+
+Matching PNGs/validity, cameras, depth/static scenes, flow/FFT, spatial modes,
+mode banks and verified references remain reusable under their own contracts.
+If only a bank was prepared during the carrier experiment, create the missing
+rendered design/direct initialization through a new preparation directory; this
+does not require retraining spatial modes. Existing free-coordinate artifacts
+still require their normal identity checks. Resume requires an exact implementation
+match; use new work directories for changed trainer revisions. New fits need new
+result/evaluation/export outputs. No scene data, catalog or frozen baseline was
+modified, and no real fitting, training, evaluation, export or viewer was started
+by this rollback. Unrelated depth, manual-box and visualization changes remain.
+
+Verification: 24 focused local synthetic tests passed, covering RGB initialization/
+fitting, sweep cameras, shared-query gradients, alternating per-frame Adam updates,
+checkpoint recovery, publication, result binding and synthetic video export.
+Restored CLI/config contracts and the retained depth entry point also passed.
+
+
+## Union of subject boxes — 2026-09-24
+
+Subject selection v3 and manual partition method v3 replace the single-box and intersection
+contract. GUI editing, save/restore, `static apply-selection`, visible-subject
+motion consumers, refinement provenance and FFT regions use the union (any box).
+Raw pixels, COLMAP, depth and the trained base static scene remain reusable.
+Save/apply a selection on that scene; changed foreground/order/scene identities
+require new scene-bound preparation, graph/control/mode and coefficient outputs.
+Recheck reference/flow contracts rather than relabeling existing sources. An FFT
+built with a different scene/region also needs a matching contract. Published
+historical inputs remain untouched; old selection/partition v1/v2 is not silently
+migrated. The current live box layout is explicitly republished as a v3
+editing backup only. The user subsequently saved the final union, which was applied
+to the new `pipeline540_box0744_20260924_001/subject_scene_union` scene. Matching
+references, flow, FFT, geometry and the requested 0.744 Hz mode were rebuilt and
+published on 2026-09-25; no coefficient fitting, evaluation or catalog redirect ran.
+
+## Viewer projection and pending brightness recovery — 2026-09-24
+
+Viewer preparation retains both subject and valid-pixel masks required by the
+reference loader. While a projection is pending or failed, the original modal
+image uses its displayed input region's p99 rather than a fixed scale of 1.
+Successful projections retain the existing shared brightness calculation.
+This repairs viewer loading/presentation only; projection numerics and cache
+contracts are unchanged. Published scenes, flows, FFTs, modes and completed
+projection caches remain reusable. Restart the viewer to retry failed projections;
+no training or downstream artifact rebuild is required.
+
+## Observation publication recovery — 2026-09-24
+
+The same bounded atomic-publication retry is now used for shared FFT and selected
+modal-image exports after a Windows rename lock in the manual-union single-mode
+run. It changes no arrays or spectrum contracts: completed FFT caches remain
+reusable, and a failed unpublished export can be rerun into its absent destination.
+
+Observation topology and base neural preparation now use the existing bounded
+Windows directory-publication retry. This fixes transient `WinError 5` during
+atomic rename without recomputing arrays inside a running stage or changing
+numerics, schemas, or identity payloads. Complete upstream scenes, references,
+flows and spectra remain reusable; a failed unpublished preparation must be rerun.
+Training revision includes the changed preparation module, so earlier training work
+must follow the normal exact-revision check rather than bypassing it.
+
+## Optional posed DA3 depth — 2026-09-24
+
+Added independent `static prepare-depth` and `static train --depth` supervision.
+Depth v1 binds all registered COLMAP frames/cameras, undistortion/processing grids,
+scene normalization, model/source checksums and confidence selection. Raw inputs,
+masks and matching COLMAP reconstructions are reusable. A new 540p dataset needs
+its corresponding cameras and new depth cache; do not resize or relabel old depths.
+
+Static resume is now v4 and summary v3. Earlier checkpoints cannot continue under
+this implementation, even for RGB-only runs. Use new work/output directories.
+Existing published v5/v6/v7 scenes remain readable. To adopt depth supervision,
+retrain static geometry, then rebuild every descendant bound to the changed scene
+(partition, depth-based stabilization, references, flow/FFT, modes and coefficients).
+No existing manifests/catalog entries are modified. No real inference, training,
+validation, evaluation, export or Viser is run by this code change.
+
 ## Remove static mask supervision — 2026-09-24
 
 Static optimization now uses only `L1_RGB + 0.2 * (1 - SSIM)`. The trimmed mask
@@ -136,7 +352,10 @@ It preserves the current component-field numerical recipe and fixed-mode RGB fit
 No scene-library artifact, raw video, model, cache or catalog was changed. No real
 experiment was run to validate the cleaned pipeline. Synthetic checks are development checks.
 
-## Joint-refinement addition
+## Historical joint-refinement addition (superseded)
+
+This records the removed Gaussian-refinement method. Current contracts are in
+"Fixed-scene control-motion refinement" and "Retire Gaussian-refinement remnants" above.
 
 - Current static v2/v3 scenes, v18 single-frequency models, v17 mode banks and
   fixed-mode direct/RGB coordinates remain input formats. The earlier cleanup's
@@ -252,9 +471,9 @@ import for this experiment, without upstream retraining. `prepare-refinement`
 requires that imported `--reference` for v16 and can select only `--view view1`.
 No upstream rebuild, new RGB fit or refinement ran for the historical measurement.
 
-## Alternating refinement and 30 FPS sweep (2026-09-24)
+## Historical alternating geometry refinement and 30 FPS sweep (2026-09-24; superseded)
 
-The sole `refine-scene` schedule is now two rounds of sparse geometry/coefficient
+The former `refine-scene` schedule used two rounds of sparse geometry/coefficient
 updates followed by exhaustive frozen-geometry coefficient passes, at scale 1.0.
 This changes sampling, budgets and learning-rate clocks. It is a method change,
 not merely a faster execution of the old all-frame joint optimizer. Old
@@ -286,7 +505,7 @@ store separate geometry/total clocks, round/phase, selections, all q/Gaussian Ad
 states, topology, density statistics and RNG. Transient GPU basis tensors are
 rebuilt on resume. Schema readers are not extended to accept old trainer states.
 
-## Fixed KNN shape bound (2026-09-24)
+## Historical Gaussian KNN shape bound (2026-09-24; removed)
 
 Joint refinement now accepts canonical positions only within their permanent
 root's original incident-segment neighborhood, as well as the existing motion
@@ -318,7 +537,7 @@ coefficient passes and the complete publication/render/evaluation/export chain.
 Tests remain Git-ignored (`tests/graph_shape_full_suite.log`); these checks do not
 establish real-scene shape quality.
 
-## Uncommitted-change audit for the alternating-pipeline implementation
+## Historical audit of the removed alternating geometry pipeline
 
 Audit scope is the worktree delta from HEAD, including untracked production files.
 No unrelated production change was found to restore. The following groups are the

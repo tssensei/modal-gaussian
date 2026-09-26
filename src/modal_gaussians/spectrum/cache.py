@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import math
-import os
 from pathlib import Path
 from modal_gaussians.common.scene_store import resolve_path
 import re
@@ -17,7 +16,7 @@ import numpy as np
 
 from modal_gaussians.spectrum.transform import temporal_rfft_tiles
 from modal_gaussians.flow.storage import create_array, open_array
-from modal_gaussians.common.cache import atomic_json, identity, sha256
+from modal_gaussians.common.cache import atomic_json, identity, sha256, publish_directory
 from modal_gaussians.spectrum.modes import TRANSFORM_CONVENTION
 from modal_gaussians.common.progress import Progress, report_progress
 
@@ -147,16 +146,16 @@ def _source(path):
 def _scene_regions(scene_dir, sources):
     """Use camera/box metadata on CPU; do not load any Gaussian tensors."""
     from modal_gaussians.geometry.scene import cameras_from_scene_manifest
-    from modal_gaussians.geometry.selection import projected_box_pixels
+    from modal_gaussians.geometry.selection import MANUAL_METHOD, boxes_from_arrays, projected_box_pixels
 
     root = resolve_path(scene_dir, strict=True)
     scene = _json(root / "manifest.json")
     partition = scene.get("partition", {})
-    if (partition.get("method") != "manual_subject_selection_v1"
+    if (partition.get("method") != MANUAL_METHOD
             or partition.get("mapping_file") != "partition.npz"):
         raise ValueError("Spectrum selected-box region requires a manually selected subject scene")
     with np.load(root / "partition.npz", allow_pickle=False) as data:
-        box = tuple(data[name] for name in ("box_position", "box_wxyz", "box_dimensions"))
+        boxes = boxes_from_arrays(data)
     cameras = {camera.label: camera for camera in cameras_from_scene_manifest(scene)
                if camera.role == "reference"}
     regions = []
@@ -164,14 +163,14 @@ def _scene_regions(scene_dir, sources):
         camera = cameras.get(label)
         if camera is None or [camera.height, camera.width] != source["flow_shape"][1:3]:
             raise ValueError(f"Reference camera/flow dimensions differ: {label}")
-        pixels = projected_box_pixels(camera, *box)
+        pixels = projected_box_pixels(camera, boxes)
         region = np.zeros((camera.height, camera.width), dtype=bool)
         region[pixels[:, 1], pixels[:, 0]] = True
         if not region.any():
             raise ValueError(f"Selected box is outside reference view: {label}")
         regions.append(region)
     return regions, {"path": str(root), "scene_identity": scene["static_scene_identity"],
-                     "box": [value.tolist() for value in box]}
+                      "box_union": [[value.tolist() for value in box] for box in boxes]}
 
 
 def build_spectrum(*, views, scene_dir=None, fft_length, output_dir, region_paths=None):
@@ -275,7 +274,7 @@ def build_spectrum(*, views, scene_dir=None, fft_length, output_dir, region_path
             report_progress(f"{label} spectrum complete in {record['seconds']:.1f}s")
         manifest.update(status="complete", seconds=time.perf_counter() - started)
         atomic_json(temporary / "manifest.json", manifest)
-        os.rename(temporary, destination)
+        publish_directory(temporary, destination)
     except BaseException:
         report_progress(f"Incomplete spectrum retained at {temporary}; it is not a usable cache")
         raise
@@ -347,5 +346,5 @@ def export_selection(cache, selection_path, output_dir):
                             "path": relative.as_posix()})
     atomic_json(temporary / "manifest.json", {"format": "modal_gaussians.spectrum_export", "version": 1,
                                             "status": "complete", "selection": selection, "modes": records})
-    os.rename(temporary, output)
+    publish_directory(temporary, output)
     return output

@@ -1,0 +1,21 @@
+{
+  "image_scale": 1.0,
+  "warmup_passes": 10,
+  "warmup_lr": 0.01,
+  "warmup_final_lr": 0.001,
+  "rounds": 2,
+  "coefficient_epochs_per_round": 1,
+  "fixed_joint_fps": 5.0,
+  "sweep_joint_fps": 10.0,
+  "coefficient_lr": 0.001,
+  "coefficient_final_lr": 0.0001,
+  "control_lr": 0.001,
+  "control_final_lr": 0.0001,
+  "anchor_weight": 0.0001,
+  "field_anchor_weight": 0.01,
+  "rigidity_weight": 0.001,
+  "rotation_weight": 0.001,
+  "checkpoint_interval": 200,
+  "query_block_size": 4096,
+  "seed": 1729
+}

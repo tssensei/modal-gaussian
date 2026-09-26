@@ -1,5 +1,15 @@
 # Scene storage
 
+Manual subject selections now use selection **v3**, with `box_positions [B,3]`,
+`box_wxyz [B,4]`, `box_dimensions [B,3]` and `B >= 1`. A Gaussian is selected only
+when its center is inside any box. The NPZ records the box count, union
+rule, source identities and selected indices. Applied static scenes remain v6,
+with partition method `manual_subject_selection_v3` and all box arrays retained.
+Spectrum regions project the union using a separate ray-depth interval per box;
+overlapping pixels are counted once. A single box uses
+the same v3 format. Old v1/v2 selections/partitions are not read through a legacy
+branch; preserve them and explicitly save/apply a new selection before reuse.
+
 All active inputs, reusable caches and experiments belong to `scene_library/`.
 Start with `scene_library/<scene>/catalog.json` and `results/index.json`.
 The root `registry.json` owns physical relocation and asset aliases.
@@ -36,6 +46,27 @@ The last command starts a viewer and is only an example for an authorized viewin
 
 ## Identity and publication
 
+Motion-refinement early stopping, when enabled, stores latest optimizer/sampler
+state and progress history in `work/checkpoint.pt`, checked best states under
+`work/best/checkpoint_STEP.pt`, and readable history in `work/early_stopping.json`.
+The latest checkpoint binds the selected best file's hash; unreferenced newer
+files after interruption do not change selection. Final coordinates include
+`training_selection` provenance. Actual training steps can exceed published steps.
+
+The reference/adjacent-flow diagnostic owns `contract.json`, `design/`, `pairs/`,
+`solution/`, `comparison/`, `curves/` and mutable `logs/` under a new experiment.
+Each completed stage publishes atomically with source/output hashes. Pair flow is
+explicit forward/backward adjacent flow, never a replacement SEA-RAFT reference
+artifact. Solution arrays are original-unit complex64, with an explicit shared
+reference offset and no temporal centering. These experiment products are not
+accepted as formal RGB coordinates or modal results. They preserve original
+scene/bank/flow/PNG inputs and do not redirect catalog entries.
+`refine-motion --flow-initialization` is the explicit checked import boundary for
+the reference-only solution. The run/checkpoint binds source identities, consumed
+array hashes and the exact supervised prefix; final coordinates retain this
+provenance. The original prepared identity remains a parent identity, while output
+views/images identify the actual subset. No source artifact is rewritten.
+
 - Resolve all manifest paths using
   `modal_gaussians.common.scene_store.resolve_path()`. Stored old paths can be
   relocation aliases; do not rewrite identity-bearing metadata.
@@ -58,19 +89,40 @@ pre-cleanup artifacts that now require new outputs.
 ## SH static scene artifacts
 
 Current static scene versions are **v5** (trained base), **v6** (repartitioned or
-manually selected), and **v7** (jointly refined). Each partition stores `means`,
+manually selected). Historical geometry-refined v7 scenes are no longer accepted.
+Each partition stores `means`,
 `quaternions`, `log_scales`, `opacity_logits`, `sh_dc [G,3]` and
 `sh_rest [G,15,3]`. The manifest declares `spherical_harmonics_world` and the active
 SH degree (0..3), which also participates in scene identity. Repartitioning and
-density changes preserve/remap every SH row; refined publication preserves degree.
-Static resume v3 binds tensors, optimizers, sampler state, iteration budget and
+density changes preserve/remap every SH row; motion refinement preserves the whole scene.
+Static resume v4 binds tensors, optimizers, sampler state, iteration budget, optional
+depth identity and
 training/scene/density/radial-render implementation hashes. Pixel and device-grid
 caches are transient process memory and are not checkpoint or artifact fields.
 Earlier direct-RGB scenes and resume
-v1/v2 are not current inputs. Training summary v2 and epoch/checkpoint statistics
-contain RGB losses only, with no removed mask-loss fields. Scene tensor formats
-remain v5/v6/v7. Preserve old outputs as described in
+v1/v2/v3 are not current inputs. Training summary v3 and epoch/checkpoint statistics
+contain RGB and unweighted depth losses, with no removed mask-loss fields. Scene tensor formats
+remain v5/v6. Preserve old outputs as described in
 [REBUILD](REBUILD.md); never rewrite their manifests.
+
+## Static depth targets
+
+`static prepare-depth` atomically publishes `modal_gaussians.static_depth` v1 in
+a new experiment's `depth/` directory. Each camera has a hashed NPZ containing
+float32 `depth [H,W]`, float32 `confidence [H,W]` and bool `valid [H,W]` on the
+original training pixel grid. Invalid values are zero. Depth is camera Z in
+normalized scene units, not ray distance or inverse depth.
+
+The content-hashed manifest binds the full static dataset identity, camera/image records,
+normalization, grouping, model file hashes, inference settings, DA3 source/runtime
+and producer hashes. It records processed K/grid and confidence thresholds.
+The loader validates every file and requires complete camera coverage; changed
+pixels, poses, normalization, missing arrays or corrupted targets fail before
+training. `inference.log` is retained; intermediate undistorted PNGs are temporary.
+`static train --depth` records the target identity/path in `depth_supervision` and
+the target identity in checkpoint v4. Changing it forbids resume. Base scene
+tensor format and identity calculation remain v5; rendered content changes produce
+new scene identities through the tensor hashes, as before.
 
 ## Stabilized recording artifacts
 
@@ -84,97 +136,70 @@ Identity binds source pixels, settings/code, static camera/scene and COLMAP hash
 Missing pixels remain black and invalid; no source camera/manifest is rewritten.
 
 SEA-RAFT v3 owns time-common trajectory support; spectrum/selected exports v2
-and neural preparation v3 carry it. Fixed RGB coordinates v2 and refinement preparation/coordinates v3 bind
+and neural preparation v3 carry it. Fixed RGB coordinates v2 and refinement preparation/coordinates v5 bind
 the common valid-mask path/checksum in each fixed recording's image record.
 Sweep has native full-frame support. Evaluation v2 records support identities and
 rejects comparisons with different supports. Old artifacts remain historical;
 rebuild requirements are in [REBUILD](REBUILD.md).
 
-## Joint refinement artifacts
+## Motion refinement artifacts
 
 ```text
 experiments/NEW_REFINEMENT/
-  motion_reference/ # fixed motion reference v1; explicit old-model import or current builder
-  sweep_coordinates/ # sweep RGB coordinates v1 at 30 FPS; fitted or parent-row subset
-  baseline_result/   # original scene, fixed-view + sweep RGB; result v3
-  baseline_evaluation/ # explicit native PNG metrics
-  prepared/       # preparation v3; immutable reference.npz, initial.npz, manifest.json
-  work/           # checkpoint.pt, training.jsonl, run.json, process lock
+  motion_reference/ # reusable fixed reference v1, explicit v16 boundary if needed
+  prepared/         # preparation v5: reference.npz, operator.npz, initial.npz, manifest
+  work/             # checkpoint.pt, training.jsonl, run.json, process lock
   refined/
-    manifest.json
-    scene/        # static scene v7; tensors.pt and identity_map.npz
-    mode_bank/    # completed modes v19; phi.npy, rotation.npy, support.npz
-    coordinates/  # refined RGB coordinates v3; coordinates.npy
-  result/         # explicit materialization, modal result v3
-  evaluation/     # explicit evaluation, with per-frame CSV
-  exports/        # explicit export-video
+    manifest.json   # references original STATIC; no scene tensor copy
+    mode_bank/      # completed modes v20: phi.npy, rotation.npy, support.npz, operator.npz
+    coordinates/    # refined RGB v5: coordinates.npy + sequence/image bindings
+  result/           # explicit modal result v3
+  evaluation/       # explicit metrics and per-frame CSV
+  exports/          # explicit videos
 ```
 
-The reference graph owns its original node coordinates/order and frequency
-propagation costs. Live foreground rows own `uid`, `root_id`, `protected` and
-`birth_step` (geometry-update clock); children inherit roots but receive new UIDs. Removing a live row
-does not remove a reference node. Prepared path tables remain sparse on disk.
-Queries cache the immutable tables on the selected device, expand sparse indices
-there, and use bounded Gaussian blocks with up to four frequencies per group and
-activation recomputation. Device caches are transient and excluded from checkpoints.
-Within an update, sampled sequences share each queried field block and one query
-backward pass. Dynamic-position/angular gradient buffers are also transient;
-no shared query graph is saved or reused after a parameter/density update.
+Preparation binds selected fixed sequences directly and an optional genuine 30 FPS
+sweep subset. There is no fitted-coordinate input. `initial.npz` contains frozen
+pixel-pair scales; q starts at zero inside training. Original modal observation views
+remain complete and distinct from supervised sequences. Reference identity and
+operator checksum participate in preparation identity. Each frame keeps its PNG
+hash, authoritative static-scene camera, source index, timestamp and coefficient row.
 
-Shape neighborhoods and median incident edge lengths are derived from this same
-immutable unweighted graph. Their CPU/GPU adjacency caches are transient; no new
-reference file or artifact version is needed. `shape_radius_fraction` is recorded
-in training settings/run identity and the published coordinate settings. Children
-inherit the original root's fixed segment neighborhood and tolerance, not a new
-neighborhood around their parent. Checkpoint loading and publication reject centers
-outside that bound. A changed fraction or implementation requires a new work
-directory; original graph/path caches remain reusable.
+`operator.npz` has an explicit internal `version=2`: per-mode CSR `ptr [K,G+1]`
+(global entry offsets), `control [NNZ]`, float32 `weight [NNZ]` and unweighted
+canonical `lever [NNZ,3]`. A second CSR (`query_ptr [K,G+1]`, `query_root`,
+`query_weight`) preserves the original own/donor two-stage float32 sum order.
+Coalesced version-1 operators are rejected: reassociation can violate the original
+field tolerance. All modal weights/valid controls remain frequency specific.
+Preparation verifies both fields at original positions. No
+query graph, optimizer graph or dense `[K,G,C]` array is published.
 
-Scene v7 has fresh foreground/tensor identities and ranges, unchanged cameras
-and normalization, and explicit parent-scene/refinement provenance. A parent's
-manual partition remains provenance; it is not a partition of the new rows.
-Mode v19 stores final displacement/angular fields in the new foreground order,
-plus inherited observation roles and original Spectrum sources. It renders
-directly without reopening source GNN models. Reference overlays use a separate
-original-node index domain.
+All Gaussian tensors/order/counts and the original static identity remain exact.
+Mode v20 stores final complex64 `[K,G,3]` displacement and angular fields, original
+and final complex control fields, fixed operator, control validity, reference graph
+and inherited observation roles/alpha. It directly references the original scene;
+the parent manual partition remains valid because no rows change. Viewer renders
+the final fields, without expanding source GNN models. Spectrum retains original
+modal images; projection caches use the new completed-mode identity.
 
-Refined coordinates bind the new scene/modes and the original input PNG records.
-The old RGB/design artifacts are initialization provenance. Modal result v3 accepts
-multiple disjoint coordinate artifacts with identical scene/mode identities and
-mode order. Linear designs are required only for ordinary direct/RGB coordinates.
-Result v1/v2 is not read; materialize into a new directory and preserve old baselines.
-Publication checksums and identities are generated
-for the new outputs; old flow/reference manifests are never rewritten.
+Coordinates v5 bind original STATIC, new mode identity and exact input frames.
+Result v3 needs no linear design for these coordinates; ordinary direct/RGB paths
+retain their existing validation. All publications are atomic and immutable.
+Old scene-refinement v19 banks, preparation/coordinate v3 and carrier v4 are not
+silently upgraded. Retain files and baselines; prepare/run/materialize into new paths.
 
-`result evaluate` publishes an immutable sibling `evaluation/` directory containing
-`manifest.json`, `metrics.json` and `per_frame.csv`. Its identity binds the result,
-actual input PNG hashes, native-resolution metric protocol, implementation and
-dependency versions. Keep the pre-refinement result/evaluation beside a short
-baseline record; do not redirect or overwrite the old model/coordinate artifacts.
-Formal evaluation hashes source tensors, baked fields and each input image.
+Checkpoints contain control corrections, q and all Adam states, warmup-end anchor,
+warmup/joint/coefficient progress, sparse selections, permutations/cursors and RNG
+states. Save every 200 total updates and phase boundaries. Exact input/config/code/
+device identities gate resume. Detached baked GPU fields are transient and rebuilt
+after load; joint changes invalidate them. Non-finite loss or gradient leaves the
+last complete checkpoint and no final output. Gaussian tensors are checked unchanged
+at publication.
 
-`--resume` requires the same prepared identity, configuration, implementation
-revision and device. Checkpoints atomically contain all parameters, optimizer
-rows, mappings, density statistics, sampler cursors/permutations and RNG states;
-checkpoints also store round/phase, total/geometry/coefficient update counters,
-per-round sparse selections and exhaustive coefficient permutations. Save at every
-phase boundary and every 200 total updates. Old checkpoints fail the implementation
-contract. A coefficient phase keeps one detached complex64 `[K,G,3]` displacement/
-angular pair on GPU, excluded from checkpoints. Resume rebuilds it once; geometry
-changes invalidate it, and final publication uses it directly. Disk stage boundaries
-remain explicit. A failed run keeps
-the last complete checkpoint and does not publish a final bundle.
-
-Prepared/refined sequence records bind each coefficient row to its PNG hash,
-camera identity, original frame index and timestamp. Cameras remain authoritative
-in the scene. Sweep coordinates bind extraction metadata and their fixed-view
-normalization source, without flow/reference/FFT identities. All registered sweep
-frames must lie on a uniform extraction grid; sparse uniform strides retain their
-timestamps and adjust playback FPS; irregular grids and noninteger ratios are
-rejected. `fit-sweep --fps 30` selects before optimization. The pure
-`downsample-sweep` stage selects coefficient rows and all bindings from an existing
-artifact, records parent identity/selected rows and reports zero newly optimized
-frames. Source artifacts and PNGs remain unchanged. Bush selects rows 0,2,...,722
-from 724 frames at 60 FPS, producing 362 rows at 30 FPS; view1 remains 1170 rows at
-30 FPS. Never change only an FPS label. The mode bank still records the original
-three modal observation views, independent of which sequences supervise refinement.
+Standalone sweep RGB v1 and fixed RGB v2 remain fixed-mode baseline tools. They are
+not prerequisites for motion refinement. A 60-to-30 FPS sweep subset selects actual
+rows/images/cameras together (Bush: 724 to 362), never just changing an FPS label.
+Evaluation still hashes exact PNGs and renders at native resolution on valid support;
+save independent metrics/CSV and keep historical results untouched. No catalog is
+redirected by implementation or preparation. See COEFFICIENT_FITTING.md for the
+scientific equations and REBUILD.md for affected dependencies.

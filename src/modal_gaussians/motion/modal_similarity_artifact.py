@@ -134,7 +134,7 @@ def build_modal_similarity_graph_artifact(*, prepared_dir, geometry_graph_dir, v
         if (scene.get("foreground_identity") != source["foreground_identity"]
                 or scene.get("static_scene_identity") != source["static_scene_identity"]):
             raise ValueError("Prepared scene identity differs")
-        visible_subject = scene.get("partition", {}).get("method") == "manual_subject_selection_v1"
+        visible_subject = scene.get("partition", {}).get("method") == "manual_subject_selection_v3"
         cameras = {c.label: c for c in cameras_from_scene_manifest(scene) if c.role == "reference"}
         flows = {f["identity"]: f for f in prepared["flows"]}
         fields, masks, depths, alphas, selected_cameras, provenance = [], [], [], [], [], []

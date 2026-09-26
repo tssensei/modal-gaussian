@@ -24,7 +24,7 @@ def load_completed_modes(path, *, validate=False):
     if manifest.get("version") == 17:
         from modal_gaussians.coordinates.preparation import load_mode_bank
         return load_mode_bank(root, validate=validate)
-    if manifest.get("version") == 19:
+    if manifest.get("version") == 20:
         from modal_gaussians.coordinates.refinement_artifacts import load_refined_modes
         return load_refined_modes(root)
     if manifest.get("version") != 18:

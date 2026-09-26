@@ -159,6 +159,14 @@ def build_parser() -> argparse.ArgumentParser:
     static_commands = static_parser.add_subparsers(
         dest="static_command", required=True
     )
+    depth = static_commands.add_parser("prepare-depth", help="Publish posed DA3 depth from joint COLMAP; no training")
+    depth.add_argument("--input", required=True, type=Path)
+    depth.add_argument("--output", required=True, type=Path)
+    depth.add_argument("--model", required=True, type=Path, help="Local DA3 multi-view pretrained snapshot")
+    depth.add_argument("--python", required=True, type=Path, help="Python executable in the isolated DA3 environment")
+    depth.add_argument("--process-res", type=_positive_int, default=1008)
+    depth.add_argument("--chunk-size", type=_positive_int, default=16)
+    depth.add_argument("--confidence-percentile", type=float, default=10.)
     train = static_commands.add_parser(
         "train", help="Train and export a pure-tensor static 3DGS bundle"
     )
@@ -167,6 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--output", required=True, type=Path)
     train.add_argument("--iterations", type=_positive_int, default=3_000)
     train.add_argument("--batch-size", type=_positive_int, default=4)
+    train.add_argument("--depth", type=Path, help="Validated static prepare-depth artifact")
+    train.add_argument("--depth-weight", type=float, help="Depth L2 weight; 0.01 with --depth, otherwise 0")
+    train.add_argument("--depth-until-step", type=_positive_int, default=3000)
     train.add_argument("--num-fg", type=_positive_int, default=40_000)
     train.add_argument("--num-bg", type=_positive_int, default=80_000)
     train.add_argument("--seed", type=_non_negative_int, default=42)
@@ -321,20 +332,22 @@ def build_parser() -> argparse.ArgumentParser:
     sweep_subset.add_argument("--input", required=True, type=Path)
     sweep_subset.add_argument("--output", required=True, type=Path)
     sweep_subset.add_argument("--fps", type=float, default=30)
-    refinement_prepare = coordinates_commands.add_parser("prepare-refinement", help="Freeze reference graph and validate RGB initialization")
+    refinement_prepare = coordinates_commands.add_parser("prepare-refinement", help="Prepare fixed interpolation and zero-start video bindings")
     refinement_prepare.add_argument("--scene", required=True, type=Path)
     refinement_prepare.add_argument("--modes", required=True, type=Path)
-    refinement_prepare.add_argument("--coordinates", required=True, action="append", type=Path)
     refinement_prepare.add_argument("--output", required=True, type=Path)
     refinement_prepare.add_argument("--view", action="append")
-    refinement_prepare.add_argument("--sweep-coordinates", type=Path)
+    refinement_prepare.add_argument("--sweep-metadata", type=Path)
     refinement_prepare.add_argument("--reference", type=Path)
-    refinement_fit = coordinates_commands.add_parser("refine-scene", help="Joint foreground and per-recording coefficient refinement")
+    refinement_prepare.add_argument("--device", default="cuda")
+    refinement_fit = coordinates_commands.add_parser("refine-motion", help="Refine control motion and coefficients with the entire scene fixed")
     refinement_fit.add_argument("--prepared", required=True, type=Path)
     refinement_fit.add_argument("--config", type=Path)
     refinement_fit.add_argument("--work-dir", required=True, type=Path)
     refinement_fit.add_argument("--output", required=True, type=Path)
     refinement_fit.add_argument("--resume", action="store_true")
+    refinement_fit.add_argument("--flow-initialization", type=Path,
+        help="Use a reference-flow diagnostic's fixed-view prefix and coefficients; skip zero-q warmup")
     refinement_fit.add_argument("--device", default="cuda")
     result_parser = command_parsers.add_parser(
         "result", help="Bind one immutable static/mode/coordinate result"
@@ -510,6 +523,13 @@ def _dispatch(
             print(f"cameras: {(output / 'cameras.json').resolve()}")
             print(f"point cloud: {(output / 'point_cloud.ply').resolve()}")
             return 0
+        if args.command == "static" and args.static_command == "prepare-depth":
+            from modal_gaussians.geometry.depth import DepthConfig, prepare_depth
+            output = prepare_depth(input_dir=args.input, output_dir=args.output, model_dir=args.model,
+                python=args.python, config=DepthConfig(process_res=args.process_res, chunk_size=args.chunk_size,
+                                                      confidence_percentile=args.confidence_percentile))
+            print(f"static depth: {output}")
+            return 0
         if args.command == "static" and args.static_command == "train":
             from modal_gaussians.geometry.training import StaticTrainConfig, run_static_training
 
@@ -517,9 +537,12 @@ def _dispatch(
                 input_dir=args.input,
                 work_dir=args.work_dir,
                 output_dir=args.output,
+                depth_dir=args.depth,
                 config=StaticTrainConfig(
                     iterations=int(args.iterations),
                     batch_size=int(args.batch_size),
+                    depth_weight=(args.depth_weight if args.depth_weight is not None else (.01 if args.depth else 0.)),
+                    depth_until_step=args.depth_until_step,
                     num_foreground=int(args.num_fg),
                     num_background=int(args.num_bg),
                     seed=int(args.seed),
@@ -697,19 +720,20 @@ def _dispatch(
         if args.command == "coordinates" and args.coordinates_command == "prepare-refinement":
             from modal_gaussians.coordinates.refinement_artifacts import prepare_refinement
             output = prepare_refinement(scene_dir=args.scene, completed_modes_dir=args.modes,
-                coordinates_dirs=args.coordinates, output_dir=args.output, view_labels=args.view,
-                sweep_coordinates_dir=args.sweep_coordinates, reference_dir=args.reference)
+                output_dir=args.output, view_labels=args.view,
+                sweep_metadata=args.sweep_metadata, reference_dir=args.reference, device=args.device)
             print(f"Refinement inputs prepared: {output}")
             return 0
-        if args.command == "coordinates" and args.coordinates_command == "refine-scene":
+        if args.command == "coordinates" and args.coordinates_command == "refine-motion":
             from dataclasses import fields
-            from modal_gaussians.coordinates.refinement import RefinementConfig, refine_scene
+            from modal_gaussians.coordinates.refinement import RefinementConfig, refine_motion
             payload = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
             if not isinstance(payload, dict) or set(payload) - {f.name for f in fields(RefinementConfig)}:
                 raise ValueError("Refinement config must contain only RefinementConfig fields")
-            output = refine_scene(prepared_dir=args.prepared, config=RefinementConfig(**payload),
-                work_dir=args.work_dir, output_dir=args.output, resume=args.resume, device=args.device)
-            print(f"Refined scene bundle: {output}")
+            output = refine_motion(prepared_dir=args.prepared, config=RefinementConfig(**payload),
+                work_dir=args.work_dir, output_dir=args.output, resume=args.resume, device=args.device,
+                flow_initialization=args.flow_initialization)
+            print(f"Refined motion bundle: {output}")
             return 0
         if args.command == "result" and args.result_command == "materialize":
             from modal_gaussians.results.artifact import materialize_modal_result

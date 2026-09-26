@@ -146,16 +146,16 @@ class ViewerCamera:
 
 
 def _completed_mode_display_roles(manifest, arrays):
-    if manifest.get('version') not in (18, 17, 19):
+    if manifest.get('version') not in (18, 17, 20):
         raise ValueError('Unsupported model for Viewer')
     support, phi = np.asarray(arrays['support_class']), np.asarray(arrays['phi'])
     if (phi.ndim != 3 or phi.shape[2] != 3 or support.shape != phi.shape[:2]
             or support.dtype.kind not in 'iu' or np.any((support < 0) | (support > 3))):
         raise ValueError('Invalid support classes')
-    if manifest.get('version') == 19:
+    if manifest.get('version') == 20:
         return np.asarray([2,0,1,3], np.int8)[support], tuple('inherited ' + name for name in NEURAL_SUPPORT_DISPLAY_NAMES) + ('inherited propagated',), (
             '**Inherited mode sources:** blue = supervised source | green = inferred source | '
-            'purple = unresolved | yellow = donor source. Refined points have no new modal supervision.')
+            'purple = unresolved | yellow = donor source. Control fields were refined by RGB; modal observations are inherited.')
     return np.asarray([2,0,1,3], np.int8)[support], NEURAL_SUPPORT_DISPLAY_NAMES + ('propagated',), (
         '**Role colors:** directly supervised = blue | structure inferred = green | '
         'unresolved = purple | propagated = yellow')
@@ -294,7 +294,7 @@ class ModalViewerData:
         self._load_graph_display(0)
         self.projections = None
         self.spectrum = None
-        if with_spectrum and all("selected_modal_supervision" in m.artifact.manifest or m.artifact.manifest.get("version") in (17, 19) for m in modes):
+        if with_spectrum and all("selected_modal_supervision" in m.artifact.manifest or m.artifact.manifest.get("version") in (17, 20) for m in modes):
             self.projections = ViewerProjections(self.result, work_dir)
             self.spectrum = SpectrumComparisonController(self.result, projections=self.projections)
         self.gpu_lock = self.projections.gpu_lock if self.projections else threading.RLock()
@@ -324,13 +324,13 @@ class ModalViewerData:
         completed = self.result.modes[mode_index].artifact
         self.structure_graph = None
         self.reference_graph_points = None
-        if completed.manifest.get("version") == 19:
+        if completed.manifest.get("version") == 20:
             self.reference_graph_points = completed.arrays["reference_points"]
             self.graph_edge_gaussian_index = completed.arrays["reference_edges"]
             self.graph_edge_colors = np.tile(np.array([[.3, .7, .9]], np.float32), (len(self.graph_edge_gaussian_index), 1))
             self.graph_mode_index = mode_index
             self.graph_edge_colors_by_mode = None
-            self.graph_legend = '**Fixed motion reference graph:** original canonical nodes; independent of refined Gaussian indices.'
+            self.graph_legend = '**Fixed motion reference graph:** original canonical nodes and unchanged Gaussian order.'
             return
         self.graph_edge_gaussian_index, self.graph_edge_colors = _neural_graph_display(
             completed.arrays, self.scene.foreground.count)
@@ -784,8 +784,8 @@ class ModalViserViewer:
         """Build RGB, projected phase, and observation-support color controls."""
 
         with self.server.gui.add_folder("Gaussian color"):
-            if any(m.artifact.manifest.get("version") == 19 for m in self.data.result.modes):
-                self.server.gui.add_markdown("Observation counts and roles are inherited from the original mode sources; refined points have no new modal supervision.")
+            if any(m.artifact.manifest.get("version") == 20 for m in self.data.result.modes):
+                self.server.gui.add_markdown("Observation counts and roles are inherited from the original mode sources; control fields have RGB refinement, with inherited modal observations.")
             self.color_mode = self.server.gui.add_dropdown(
                 "Render color mode",
                 options=((COLOR_RGB, COLOR_PHASE, COLOR_OBSERVATIONS) if self.data.spectrum is not None
