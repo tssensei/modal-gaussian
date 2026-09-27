@@ -31,6 +31,24 @@ from modal_gaussians.geometry.depth import DepthTargets, depth_l2
 _IMAGE_CACHE_BYTES = 2 * 1024**3
 
 
+def _validate_time_budget(seconds: float | None, milestones: Sequence[float], *, resume: bool = False) -> tuple[float, ...]:
+    """Wall-clock limits are execution controls, independent of scientific config."""
+    values = tuple(float(value) for value in milestones)
+    if seconds is None:
+        if values:
+            raise ValueError("Time milestones require --time-budget-seconds")
+        return values
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("time_budget_seconds must be finite and positive")
+    if resume:
+        raise ValueError("Wall-clock budget runs require a fresh work directory; budget resume is unsupported")
+    if any(not math.isfinite(value) or value <= 0 or value > seconds for value in values):
+        raise ValueError("Time milestones must be finite, positive and within the requested budget")
+    if values != tuple(sorted(set(values))):
+        raise ValueError("Time milestones must be strictly increasing")
+    return values
+
+
 @dataclass(frozen=True)
 class StaticTrainConfig:
     """Hold the intentionally small accepted static-training configuration."""
@@ -276,6 +294,7 @@ class StaticTrainer:
         self.started_at = time.time()
         self.image_cache: OrderedDict[str, Tensor] = OrderedDict()
         self.image_cache_bytes = 0
+        self.training_timing: dict[str, Any] | None = None
 
     def elapsed_seconds(self) -> float:
         """Return active training-process time accumulated across resume boundaries."""
@@ -765,10 +784,13 @@ class StaticTrainer:
         if torch.cuda.is_available() and "torch_cuda" in state:
             torch.cuda.set_rng_state_all(state["torch_cuda"])
 
-    def save_resume(self) -> Path:
+    def save_resume(self, path: Path | None = None) -> Path:
         """Atomically save model, optimizer, density, progress, and RNG state."""
 
-        path = self.work_dir / "resume.pt"
+        if path is None:
+            path = self.work_dir / "resume.pt"
+        elif path.exists() or path.is_symlink():
+            raise FileExistsError(f"Immutable checkpoint already exists: {path}")
         payload = {
             "format": "modal_gaussians.static_training_resume",
             "version": 4,
@@ -832,19 +854,55 @@ class StaticTrainer:
         self.started_at = time.time()
         self._restore_rng_state(payload["rng_state"])
 
-    def train(self) -> dict[str, Any]:
-        """Run or resume the exact configured update budget and leave an end-state checkpoint."""
+    def train(self, *, time_budget_seconds: float | None = None,
+              time_milestones_seconds: Sequence[float] = ()) -> dict[str, Any]:
+        """Run the update limit or stop a fresh budget run at a complete update."""
 
+        milestones = _validate_time_budget(time_budget_seconds, time_milestones_seconds,
+                                           resume=self.global_step != 0)
+        timed = time_budget_seconds is not None
         self.scene.train()
         progress = Progress(
             "static train", self.config.iterations,
             unit="steps", initial=self.global_step,
         )
-        while self.global_step < self.config.iterations:
+        def synchronize():
+            if timed and self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+
+        timing = None
+        if timed:
+            synchronize()
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
+            timing = {"format": "gaussian_training_timing", "version": 1, "method": "static",
+                "requested_budget_seconds": time_budget_seconds, "requested_milestones_seconds": list(milestones),
+                "configured_iterations": self.config.iterations,
+                "initialization_seconds": None, "publication_seconds": None, "end_to_end_seconds": None,
+                "optimization_seconds": 0.0, "density_seconds": 0.0,
+                "periodic_checkpoint_seconds": 0.0, "milestone_checkpoint_seconds": 0.0,
+                "initial_gaussians": self.scene.count, "milestones": [],
+                "timing_scope": "perf_counter from first sampling through complete updates, density, in-loop checkpoints, milestones and logging; CUDA synchronized; final save/publication excluded; component timers are not an additive decomposition"}
+        training_started = time.perf_counter() if timed else None
+
+        def periodic_checkpoint():
+            if timed:
+                synchronize()
+                start = time.perf_counter()
+            self.save_resume()
+            if timed:
+                synchronize()
+                timing["periodic_checkpoint_seconds"] += time.perf_counter()-start
+
+        stopped_for_time = False
+        while self.global_step < self.config.iterations and not stopped_for_time:
             if self.current_batches is None:
                 self.current_batches = self._make_epoch_batches()
                 self.next_batch_index = 0
             while self.next_batch_index < len(self.current_batches) and self.global_step < self.config.iterations:
+                if timed:
+                    synchronize()
+                    optimization_started = time.perf_counter()
                 self.scene.sh_degree = min((self.global_step + 1) // 1000, 3)
                 batch = self.current_batches[self.next_batch_index]
                 cameras, targets = self._load_batch(
@@ -865,9 +923,16 @@ class StaticTrainer:
                 self.global_step += 1
                 self.next_batch_index += 1
                 self._update_epoch_accumulator(stats)
+                if timed:
+                    synchronize()
+                    timing["optimization_seconds"] += time.perf_counter()-optimization_started
+                    density_started = time.perf_counter()
                 self._run_density_control()
+                if timed:
+                    synchronize()
+                    timing["density_seconds"] += time.perf_counter()-density_started
                 if self.global_step % self.config.checkpoint_every_steps == 0:
-                    self.save_resume()
+                    periodic_checkpoint()
                 progress.update(
                     self.global_step,
                     f"epoch={self.epoch + 1} "
@@ -879,24 +944,72 @@ class StaticTrainer:
                     f"fg={self.scene.foreground.count} bg={self.scene.background.count}",
                     force=self.next_batch_index == len(self.current_batches),
                 )
-            summary = self._finish_epoch()
-            self.save_resume()
-            report_progress(
-                "static epoch "
-                f"{summary['epoch'] + 1}: "
-                f"loss={summary['loss']:.6f}, "
-                f"psnr={summary['psnr']:.3f}, "
-                f"fg={summary['foreground_gaussians']}, "
-                f"bg={summary['background_gaussians']}"
-            )
+                if timed:
+                    # A complete epoch belongs to this update's timed boundary.
+                    if self.next_batch_index == len(self.current_batches):
+                        summary = self._finish_epoch()
+                        periodic_checkpoint()
+                        report_progress(f"static epoch {summary['epoch'] + 1}: loss={summary['loss']:.6f}")
+                    synchronize()
+                    for milestone_index, requested in enumerate(milestones):
+                        if milestone_index < len(timing["milestones"]) or time.perf_counter()-training_started < requested:
+                            continue
+                        actual = time.perf_counter()-training_started
+                        path = self.work_dir / "time_milestones" / f"milestone_{milestone_index:03d}.pt"
+                        save_started = time.perf_counter()
+                        self.save_resume(path)
+                        synchronize()
+                        checkpoint_hash = _sha256_file(path)
+                        save_seconds = time.perf_counter()-save_started
+                        timing["milestone_checkpoint_seconds"] += save_seconds
+                        record = {"requested_seconds": requested, "actual_seconds": actual,
+                            "save_completed_seconds": time.perf_counter()-training_started,
+                            "actual_updates": self.global_step, "checkpoint_path": str(path.resolve()),
+                            "checkpoint_sha256": checkpoint_hash, "save_seconds": save_seconds}
+                        _atomic_json_write(record, path.with_suffix(".json"))
+                        timing["milestones"].append(record)
+                    synchronize()
+                    stopped_for_time = time.perf_counter()-training_started >= time_budget_seconds
+                    if stopped_for_time or self.current_batches is None:
+                        break
+            if not timed:
+                summary = self._finish_epoch()
+                self.save_resume()
+                report_progress(
+                    "static epoch "
+                    f"{summary['epoch'] + 1}: "
+                    f"loss={summary['loss']:.6f}, "
+                    f"psnr={summary['psnr']:.3f}, "
+                    f"fg={summary['foreground_gaussians']}, "
+                    f"bg={summary['background_gaussians']}"
+                )
         # A checkpoint may have been saved after the last update but before its
         # partial-epoch summary was finalized.
-        if self.epoch_accumulator["batch_count"]:
+        if not timed and self.epoch_accumulator["batch_count"]:
             self._finish_epoch()
+        if timed:
+            synchronize()
+            timing.update(training_seconds=time.perf_counter()-training_started,
+                actual_updates=self.global_step,
+                stop_reason="time_budget" if stopped_for_time else "iteration_limit",
+                final_gaussians=self.scene.count,
+                peak_cuda_allocated_bytes=torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else 0,
+                peak_cuda_reserved_bytes=torch.cuda.max_memory_reserved(self.device) if self.device.type == "cuda" else 0,
+                density_events=self.density_events)
+            timing["time_overshoot_seconds"] = max(0.0, timing["training_seconds"]-time_budget_seconds)
+            final_save_started = time.perf_counter()
         self.scene.eval()
         self.save_resume()
-        final = self.epoch_summaries[-1]
-        return {
+        if timed:
+            synchronize()
+            timing["final_save_seconds"] = time.perf_counter()-final_save_started
+            self.training_timing = timing
+            _atomic_json_write(timing, self.work_dir / "training_timing.json")
+        count = self.epoch_accumulator["batch_count"]
+        final = ({name: self.epoch_accumulator[name+"_sum"]/count
+                  for name in ("loss", "rgb_loss", "depth_loss", "psnr", "ssim")}
+                 if count else self.epoch_summaries[-1])
+        result = {
             "epoch": self.epoch,
             "global_step": self.global_step,
             "final_loss": final["loss"],
@@ -905,6 +1018,11 @@ class StaticTrainer:
             "final_psnr": final["psnr"],
             "final_ssim": final["ssim"],
         }
+        if timed:
+            result.update(end_reason=timing["stop_reason"], actual_updates=self.global_step,
+                configured_iterations=self.config.iterations,
+                execution_timing=str((self.work_dir / "training_timing.json").resolve()))
+        return result
 
 
 def _runtime_information(device: torch.device) -> dict[str, Any]:
@@ -1040,7 +1158,7 @@ def export_static_bundle(
             "density_events": trainer.density_events,
             "runtime": _runtime_information(trainer.device),
             "elapsed_seconds": trainer.elapsed_seconds(),
-            "end_reason": "configured_iterations_completed",
+            "end_reason": training_result.get("end_reason", "configured_iterations_completed"),
         }
         (temporary_root / "training_summary.json").write_text(
             json.dumps(summary, indent=2) + "\n", encoding="utf-8"
@@ -1076,9 +1194,13 @@ def run_static_training(
     resume: bool = False,
     device: str | torch.device | None = None,
     depth_dir: str | Path | None = None,
+    time_budget_seconds: float | None = None,
+    time_milestones_seconds: Sequence[float] = (),
 ) -> Path:
     """Validate inputs, train/resume and export; QA uses the explicit render command."""
 
+    milestones = _validate_time_budget(time_budget_seconds, time_milestones_seconds, resume=resume)
+    overall_started = time.perf_counter() if time_budget_seconds is not None else None
     config = StaticTrainConfig() if config is None else config
     config.validate()
     output_dir = Path(output_dir).expanduser().resolve()
@@ -1142,9 +1264,20 @@ def run_static_training(
             depth_targets=depth_targets,
         )
         trainer.save_resume()
-    result = trainer.train()
+    if time_budget_seconds is None:
+        result = trainer.train()
+    else:
+        torch.cuda.synchronize(selected_device)
+        initialization_seconds = time.perf_counter()-overall_started
+        result = trainer.train(time_budget_seconds=time_budget_seconds, time_milestones_seconds=milestones)
+        trainer.training_timing["initialization_seconds"] = initialization_seconds
     report_progress("static: exporting trained bundle")
+    publication_started = time.perf_counter() if time_budget_seconds is not None else None
     bundle = export_static_bundle(trainer, output_dir, result)
+    if time_budget_seconds is not None:
+        trainer.training_timing.update(publication_seconds=time.perf_counter()-publication_started,
+            end_to_end_seconds=time.perf_counter()-overall_started)
+        _atomic_json_write(trainer.training_timing, work_dir / "training_timing.json")
     return bundle
 
 

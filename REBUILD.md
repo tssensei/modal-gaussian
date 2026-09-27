@@ -1,5 +1,45 @@
 # Cleanup and required rebuilds — 2026-09-23
 
+## Independent Adaptive benchmark evaluation — 2026-09-26
+
+Phase 4 adds explicit native render adapters and common metric/review exports in
+`tools/`. Phase 1 datasets and Phase 3 model checkpoints remain reusable and
+unchanged. Render manifests bind cameras, normalized model times, source files
+and implementation hashes. Adapter/metric interpretation changes require fresh
+render/evaluation outputs, not retraining or identity edits. Frozen snapshots are
+diagnostics; no static import, catalog redirect or mainline downstream rebuild
+is performed by evaluation.
+
+## Explicit static/Adaptive wall-clock control — 2026-09-26
+
+`static train` adds optional execution-only time budgets and milestone checkpoints.
+It preserves RGB/depth objectives, LR/density clocks, existing v4 resume layout
+and scene v5 publication. Partial-epoch stopping preserves sampler state. Timing
+reports are independent `gaussian_training_timing` v1 artifacts. The training.py
+implementation hash changes: earlier static checkpoints need their original code,
+not rewritten identities. Published scenes, SfM/depth/motion ancestors and Phase 1
+common inputs remain reusable; this change alone requests no upstream rebuild.
+
+The external Adaptive checkout receives corresponding budget/atomic-save changes,
+exact iteration stopping and suppressed image reports for budgeted runs. Its
+snapshots are loadable model/Adam states, not exact resumes. Both budget modes
+start fresh; continuous milestones provide multiple budgets. Real smoke runs are
+recorded separately and do not establish reconstruction/deblurring quality.
+
+## Independent Adaptive SfM benchmark preparation — 2026-09-26
+
+The explicit tools `prepare_adaptive_sfm.py` and `verify_adaptive_sfm.py` add a
+common undistorted input/split boundary for an external-method comparison. They
+do not change mainline kernels, scene formats, training defaults or catalog aliases.
+Raw/registered SfM, depth, existing scenes, modes and coefficients remain intact
+and reusable for their original experiments. Preparation creates new pixel/camera
+identities and a training-only static dataset: old depth targets and static
+checkpoints cannot be reused for this benchmark. Future benchmark training and
+evaluation must bind these new inputs and the explicit split. Importing a trained
+Adaptive snapshot and rebuilding its downstream motion products are later,
+separately requested phases. Preparation or loader/GPU synthetic checks alone do
+not establish reconstruction quality.
+
 ## Explicit frozen-motion sweep scene refinement — 2026-09-26
 
 The experiment driver additionally supports explicitly authorized early stopping

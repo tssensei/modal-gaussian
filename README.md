@@ -139,6 +139,10 @@ Its reference-only solution can explicitly initialize motion refinement with
 the diagnostic's fixed-view prefix, preserves its shared offset and normalization,
 and skips zero-q warmup. See the reconstruction document for validation/recovery.
 
+The [Bush uniform/greedy 20/40/60-frequency experiment](docs/bush-frequency-selection-20260926.md)
+records the 2026-09-26 original 2D modal-image flow-capacity comparison, its
+reproduction inputs and in-sample limitations. It does not change the production recipe.
+
 | Stage | Command |
 | --- | --- |
 | Inspect registered paths | `storage list`, `storage path`, `storage run` |
@@ -179,6 +183,23 @@ best state and publishes it on plateau or budget exhaustion; it is disabled by
 default. This measures training-set convergence, not held-out quality.
 
 ## Environment and checks
+
+For the independent Adaptive Spatio-Temporal Gaussians comparison from SfM,
+`tools/prepare_adaptive_sfm.py` prepares common centered, undistorted sweep inputs
+and a shared train/test split. `tools/verify_adaptive_sfm.py` checks both projects'
+actual data loaders, pixels, poses and point clouds without training. This is an
+explicit benchmark preparation tool, not an extra default pipeline stage.
+See [Phase 1 instructions](docs/adaptive-sfm-phase1-20260926.md) and
+[Phase 2 time-budget protocol](docs/adaptive-sfm-phase2-20260926.md).
+After explicit benchmark training, [Phase 4](docs/adaptive-sfm-phase4-20260926.md)
+uses independent native render workers and the existing common metric kernel to
+compare held-out frames and preselected frozen-time snapshots. It does not train
+models or import a new static scene.
+`static train --time-budget-seconds SECONDS --time-milestones-seconds MILESTONE`
+stops at a complete update boundary and saves the actual state. These optional
+execution limits preserve the iteration/LR/density schedule, require fresh work
+and do not launch evaluation. Reports separate initialization/final saving/
+publication from training and record any time overshoot.
 
 Use the project's CUDA-capable Python environment (Python >=3.11, PyTorch,
 CUDA/gsplat, CuPy). Install the package with `python -m pip install -e .` after

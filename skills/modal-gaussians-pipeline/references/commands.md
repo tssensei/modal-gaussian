@@ -27,6 +27,13 @@ Static training uses RGB L1 + 0.2 DSSIM plus depth L2 when supplied, without mas
 `--mask-weight` option. Masks remain required for initial point classification.
 Use a new work directory for earlier static checkpoints (current resume v4).
 
+For an explicitly requested wall-clock experiment, keep the intended maximum
+iteration schedule and add `--time-budget-seconds SECONDS`, optionally
+`--time-milestones-seconds T1 T2`. This requires fresh work (no `--resume`), saves
+at complete update/density boundaries and reports actual time/overshoot in
+`WORK/training_timing.json`. It does not automatically evaluate or export video.
+See [the paired benchmark protocol](../../../docs/adaptive-sfm-phase2-20260926.md).
+
 For a deliberately RGB-only run omit `--depth`, `--depth-weight` and the depth
 preparation stage. Missing/incompatible requested depth is an error, never a fallback.
 DA3 requires a separate CUDA Python environment because upstream pins NumPy < 2
@@ -114,7 +121,7 @@ modal-gaussians motion iterate-neural --prepared FREQUENCY_PREPARED --geometry-g
 Mode output is bound by `EXPERIMENT/status.json`. Shared control geometry is created
 or reused automatically. Never use a soft graph from another frequency. To proceed
 to video reconstruction, follow [COEFFICIENT_FITTING.md](../../../COEFFICIENT_FITTING.md)
-only when requested. See [recovery](validation-recovery.md) for resume semantics.
+for the full-pipeline endpoint. See [recovery](validation-recovery.md) for resume semantics.
 
 ## Optional fixed-scene motion refinement (separate authorization)
 
@@ -139,8 +146,8 @@ Preparation does not train. The trainer freezes the complete Gaussian scene, sta
 q at zero with ten in-run warmup passes, then refines control fields/q. Omit sweep
 metadata for fixed views only. It consumes no pre-fitted RGB coordinates and writes
 no new scene. Current sources can omit `--reference`; v16 needs the explicit
-validated importer. This pipeline skill does not itself authorize fitting/refinement,
-evaluation, export or Viser. See COEFFICIENT_FITTING.md for all contracts.
+validated importer. A full-pipeline request includes fitting/refinement, evaluation and export; Viser
+is prepared but not launched unless requested. See COEFFICIENT_FITTING.md for all contracts.
 
 For an explicitly requested flow-initialized run, add `--flow-initialization
 DIAGNOSTIC_ROOT` to `refine-motion`. It uses only the reference-only diagnostic's
@@ -150,7 +157,8 @@ same diagnostic source. This does not change the default zero-start recipe.
 
 ## Optional frozen-motion sweep scene refinement
 
-Only append this stage when explicitly requested.
+Only append this stage when explicitly requested; the default endpoint remains
+joint motion/coefficient refinement plus Viser-ready reconstruction delivery.
 
 ```sh
 modal-gaussians static refine-scene --scene STATIC --modes REFINED/mode_bank --coordinates SWEEP_COORDINATES --motion fitted --config configs/scene_refinement.json --work-dir EXP/work --output EXP/published

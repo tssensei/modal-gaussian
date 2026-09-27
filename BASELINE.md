@@ -1,5 +1,42 @@
 # Current numerical recipe
 
+## Provisional Bush motion-refinement baseline — 2026-09-26
+
+The user selected **greedy20 RGB-only motion refinement, published step 7000**
+as the current comparison baseline. Use this result and recipe for subsequent
+Bush refinement experiments unless explicitly overridden. The user saw no obvious
+visual difference from the preceding regularized run; acceptance is provisional,
+not a claim of improved 3D geometry or rigidity. Scope: view1 frames 0–299,
+30 FPS, 960x540, the same 20 greedy-selected modes and unchanged static scene.
+
+- Experiment: `scene_library/bush/experiments/greedy20_rgb_only_20260926_001/`.
+- Published result: `result_refined/`; fields: `refined/mode_bank/`;
+  coefficients: `refined/coordinates/`. These three belong together.
+- Exact settings: `motion_refinement.json` in that experiment. Objective is
+  `0.8 * L1 + 0.2 * (1 - SSIM)` on valid support. `field_anchor_weight`,
+  `anchor_weight`, `rigidity_weight` and `rotation_weight` are all **0**.
+- Control LR: **0.003 -> 0.0001**, exponential on the joint-update clock;
+  coefficient LR: **0.002 -> 0.0001**, linear on the post-warmup total clock.
+  Alternate sparse joint updates with exhaustive coefficient passes; Gaussian
+  attributes, cameras, control positions, propagation and correction gauge stay fixed.
+- Start a fresh run from the matching original greedy20 fields and validated
+  reference-only flow initialization (shared pose offset retained, zero-q warmup
+  skipped). This baseline did not resume the previous refined checkpoint.
+- Budget: 20 rounds, 50 joint + 300 coefficient updates per round. Early stopping
+  checks full-sequence RGB at interior joint intervals of 25 and coefficient-pass
+  ends, with patience 5 and relative improvement threshold 0.001. Actual/best
+  step **7000** (1000 joint + 6000 coefficient); stopped at the budget limit.
+- Valid-support frame-mean metrics: **24.435157 dB PSNR**, **0.814252 SSIM**,
+  **0.060273 RMSE**. LPIPS was not computed because local pretrained weights
+  were unavailable. Metrics measure fitting on the supervised 300 frames.
+- `RUN_REPORT.md` records comparisons and verification; `delivery/` contains
+  original/before/after videos; `VISER_COMMANDS.ps1` provides viewer commands.
+
+This supersedes the older flow-only result below as the current refined-result
+comparison target, while preserving flow initialization and historical artifacts.
+It records an experiment baseline; repository-wide config defaults and catalog
+aliases are unchanged. No retraining or artifact rebuild is required to adopt it.
+
 ## Accepted coefficient visual baseline — 2026-09-25
 
 The user selected **reference-only flow coordinates + one shared reference-frame
@@ -114,6 +151,13 @@ batch padding, device and dtype. Static training requests expected depth only
 while depth supervision is active; normal scene/depth render calls retain depth. Caching is an execution
 optimization; removal of mask supervision is a separate loss change.
 Caches are transient and are rebuilt lazily after restoring a checkpoint.
+
+For explicit time-budget experiments, `static train` accepts
+`--time-budget-seconds` and optional `--time-milestones-seconds`. These execution
+limits preserve the numerical recipe above. Keep the intended iteration cap;
+time limits do not rescale LR/density clocks. Budgeted runs start fresh and record
+actual updates, training time and overshoot, with initialization/final saving/
+publication separate. See the [timing protocol](docs/adaptive-sfm-phase2-20260926.md).
 
 ### COLMAP-conditioned DA3 depth supervision
 

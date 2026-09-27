@@ -93,7 +93,38 @@ The path resolver stays because current immutable data depends on relocation.
 It does not load removed model/flow schemas. [REBUILD.md](REBUILD.md) lists the
 pre-cleanup artifacts that now require new outputs.
 
+## Independent Adaptive SfM benchmark inputs
+
+Independent Adaptive SfM benchmark inputs use
+`modal_gaussians.adaptive_sfm_benchmark` v1, published atomically into a new
+experiment's `data/`. `dataset_adaptive/` has all sweep frames, numeric flat names,
+centered SIMPLE_PINHOLE cameras and an explicit SfM PLY; `dataset_static_train/`
+has only training frames with byte-identical RGB and equivalent SIMPLE_RADIAL
+cameras with k=0. `frame_mapping.json` preserves source indices/timestamps/hashes,
+and `split.json` records exact train/test membership. The manifest binds source
+and output hashes, derivation and producer implementation. All original SfM XYZ/RGB
+are retained, even when filtering observations leaves empty tracks; this is an
+initialization dataset, not a newly solved SfM model. Original fixed-reference
+images do not participate in RGB training, but their contribution to the shared
+ancestor SfM is recorded. Environment logs and independent verification reports
+live beside `data/`, never modify it, and do not make it a trained scene/result.
+
+Phase 4 benchmark render artifacts use explicit v1 manifests with checkpoint,
+camera/time/input identities and per-file hashes. Native float32 RGB arrays are
+metric inputs; PNG/video files are previews. Independent evaluation artifacts
+bind all render manifests and the common metric protocol. Frozen-time residuals
+are labeled separately from matched-time reconstruction. These experiment files
+are not mainline modal results or imported static scenes.
+
 ## SH static scene artifacts
+
+Optional static time budgets write `gaussian_training_timing` v1 execution reports
+to `WORK/training_timing.json`, separately from immutable scene publication.
+Milestones save complete checkpoints with capture/save-completion times and
+actual update counts; their I/O is included in training time. The resume tensor
+layout stays v4 and scene publication stays v5; budget metadata is not a new
+Gaussian representation. Time-budget plus resume is rejected. A stopped partial
+epoch retains its batches/cursor/accumulator for ordinary matching-code recovery.
 
 Current static scene versions are **v5** (trained base), **v6** (repartitioned or
 manually selected), and **v8** (frozen-motion sweep scene refinement). Historical

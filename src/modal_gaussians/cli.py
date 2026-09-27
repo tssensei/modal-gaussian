@@ -174,6 +174,10 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--work-dir", required=True, type=Path)
     train.add_argument("--output", required=True, type=Path)
     train.add_argument("--iterations", type=_positive_int, default=3_000)
+    train.add_argument("--time-budget-seconds", type=_positive_float,
+                       help="Fresh runs only: stop after a complete update when this training wall time is reached")
+    train.add_argument("--time-milestones-seconds", type=_positive_float, nargs="*", default=[],
+                       help="Increasing times within the budget for immutable full checkpoints")
     train.add_argument("--batch-size", type=_positive_int, default=4)
     train.add_argument("--depth", type=Path, help="Validated static prepare-depth artifact")
     train.add_argument("--depth-weight", type=float, help="Depth L2 weight; 0.01 with --depth, otherwise 0")
@@ -558,6 +562,8 @@ def _dispatch(
                     max_background_gaussians=int(args.max_bg_gaussians),
                 ),
                 resume=bool(args.resume),
+                time_budget_seconds=args.time_budget_seconds,
+                time_milestones_seconds=args.time_milestones_seconds,
             )
             print(f"static scene: {output.resolve()}")
             print(f"manifest: {(output / 'manifest.json').resolve()}")
