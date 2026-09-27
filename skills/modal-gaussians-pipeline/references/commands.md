@@ -118,6 +118,17 @@ only when requested. See [recovery](validation-recovery.md) for resume semantics
 
 ## Optional fixed-scene motion refinement (separate authorization)
 
+For an explicitly requested coefficient-only sweep fit with frozen refined modes:
+
+```sh
+modal-gaussians coordinates fit-sweep --scene STATIC --modes REFINED/mode_bank --scale-source REFINED/coordinates --metadata SWEEP_METADATA --config RGB_CONFIG --output EXP/sweep_coordinates --fps 30
+modal-gaussians result materialize --scene STATIC --modes REFINED/mode_bank --coordinates EXP/sweep_coordinates --output EXP/result
+```
+
+The scale source must be a matching single fixed-view RGB/refined fit. Sweep q
+starts independently; no motion refinement runs. Use zero initial/final anchor
+weights in RGB_CONFIG for RGB-only fitting.
+
 ```sh
 modal-gaussians coordinates prepare-refinement --scene STATIC --modes BANK20 --view view1 --sweep-metadata SWEEP_METADATA --reference MOTION_REFERENCE --output EXP/prepared
 modal-gaussians coordinates refine-motion --prepared EXP/prepared --config configs/motion_refinement.json --work-dir EXP/work --output EXP/refined
@@ -136,3 +147,48 @@ DIAGNOSTIC_ROOT` to `refine-motion`. It uses only the reference-only diagnostic'
 checked fixed-view prefix and skips warmup, preserving the included shared offset
 and pixel-pair normalization. Use a fresh work/output directory; resume binds the
 same diagnostic source. This does not change the default zero-start recipe.
+
+## Optional frozen-motion sweep scene refinement
+
+Only append this stage when explicitly requested.
+
+```sh
+modal-gaussians static refine-scene --scene STATIC --modes REFINED/mode_bank --coordinates SWEEP_COORDINATES --motion fitted --config configs/scene_refinement.json --work-dir EXP/work --output EXP/published
+modal-gaussians result materialize --scene EXP/published/scene --modes EXP/published/mode_bank --coordinates EXP/published/coordinates --output EXP/result
+modal-gaussians result evaluate --result EXP/result --output EXP/evaluation
+modal-gaussians result export-video --result EXP/result --view sweep --output EXP/video
+modal-gaussians viewer --input EXP/result --work-dir EXP/viewer
+```
+
+Use `--motion zero` with separate work/output for the q=0 ablation. Add `--resume`
+only for a matching scene-refinement checkpoint, never the old static work. Train
+only on coordinate-bound sweep frames; original modal observation views are inherited.
+The viewer command is a handoff, not an automatic service launch. Check actual CLI
+help for export arguments. Keep the original view1 q for cross-view validation,
+without refitting or using that loss to select the scene checkpoint.
+
+The explicitly requested A/B run can be composed with
+`python tools/sweep_scene_experiment.py --recipe EXP/recipe.json --stage STAGE`,
+where STAGE is `smoke`, `train`, `deliver` or `report`. The recipe records absolute
+scene, modes, sweep coordinates, view1 coordinates and experiment paths, plus the
+scene-refinement config object. Smoke runs each arm to step 25; train resumes those
+same checkpoints to the configured budget. Deliver binds results, measures both
+initial baselines and both outputs, transfers the original view1 q for its check,
+and exports the four independent videos and four-column comparison. Report writes
+paired metric CSVs, Gaussian-count CSVs, timing/density summaries and RUN_REPORT.md.
+Each stage must succeed before the next one is called. No service starts.
+
+If the user authorizes early stopping during an existing run, record an explicit
+`EXP/early_stopping_policy.json` with `patience`, `minimum_step` and
+`relative_improvement` (for example 3 evaluations, step 2000, and 0.002).
+Use only full-sweep evaluations. Once the policy is met, stop the owned trainer
+after its complete evaluation checkpoint, then call `--stage finish-early`.
+This stage requires an unlocked work directory and the original unchanged
+checkpoint contract; it publishes the saved best state. It does not stop a live
+process or fabricate resumed optimizer state. Continue with `deliver` and `report`.
+Record unequal A/B budgets and any discarded updates after the retained checkpoint.
+For a user-requested immediate stop, set policy `mode` to
+`user_requested_checkpoint_stop` and record the reason. The stage then performs
+only a final full-frame evaluation of the retained checkpoint and best-state
+publication, without further Gaussian updates. The original process's allocator
+peak is unavailable after an external stop and is reported as unrecorded.

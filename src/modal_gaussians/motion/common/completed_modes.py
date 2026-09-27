@@ -27,6 +27,9 @@ def load_completed_modes(path, *, validate=False):
     if manifest.get("version") == 20:
         from modal_gaussians.coordinates.refinement_artifacts import load_refined_modes
         return load_refined_modes(root)
+    if manifest.get("version") == 21:
+        from modal_gaussians.geometry.refinement_artifacts import load_scene_refined_modes
+        return load_scene_refined_modes(root)
     if manifest.get("version") != 18:
         raise ValueError("Unsupported mode version; rebuild with the mainline pipeline")
     from modal_gaussians.motion.artifacts import load_neural_completed_modes

@@ -59,6 +59,24 @@ Static training uses full-frame RGB L1 + 0.2 DSSIM, plus optional depth L2; the 
 `--mask-weight` option are removed. Masks remain inputs for initial partitioning,
 stabilization and modal observation support.
 
+## Optional sweep scene refinement
+
+`static refine-scene` continues Gaussian training with frozen refined controls,
+reference graph and sweep coefficients. It changes position, covariance, opacity,
+all SH and Gaussian count; `coordinates refine-motion` still freezes the scene.
+Use `--motion zero` for the static ablation or `--motion fitted` for frozen sweep q.
+Both use the same renderer and inherited foreground/background partitions.
+
+```sh
+modal-gaussians static refine-scene --scene STATIC --modes REFINED/mode_bank --coordinates SWEEP_COORDINATES --motion fitted --config configs/scene_refinement.json --work-dir EXP/work --output EXP/published
+```
+
+Add `--resume` only for this stage's matching work contract. Training publishes a
+scene/mode/coordinate bundle; result binding, evaluation, video and viewing remain
+independent. It does not redirect the catalog. This stage is not appended to the
+default pipeline. Numerical recipe: [BASELINE](BASELINE.md); independent reference
+and rendering domains: [SCENE_STORAGE](SCENE_STORAGE.md).
+
 ## Pipeline and source map
 
 ```text
@@ -89,6 +107,7 @@ Sweep + fixed-view videos
 | Spatial mode learning | [`motion/`](src/modal_gaussians/motion/) | `prepared.py`, `selected_modal.py`, `batch.py`, `training.py`, `network.py` | prepared observations, soft graphs, controls, single-frequency models |
 | Temporal coefficients | [`coordinates/`](src/modal_gaussians/coordinates/) | `preparation.py`, `direct.py`, `rgb.py`, `sweep.py`, `fitting.py`, `rendering.py` | fixed mode bank, design, fixed-view/sweep RGB coefficients |
 | Optional joint motion refinement | [`coordinates/`](src/modal_gaussians/coordinates/) | `reference.py`, `sequences.py`, `refinement_artifacts.py`, `refinement.py`; `motion/reference_field.py`, `motion/fixed_field.py` | fixed reference/operator, frame/camera bindings, resumable work, modes/coefficients |
+| Optional frozen-motion scene refinement | [`geometry/`](src/modal_gaussians/geometry/) | `refinement.py`, `refinement_artifacts.py`; `motion/material_field.py`, `coordinates/transfer.py` | fresh Adam, density/lineage checkpoint, scene v8 / modes v21 / transferred q v1 |
 | Result binding, evaluation and video | [`results/`](src/modal_gaussians/results/) | `artifact.py`, `evaluation.py`, `video.py` | result manifest, metrics/CSV, comparison MP4 |
 | Interactive inspection | [`vis/`](src/modal_gaussians/vis/) | `inputs.py`, `viewer.py`, `spectrum.py` | explicit viewer/projection work directory |
 | Shared infrastructure | [`common/`](src/modal_gaussians/common/) | `scene_store.py`, `cache.py`, camera math, array I/O | path resolution, cache contracts, atomic publication |

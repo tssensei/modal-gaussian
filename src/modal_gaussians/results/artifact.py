@@ -52,6 +52,7 @@ COORDINATE_IDENTITY_NAMES = {
     "rgb": "rgb_coordinates_identity",
     "refined_rgb": "refined_coordinates_identity",
     "sweep_rgb": "sweep_coordinates_identity",
+    "transferred_rgb": "transferred_coordinates_identity",
 }
 
 
@@ -138,6 +139,9 @@ def _load_coordinate_artifact(path: Path) -> tuple[str, CoordinateArtifact]:
     from modal_gaussians.coordinates.refinement_artifacts import COORDINATES_FORMAT, load_refined_coordinates
     if artifact_format == COORDINATES_FORMAT:
         return "refined_rgb", load_refined_coordinates(path)
+    from modal_gaussians.coordinates.transfer import TRANSFER_FORMAT, load_transferred_coordinates
+    if artifact_format == TRANSFER_FORMAT:
+        return "transferred_rgb", load_transferred_coordinates(path)
     raise ValueError(
         "Result coordinates must be a direct- or RGB-coordinate artifact"
     )
@@ -276,7 +280,7 @@ def _load_sources(
         completed.manifest["modes"],
     )
 
-    if coordinate_kind in ("refined_rgb", "sweep_rgb"):
+    if coordinate_kind in ("refined_rgb", "sweep_rgb", "transferred_rgb"):
         from modal_gaussians.coordinates.sequences import validate_sequences
         cm = coordinates.manifest
         _require_equal("coordinate scene", cm['static_scene_identity'], scene_manifest['static_scene_identity'])
@@ -293,6 +297,15 @@ def _load_sources(
                 raise ValueError('Refined coordinates require a fixed-scene refined mode bank')
             for key in ('preparation_identity','run_identity'):
                 _require_equal(f'refined {key}',cm[key],completed.manifest[key])
+        if coordinate_kind == 'transferred_rgb':
+            zero_baseline=completed.manifest.get('version')==20 and cm['operation']=='zero_ablation'
+            if completed.manifest.get('version') != 21 and not zero_baseline:
+                raise ValueError('Transferred coordinates require scene-refined modes')
+            parent = (dict(identity=completed.manifest['completed_modes_identity'],
+                static_scene_identity=completed.manifest['static_scene_identity']) if zero_baseline
+                else completed.manifest['parent_modes'])
+            _require_equal('transferred parent modes',cm['parent']['completed_modes_identity'],parent['identity'])
+            _require_equal('transferred parent scene',cm['parent']['static_scene_identity'],parent['static_scene_identity'])
         _require_equal('coordinate field shape', completed.arrays['phi'].shape,
                        (len(cm['modes']),scene.foreground.count,3))
         if not np.array_equal(completed.arrays['g_points'],scene.foreground.params['means'].detach().numpy()):

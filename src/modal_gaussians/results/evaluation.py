@@ -74,7 +74,7 @@ def evaluate_result(*, result_dir, output_dir, view_labels=None, with_lpips=Fals
         raise FileExistsError(destination)
     started = time.perf_counter()
     result = load_modal_result(result_dir)
-    if result.manifest['coordinate_source']['kind'] not in ('rgb', 'refined_rgb', 'sweep_rgb', 'mixed_rgb'):
+    if result.manifest['coordinate_source']['kind'] not in ('rgb', 'refined_rgb', 'sweep_rgb', 'transferred_rgb', 'mixed_rgb'):
         raise ValueError("Evaluation requires RGB-fitted coordinates with input PNG records")
     # Result loading verifies bindings; a formal measurement additionally hashes tensors/fields.
     load_static_scene(result.manifest['sources']['static_scene']['path'], 'cpu', validate=True)

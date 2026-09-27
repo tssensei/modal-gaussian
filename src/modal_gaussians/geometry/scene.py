@@ -483,6 +483,19 @@ class ForegroundBackgroundScene(nn.Module):
         foreground_colors: Tensor | None = None,
         include_background: bool = True,
     ) -> dict[str, Tensor]:
+        rendered, _ = self.render_deformed_with_info(camera, foreground_means,
+            foreground_quaternions=foreground_quaternions, foreground_colors=foreground_colors,
+            include_background=include_background)
+        return rendered
+
+    def render_deformed_with_info(
+        self, camera: Camera, foreground_means: Tensor, *,
+        foreground_quaternions: Tensor | None = None,
+        foreground_colors: Tensor | None = None,
+        include_background: bool = True,
+        retain_screen_grad: bool = False,
+        include_depth: bool = True,
+    ) -> tuple[dict[str, Tensor], dict]:
         """Render deformed foreground and static background with one depth order.
 
         The modal viewer supplies foreground means and optional world-space
@@ -542,7 +555,7 @@ class ForegroundBackgroundScene(nn.Module):
             active = combined
 
         rasterization = _load_gsplat_rasterization()
-        rendered, alphas, _ = rasterize_cameras(rasterization, [camera],
+        rendered, alphas, info = rasterize_cameras(rasterization, [camera],
             means=active["means"],
             quats=active["quaternions"],
             scales=active["scales"],
@@ -555,17 +568,21 @@ class ForegroundBackgroundScene(nn.Module):
             height=camera.height,
             packed=False,
             backgrounds=torch.ones((1, 3), device=device),
-            render_mode="RGB+ED",
+            render_mode="RGB+ED" if include_depth else "RGB",
             rasterize_mode="classic",
             camera_model="pinhole",
         )
+        if retain_screen_grad:
+            means2d = info.get("means2d")
+            if means2d is None or not means2d.requires_grad:
+                raise RuntimeError("gsplat did not expose differentiable means2d")
+            means2d.retain_grad()
         alpha = alphas[0, ..., 0]
-        depth = torch.where(
-            alpha > 1.0e-8,
-            rendered[0, ..., 3],
-            torch.zeros_like(rendered[0, ..., 3]),
-        )
-        return {"rgb": rendered[0, ..., :3], "alpha": alpha, "expected_depth": depth}
+        outputs = {"rgb": rendered[0, ..., :3], "alpha": alpha}
+        if include_depth:
+            outputs["expected_depth"] = torch.where(alpha > 1.0e-8,
+                rendered[0, ..., 3], torch.zeros_like(alpha))
+        return outputs, info
 
     def render_features(
         self,
@@ -1379,7 +1396,7 @@ def load_static_scene(
     if not manifest_path.is_file() or not tensors_path.is_file():
         raise FileNotFoundError(f"Incomplete static scene bundle: {path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("format") != "modal_gaussians.static_scene" or manifest.get("version") not in (5, 6):
+    if manifest.get("format") != "modal_gaussians.static_scene" or manifest.get("version") not in (5, 6, 8):
         raise ValueError(f"Unsupported static scene manifest: {manifest_path}")
     if (manifest["representation"].get("color") != "spherical_harmonics_world"
             or type(manifest["representation"].get("sh_degree")) is not int
@@ -1423,6 +1440,9 @@ def load_static_scene(
 
             validate_partition_bundle(path, manifest, loaded)
             static_identity_payload["partition_identity"] = manifest["partition_identity"]
+        if manifest["version"] == 8:
+            from .refinement_artifacts import validate_scene_lineage
+            static_identity_payload["scene_refinement"] = validate_scene_lineage(path, manifest, loaded)
         if _sha256_json(static_identity_payload) != manifest.get("static_scene_identity"):
             raise ValueError("Static scene identity does not match manifest contents")
     parts: dict[str, GaussianSet] = {}

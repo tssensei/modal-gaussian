@@ -1,0 +1,18 @@
+{
+  "iterations": 7000,
+  "batch_size": 4,
+  "seed": 1729,
+  "source_step": 3000,
+  "query_block_size": 4096,
+  "checkpoint_every_steps": 200,
+  "evaluation_every_steps": 500,
+  "density_warmup_steps": 500,
+  "density_control_every": 100,
+  "density_stop_step": 5000,
+  "foreground_densify_stop_step": 5000,
+  "background_densify_stop_step": 5000,
+  "max_foreground_gaussians": 800000,
+  "max_background_gaussians": 400000,
+  "opacity_reset_every": 3000,
+  "depth_weight": 0.0
+}

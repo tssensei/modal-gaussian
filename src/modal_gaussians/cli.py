@@ -193,6 +193,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resume only when input and resolved training config identities match",
     )
+    scene_refine = static_commands.add_parser("refine-scene", help="Optimize Gaussian scene/density with frozen material motion and sweep q")
+    for name in ("scene", "modes", "coordinates", "work-dir", "output"):
+        scene_refine.add_argument("--"+name, required=True, type=Path)
+    scene_refine.add_argument("--motion", choices=("fitted", "zero"), required=True)
+    scene_refine.add_argument("--config", type=Path)
+    scene_refine.add_argument("--resume", action="store_true")
+    scene_refine.add_argument("--device", default="cuda")
     render = static_commands.add_parser(
         "render", help="Render stored sweep/reference cameras for offline QA"
     )
@@ -555,6 +562,14 @@ def _dispatch(
             print(f"static scene: {output.resolve()}")
             print(f"manifest: {(output / 'manifest.json').resolve()}")
             print(f"tensors: {(output / 'tensors.pt').resolve()}")
+            return 0
+        if args.command == "static" and args.static_command == "refine-scene":
+            from modal_gaussians.geometry.refinement import SceneRefineConfig, refine_scene
+            settings = {} if args.config is None else json.loads(args.config.read_text(encoding="utf-8"))
+            output = refine_scene(scene_dir=args.scene,completed_modes_dir=args.modes,coordinates_dir=args.coordinates,
+                motion=args.motion,config=SceneRefineConfig(**settings),work_dir=args.work_dir,output_dir=args.output,
+                resume=args.resume,device=args.device)
+            print(f"refined scene bundle: {output}")
             return 0
         if args.command == "static" and args.static_command == "repartition":
             from modal_gaussians.geometry.partition import PartitionConfig, repartition_static_scene

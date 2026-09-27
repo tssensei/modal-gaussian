@@ -5,12 +5,12 @@ immutable complex displacement and angular fields. The static scene, appearance,
 cameras, Gaussian order and both fields remain frozen throughout RGB fitting.
 Videos were recorded separately; fit independent coefficients for each video.
 
-Appearance now uses world-frame SH (static scene v5/v6, refined v7). Fixed RGB and
-sweep fitting freeze all SH parameters while evaluating colors at each frame's
-camera and deformed positions. Joint refinement updates foreground SH DC at
-`color_lr` and higher bands at `color_lr / 20`; background SH stays frozen. Baked
-fields, result rendering, evaluation and playback use the same SH-aware renderer.
-This does not change the existing 0.8 L1 / 0.2 DSSIM coefficient/refinement loss.
+Appearance uses world-frame SH (scene v5/v6/v8). Fixed RGB/sweep fitting and
+`coordinates refine-motion` freeze all scene attributes, including all SH.
+The explicit `static refine-scene` stage instead freezes motion and sweep q while
+optimizing every Gaussian attribute and density, using L1 + 0.2 DSSIM. This is
+separate from the 0.8 L1 / 0.2 DSSIM coefficient/motion-refinement objective.
+All renderers evaluate SH at each camera and the current deformed positions.
 
 ```text
 completed batch index
@@ -294,6 +294,17 @@ together. Do not merely relabel FPS. Fixed views retain their original frame gri
 Standalone `fit-sweep` and `downsample-sweep` remain fixed-mode baseline tools;
 they are not prerequisites for motion refinement.
 
+To fit sweep q against an already refined, frozen mode bank, use
+`coordinates fit-sweep --scene STATIC --modes REFINED/mode_bank --scale-source
+REFINED/coordinates --metadata SWEEP_METADATA --config RGB_CONFIG --output NEW_SWEEP`.
+The scale source must contain one fixed recording and match the scene and mode
+identities. It supplies only the original frozen pixel-pair normalization (from
+the checked preparation or flow initialization), never that recording's q.
+Sweep starts its own q at zero and uses the existing RGB offset/multiscale solver;
+all displacement/angular fields and Gaussian attributes stay frozen. Set both
+`anchor_weight` and `final_anchor_weight` to zero for RGB-only fitting. This solver
+uses its configured epoch budget and linear LR schedule, not refinement early stopping.
+
 Prepared v5 contains reference, fixed operator and normalization inputs. Work owns
 atomic checkpoint/log/run state. Final output has only manifest, `mode_bank/`
 (completed modes v20) and `coordinates/` (refined RGB v5); it references the unchanged
@@ -311,10 +322,32 @@ stops without final publication. Logs separate query/render/regularization/backw
 times and record per-view losses, correction/q magnitudes and displacement/angular
 RMS. Synchronized CUDA timing belongs in the local benchmark, not daily logging.
 
-The old `refine-scene`, density/shape configuration and fitted-coordinate preparation
+The old `coordinates refine-scene`, density/shape configuration and fitted-coordinate preparation
 arguments are removed. Old preparations/checkpoints cannot resume this method;
 use new prepared/work/output directories. Preserve historical artifacts/baselines.
 Matching static scenes, original banks and verified references remain reusable.
 This method can change the span of the existing control-supported fields but adds
 neither modes nor support for unresolved structure. Real quality requires a separate
 authorized comparison with fixed-mode free-q fitting on the same inputs and budget.
+
+## Explicit scene refinement and frozen coordinate transfer
+
+`static refine-scene` consumes one calibrated 30-FPS sweep coordinate artifact,
+v20 refined modes and their unchanged static source. It does not refit q or motion.
+Use `--motion fitted|zero`, `--config configs/scene_refinement.json`, separate
+`--work-dir` and `--output`; `--resume` requires this stage's exact contract.
+The published bundle contains scene, mode_bank and coordinates. Materialize it with
+`result materialize --scene OUT/scene --modes OUT/mode_bank --coordinates OUT/coordinates --output RESULT`.
+
+The motion module keeps reference controls/paths separate from mutable Gaussian
+rows, querying frozen control displacement/angular fields at current positions.
+Clone/split descendants inherit reference roots and partition; background is static.
+Only interpolation support violations reject an update; this is not a loss term.
+After selecting the best full-sweep RGB state, re-query and bake its fields.
+
+`coordinates.transfer.transfer_coordinates` binds original fixed-view refined q to
+the new bank without fitting, for the cross-view check. Fitted q values and their
+normalization/phase convention remain unchanged. It rejects parent-mode, frequency,
+scene, frame and camera mismatches. Results using transferred coordinates support
+native valid-support evaluation, video and Viser. Do not use the old fixed W/L
+preparation for another motion-refinement run on the changed Gaussian domain.

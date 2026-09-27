@@ -16,6 +16,7 @@ from .rgb import RGBModalCoordinatesArtifact, load_rgb_frame
 from .sequences import validate_sequences, frame_camera, downsample_sequence, validate_time_grid
 
 SWEEP_FORMAT = 'modal_gaussians.sweep_rgb_coordinates'
+SWEEP_VERSION = 2
 
 
 def sweep_sequence(scene, metadata_path, fps=30):
@@ -94,7 +95,7 @@ def sweep_sequence(scene, metadata_path, fps=30):
 def load_sweep_coordinates(path):
     from .refinement_artifacts import read_manifest
     from .direct import _validate_modes
-    root,m = read_manifest(path,SWEEP_FORMAT,1,'sweep_coordinates_identity')
+    root,m = read_manifest(path,SWEEP_FORMAT,SWEEP_VERSION,'sweep_coordinates_identity')
     _validate_modes(m['modes'])
     RGBFitConfig(**m['settings']).validate()
     q = np.load(root/'coordinates.npy',allow_pickle=False)
@@ -104,7 +105,8 @@ def load_sweep_coordinates(path):
             or m['counts'] != dict(frames=n,modes=k,views=1) or len(m['views']) != 1
             or m['views'][0].get('kind') != 'sweep' or scales.shape != (k,)
             or not np.isfinite(scales).all() or np.any(scales<=0)
-            or set(m['checksums']) != {'coordinates.npy'}):
+            or set(m['checksums']) != {'coordinates.npy'}
+            or m['scale_source'].get('kind') not in ('rgb', 'refined_rgb')):
         raise ValueError('Invalid sweep coordinate artifact')
     validate_time_grid(m['views'][0])
     if m['views'][0]['frame_count'] != n:
@@ -146,9 +148,45 @@ def downsample_sweep(*, input_dir, output_dir, fps=30):
     return load_sweep_coordinates(destination)
 
 
+def _fixed_view_scales(kind, coordinates, bank, direct, views):
+    """Reuse the source fit's frozen normalization, never its temporal coefficients."""
+    if kind not in ('rgb', 'refined_rgb') or len(views) != 1 or views[0].get('kind', 'fixed') != 'fixed':
+        raise ValueError('Sweep scale source must be a single fixed-view RGB or refined fit')
+    label = views[0]['label']
+    if kind == 'rgb':
+        original = next(v for v in direct.manifest['views'] if v['label'] == label)
+        scales = direct.diagnostics['mode_pair_scales'][original['index']]
+    else:
+        from .refinement_artifacts import read_manifest, PREPARED_FORMAT
+        m = coordinates.manifest
+        root, prepared = read_manifest(bank.manifest['prepared'], PREPARED_FORMAT, 5, 'preparation_identity')
+        if (prepared['preparation_identity'] != m['preparation_identity']
+                or prepared['preparation_identity'] != bank.manifest['preparation_identity']
+                or prepared['static_scene_identity'] != m['static_scene_identity']
+                or prepared['modes'] != m['modes']):
+            raise ValueError('Sweep normalization preparation differs from refined source')
+        provenance = m.get('initialization_source')
+        if provenance is not None:
+            if (provenance.get('method') != 'reference_only_flow_plus_shared_rgb_offset'
+                    or provenance.get('normalization') != 'diagnostic_rendered_design_pixel_pair_rms'):
+                raise ValueError('Unsupported refined normalization source')
+            path = resolve_path(provenance['directory'], strict=True)/'solution/scales.npy'
+            if sha256(path) != provenance['checksums']['scales.npy']:
+                raise ValueError('Refined normalization checksum differs')
+            scales = np.load(path, allow_pickle=False)
+        else:
+            original = next(v for v in prepared['views'] if v['label'] == label and v['kind'] == 'fixed')
+            with np.load(root/'initial.npz', allow_pickle=False) as initial:
+                scales = initial['scales'][original['index']]
+    scales = np.asarray(scales, np.float32)
+    if scales.shape != (len(bank.manifest['modes']),) or not np.isfinite(scales).all() or np.any(scales <= 0):
+        raise ValueError('Invalid sweep normalization scales')
+    return scales
+
+
 def fit_sweep(*,scene_dir,completed_modes_dir,scale_source,metadata_path,output_dir,
               config=RGBFitConfig(),device='cuda',fps=30):
-    from modal_gaussians.results.artifact import _load_sources
+    from modal_gaussians.results.artifact import _load_sources, COORDINATE_IDENTITY_NAMES
     from .refinement_artifacts import write_manifest
     from . import fitting, rendering, sequences
     from modal_gaussians.geometry.scene import load_static_scene
@@ -158,16 +196,13 @@ def fit_sweep(*,scene_dir,completed_modes_dir,scale_source,metadata_path,output_
     load_completed_modes(completed_modes_dir, validate=True)
     _,scene,bank,kind,rgb,_,direct,views = _load_sources(scene_dir=scene_dir,
         completed_modes_dir=completed_modes_dir,coordinates_dir=scale_source)
-    if kind != 'rgb' or len(views) != 1:
-        raise ValueError('Sweep scale source must be a single fixed-view RGB fit')
+    scales = _fixed_view_scales(kind, rgb, bank, direct, views)
     destination = resolve_path(output_dir)
     view,image,metadata = sweep_sequence(scene,metadata_path,fps)
     if any(destination.is_relative_to(resolve_path(p)) for p in
            (scene_dir,completed_modes_dir,scale_source,image['directory'])):
         raise ValueError('Sweep output must be outside immutable inputs')
     if destination.exists(): raise FileExistsError(destination)
-    original = next(v for v in direct.manifest['views'] if v['label']==views[0]['label'])
-    scales = np.asarray(direct.diagnostics['mode_pair_scales'][original['index']],np.float32)
     cameras = {c.name:c for c in cameras_from_scene_manifest(scene.manifest)}
     render = make_sequence_renderer(scene,[frame_camera(cameras,view,i) for i in range(view['frame_count'])],
                                    bank.arrays['phi'],bank.rotation,device)
@@ -183,11 +218,12 @@ def fit_sweep(*,scene_dir,completed_modes_dir,scale_source,metadata_path,output_
         scales,None,None,target,config,device,render_frame=render,on_progress=report)
     with _publish(destination) as work:
         np.save(work/'coordinates.npy',q,allow_pickle=False)
-        write_manifest(work,dict(format=SWEEP_FORMAT,version=1,static_scene=str(resolve_path(scene_dir)),
+        write_manifest(work,dict(format=SWEEP_FORMAT,version=SWEEP_VERSION,static_scene=str(resolve_path(scene_dir)),
             static_scene_identity=scene.manifest['static_scene_identity'],
             completed_modes=str(bank.path),completed_modes_identity=bank.manifest['completed_modes_identity'],
             modes=bank.manifest['modes'],views=[view],images=[image],pair_scales=scales.tolist(),
-            scale_source=dict(path=str(rgb.path),identity=rgb.manifest['rgb_coordinates_identity'],label=views[0]['label']),
+            scale_source=dict(path=str(rgb.path),kind=kind,
+                identity=rgb.manifest[COORDINATE_IDENTITY_NAMES[kind]],label=views[0]['label']),
             metadata=metadata,settings=config.to_dict(),training=summary,
             implementation=module_revision(sys.modules[__name__],fitting,rendering,sequences),
             counts=dict(frames=len(q),views=1,modes=q.shape[1]),

@@ -46,6 +46,13 @@ The last command starts a viewer and is only an example for an authorized viewin
 
 ## Identity and publication
 
+Sweep RGB coordinates now use v2: `scale_source.kind` explicitly identifies an
+`rgb` or `refined_rgb` fixed-recording source, and `scale_source.identity` uses
+that artifact's corresponding identity. Frozen `pair_scales` retain original
+pixel-projection normalization, including checked flow-initialization scales for
+refined inputs. The q array, frame/camera bindings and rendering interpretation
+are unchanged. v1 outputs are historical; do not relabel their manifests.
+
 Motion-refinement early stopping, when enabled, stores latest optimizer/sampler
 state and progress history in `work/checkpoint.pt`, checked best states under
 `work/best/checkpoint_STEP.pt`, and readable history in `work/early_stopping.json`.
@@ -89,7 +96,8 @@ pre-cleanup artifacts that now require new outputs.
 ## SH static scene artifacts
 
 Current static scene versions are **v5** (trained base), **v6** (repartitioned or
-manually selected). Historical geometry-refined v7 scenes are no longer accepted.
+manually selected), and **v8** (frozen-motion sweep scene refinement). Historical
+geometry-refined v7 scenes are no longer accepted.
 Each partition stores `means`,
 `quaternions`, `log_scales`, `opacity_logits`, `sh_dc [G,3]` and
 `sh_rest [G,15,3]`. The manifest declares `spherical_harmonics_world` and the active
@@ -102,7 +110,7 @@ caches are transient process memory and are not checkpoint or artifact fields.
 Earlier direct-RGB scenes and resume
 v1/v2/v3 are not current inputs. Training summary v3 and epoch/checkpoint statistics
 contain RGB and unweighted depth losses, with no removed mask-loss fields. Scene tensor formats
-remain v5/v6. Preserve old outputs as described in
+retain the same tensor layout in v5/v6/v8. Preserve old outputs as described in
 [REBUILD](REBUILD.md); never rewrite their manifests.
 
 ## Static depth targets
@@ -203,3 +211,32 @@ Evaluation still hashes exact PNGs and renders at native resolution on valid sup
 save independent metrics/CSV and keep historical results untouched. No catalog is
 redirected by implementation or preparation. See COEFFICIENT_FITTING.md for the
 scientific equations and REBUILD.md for affected dependencies.
+
+## Frozen-motion Gaussian scene refinement contracts
+
+Scene v8 retains the v5/v6 SH tensor layout and original camera/normalization data.
+`lineage.npz` maps each current foreground/background row to its source partition;
+its checksum, source scene/modes IDs, source counts, run ID and published step are
+part of scene identity. Partition membership is inherited, never reclassified.
+
+Completed modes v21 store `phi.npy`/`rotation.npy` in new rendering order and
+`support.npz`: current g_points, int64 reference_root, immutable reference points/
+edges, independent c_positions, frozen complex control fields/validity, and inherited
+observation masks/roles/alphas. Controls have no current-Gaussian index; culling a
+rendering row cannot delete a reference control. Parent mode/scene/preparation IDs
+remain explicit. Inherited roles do not constitute new modal supervision.
+
+Transferred RGB coordinates v1 record old/new identities, source coordinate checksum,
+full sequence/image/camera/time bindings and `frozen_transfer` or `zero_ablation`.
+Frozen q is copied byte-for-byte; zero ablation is explicitly zero. A zero baseline
+may bind the unchanged source v20 modes/scene; actual refined outputs use v21/v8.
+The source scene/modes/q are never edited. Bundle publication is atomic across all
+three products. Result/evaluation/video/Viser validate their mutual identities.
+Viser draws controls/reference edges from the independent reference domain.
+
+Scene-refinement checkpoint v1 stores tensors, all Adam state, LR clock, random
+states, exact sampler order/cursor, lineage, density statistics/events and best
+state/checksum. Run identity includes config, inputs and output-affecting code.
+It cannot resume old static training or coordinate refinement. GPU query layouts
+are transient and contain no learned weights; dynamic distances/weights/levers
+are recomputed. A best checkpoint does not claim to be the final update.

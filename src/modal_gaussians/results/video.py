@@ -28,7 +28,7 @@ def export_result_video(*, result_dir, view_label, output_dir, device="cuda") ->
     if destination.exists():
         raise FileExistsError(f"Video output already exists: {destination}")
     result = load_modal_result(result_dir)
-    if result.manifest["coordinate_source"]["kind"] not in ("rgb", "refined_rgb", "sweep_rgb", "mixed_rgb"):
+    if result.manifest["coordinate_source"]["kind"] not in ("rgb", "refined_rgb", "sweep_rgb", "transferred_rgb", "mixed_rgb"):
         raise ValueError("Video comparison requires an RGB-fitted result with recorded input images")
     views = {view["label"]: view for view in result.manifest["views"]}
     if view_label not in views:

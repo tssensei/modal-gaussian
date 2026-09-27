@@ -146,13 +146,13 @@ class ViewerCamera:
 
 
 def _completed_mode_display_roles(manifest, arrays):
-    if manifest.get('version') not in (18, 17, 20):
+    if manifest.get('version') not in (18, 17, 20, 21):
         raise ValueError('Unsupported model for Viewer')
     support, phi = np.asarray(arrays['support_class']), np.asarray(arrays['phi'])
     if (phi.ndim != 3 or phi.shape[2] != 3 or support.shape != phi.shape[:2]
             or support.dtype.kind not in 'iu' or np.any((support < 0) | (support > 3))):
         raise ValueError('Invalid support classes')
-    if manifest.get('version') == 20:
+    if manifest.get('version') in (20, 21):
         return np.asarray([2,0,1,3], np.int8)[support], tuple('inherited ' + name for name in NEURAL_SUPPORT_DISPLAY_NAMES) + ('inherited propagated',), (
             '**Inherited mode sources:** blue = supervised source | green = inferred source | '
             'purple = unresolved | yellow = donor source. Control fields were refined by RGB; modal observations are inherited.')
@@ -294,7 +294,7 @@ class ModalViewerData:
         self._load_graph_display(0)
         self.projections = None
         self.spectrum = None
-        if with_spectrum and all("selected_modal_supervision" in m.artifact.manifest or m.artifact.manifest.get("version") in (17, 20) for m in modes):
+        if with_spectrum and all("selected_modal_supervision" in m.artifact.manifest or m.artifact.manifest.get("version") in (17, 20, 21) for m in modes):
             self.projections = ViewerProjections(self.result, work_dir)
             self.spectrum = SpectrumComparisonController(self.result, projections=self.projections)
         self.gpu_lock = self.projections.gpu_lock if self.projections else threading.RLock()
@@ -307,11 +307,14 @@ class ModalViewerData:
         self.control_point_colors = (_component_colors(arrays.get("g_component_index", np.zeros(self.scene.foreground.count, np.int64))[self.control_point_gaussian_index])
             if len(self.control_point_gaussian_index) else np.empty((0, 3), np.float32))
         self.control_positions = np.asarray(arrays.get("c_positions", np.empty((0, 3), np.float32)))
+        independent_controls = mode.artifact.manifest.get('version') == 21
+        if independent_controls:
+            self.control_point_colors = np.tile(np.array([[.3,.7,.9]],np.float32),(len(self.control_positions),1))
         self.control_displacement = mode.artifact.control_displacement
         self._control_slot = mode.slot
         if self.control_displacement is not None and (
                 self.control_displacement[mode.slot].shape != self.control_positions.shape
-                or self.control_positions.shape != (len(self.control_point_gaussian_index), 3)):
+                or (not independent_controls and self.control_positions.shape != (len(self.control_point_gaussian_index), 3))):
             raise ValueError("Viewer control displacement domain differs")
 
     def has_coordinates(self, view_index):
@@ -324,13 +327,13 @@ class ModalViewerData:
         completed = self.result.modes[mode_index].artifact
         self.structure_graph = None
         self.reference_graph_points = None
-        if completed.manifest.get("version") == 20:
+        if completed.manifest.get("version") in (20, 21):
             self.reference_graph_points = completed.arrays["reference_points"]
             self.graph_edge_gaussian_index = completed.arrays["reference_edges"]
             self.graph_edge_colors = np.tile(np.array([[.3, .7, .9]], np.float32), (len(self.graph_edge_gaussian_index), 1))
             self.graph_mode_index = mode_index
             self.graph_edge_colors_by_mode = None
-            self.graph_legend = '**Fixed motion reference graph:** original canonical nodes and unchanged Gaussian order.'
+            self.graph_legend = '**Fixed motion reference graph:** original canonical reference nodes; rendering Gaussians may have a separate domain.'
             return
         self.graph_edge_gaussian_index, self.graph_edge_colors = _neural_graph_display(
             completed.arrays, self.scene.foreground.count)
@@ -784,7 +787,7 @@ class ModalViserViewer:
         """Build RGB, projected phase, and observation-support color controls."""
 
         with self.server.gui.add_folder("Gaussian color"):
-            if any(m.artifact.manifest.get("version") == 20 for m in self.data.result.modes):
+            if any(m.artifact.manifest.get("version") in (20, 21) for m in self.data.result.modes):
                 self.server.gui.add_markdown("Observation counts and roles are inherited from the original mode sources; control fields have RGB refinement, with inherited modal observations.")
             self.color_mode = self.server.gui.add_dropdown(
                 "Render color mode",
@@ -847,7 +850,7 @@ class ModalViserViewer:
                 self.data.select_mode(index)
             self._remove_control_cloud()
             if getattr(self, "show_controls_only", None) is not None:
-                self.show_controls_only.disabled = not len(self.data.control_point_gaussian_index)
+                self.show_controls_only.disabled = not len(self.data.control_positions)
                 if self.show_controls_only.disabled:
                     self.show_controls_only.value = False
                 self.control_color_mode.disabled = self.data.control_displacement is None
@@ -930,7 +933,7 @@ class ModalViserViewer:
         graph_edge_count = len(self.data.graph_edge_gaussian_index)
         graph_edge_step = max(graph_edge_count // 200, 1)
         with self.server.gui.add_folder("Debug points"):
-            control_count = len(self.data.control_point_gaussian_index)
+            control_count = len(self.data.control_positions)
             has_control_modes = self.data.control_displacement is not None
             self.show_controls_only = self.server.gui.add_checkbox(
                 "Show control points only", False, disabled=not control_count)
@@ -1040,7 +1043,7 @@ class ModalViserViewer:
 
     def _update_control_cloud(self, means: Tensor, camera: Camera) -> None:
         indices = torch.as_tensor(self.data.control_point_gaussian_index, device=means.device)
-        points = means[indices].detach().cpu().numpy()
+        points = (means[indices].detach().cpu().numpy() if len(indices) else self.data.control_positions)
         colors = self.data.control_point_colors
         if self.control_color_mode.value == "modal shape":
             colors = self.data.control_phase_colors(

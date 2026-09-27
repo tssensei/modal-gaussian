@@ -331,3 +331,35 @@ These defaults and counts do not establish runtime, convergence or real quality.
 | Changed identity, schema, loss, reference or code contract | Rebuild affected dependencies into new outputs. |
 
 These mechanisms apply to the current schema. They do not upgrade pre-cleanup artifacts.
+
+## Frozen-motion sweep Gaussian refinement — experimental recipe
+
+`configs/scene_refinement.json` uses 7000 new Gaussian updates, batch 4, seed 1729,
+full-frame L1 + 0.2 (1-SSIM), no depth/mask/motion losses. Preserve SH degree 3.
+All Gaussian attributes in both partitions train; only foreground receives motion.
+Adam starts fresh (epsilon 1e-15). Position LR uses the original camera extent and
+static exponential clock 3000..10000 of 20000; DC/rest/opacity/scale/quaternion rates
+are 0.0025/0.000125/0.05/0.005/0.001. Cameras, normalization, control motion,
+reference graph, per-frequency path costs/donors and coefficients remain fixed.
+
+Density runs at 600..4900 every 100 updates, gradient threshold 2e-4,
+split scale 0.01 extent, opacity cull 0.005, foreground/background caps 800000/400000.
+Caps restrict new nodes only. Reset opacity to at most 0.01 once at step 3000;
+after that event cull scale >0.1 extent or screen radius >20 pixels. New children
+inherit partition/reference root, zero Adam moments, and query at new canonical
+positions. Revert position updates that lose originally valid support (zero the
+position moments); cancel unsupported splits. Unresolved zero fields stay zero.
+No shape loss is added. Final 2000 updates keep count fixed.
+
+Sample shuffled sweep frames exhaustively, wrapping to keep every batch at four.
+A/B use the same independent NumPy sampler/seed; A renders zero q, B unchanged q.
+Save every 200 and after density events, evaluate all bound frames at step 0 and
+every 500, and publish the actual lowest evaluated RGB loss state. No early stop.
+Log actual/published steps separately. Query blocks contain 4096 rendering rows;
+frequency grouping, immutable index layouts and conservative support bounds only
+change execution, with exact path checks outside the guaranteed support ball.
+
+Bush A/B: registered 540p 362-frame/30-FPS sweep, source subject_scene_union,
+20 view1 RGB-only modes at step 7000 and independent fitted sweep q. View1's original
+300 frames/q are an untrained-view check, not an independent test set or selection
+criterion. Results remain experimental until metrics and visual review are complete.

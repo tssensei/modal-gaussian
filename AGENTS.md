@@ -85,6 +85,13 @@ pipeline or remove recovery checkpoints speculatively.
   Use the joint clock for control LR and post-warmup total clock for q LR. Publish
   baked fields and coordinates referencing the unchanged static scene; never create
   a new Gaussian scene or silently run geometry optimization/density control.
+- `static refine-scene` explicitly optimizes Gaussian attributes/counts from a
+  published scene with frozen sweep q and refined control fields. Keep an immutable
+  reference graph/control domain and inherited reference roots for rendering rows.
+  Query motion at current canonical positions; never reuse old fixed W/L weights
+  or attach controls to mutable rendering indices. Reject lost support and invalid
+  splits. Publish new scene v8 / modes v21 / frozen-coordinate v1 atomically;
+  preserve ancestors and keep evaluation/export as independent stages.
 - Keep original modal observation views separate from supervised sequences. Sweep
   has per-frame calibrated cameras and its own extraction clock; it is not an FFT
   observation or a synchronized recording. Use `coordinates/sequences.py` bindings

@@ -16,9 +16,9 @@ def expand_rows(ptr, rows):
     return starts + np.arange(int(counts.sum())), local
 
 
-def _device_rows(ptr, rows):
+def _device_rows(ptr, rows, output_size=None):
     counts = ptr[rows + 1] - ptr[rows]
-    local = torch.repeat_interleave(torch.arange(len(rows), device=rows.device), counts)
+    local = torch.repeat_interleave(torch.arange(len(rows), device=rows.device), counts, output_size=output_size)
     starts = ptr[rows] - counts.cumsum(0) + counts
     return starts[local] + torch.arange(len(local), device=rows.device), local
 
@@ -145,12 +145,16 @@ class ReferenceField:
             self._device = device
         return self._tables
 
-    def _own(self, x, roots, k, *, support_only=False, stencil=False):
+    def _own(self, x, roots, k, *, support_only=False, stencil=False, layout=None):
         a = self.a
         t = self._on_device(x.device)
         roots = torch.as_tensor(roots, device=x.device)
-        candidates, rows = _device_rows(t["candidate_ptr"], roots)
-        queries, qrows = _device_rows(t["query_ptr"], candidates)
+        if layout is None:
+            candidates, rows = _device_rows(t["candidate_ptr"], roots)
+            queries, qrows = _device_rows(t["query_ptr"], candidates)
+        else:
+            candidates, rows = _device_rows(t['candidate_ptr'],roots,layout[0])
+            queries, qrows = _device_rows(t['query_ptr'],candidates,layout[1])
         if np.ndim(k):
             mode = torch.as_tensor(k, device=x.device)
             control_mode, path_mode = mode[rows], mode[rows[qrows]]
@@ -169,20 +173,25 @@ class ReferenceField:
         path = t["query_path"][queries]
         d0 = distance.new_full((len(candidates),), float("inf")).scatter_reduce(
             0, qrows, distance + t["geometric"][path], reduce="amin", include_self=True)
+        controls = t["candidate_control"][candidates]
+        counts = t["candidate_ptr"][roots+1] - t["candidate_ptr"][roots]
+        if support_only:
+            # Frozen finite path costs cannot change whether a positive compact
+            # support weight exists. Avoid reading frequency costs for this check.
+            active = d0 < float(a['radius'])
+            if 'control_valid' in a:
+                active &= t['control_valid'][control_mode,controls]
+            return _segment_sum(active.to(x.dtype),counts)>0
         dk = distance.new_full((len(candidates),), float("inf")).scatter_reduce(
             0, qrows, distance * stretch + t["weighted"][path_mode,path],
             reduce="amin", include_self=True)
         ratio = d0 / float(a["radius"])
         attenuation = torch.where(dk > 0, d0 / dk.clamp_min(torch.finfo(dk.dtype).tiny), torch.ones_like(dk))
         raw = (1-ratio).clamp_min(0).pow(4) * (1+4*ratio) * attenuation
-        controls = t["candidate_control"][candidates]
         if "control_valid" in a:
             raw = raw * t["control_valid"][control_mode, controls].to(x.dtype)
-        counts = t["candidate_ptr"][roots+1] - t["candidate_ptr"][roots]
         total = _segment_sum(raw, counts)
         good = total > 0
-        if support_only:
-            return good
         weight = (raw / total[rows].clamp_min(torch.finfo(raw.dtype).tiny)).to(x.dtype)
         angular = t["angular"][control_mode,controls]
         displacement = t["displacement"][control_mode,controls]
@@ -195,7 +204,35 @@ class ReferenceField:
         omega = _segment_sum(weight[:,None] * angular, counts)
         return phi, omega, good
 
-    def _mode(self, x, roots, k, *, support_only=False):
+    def prepare_query(self, roots, k, device):
+        """Expand only immutable indices; distances/weights still depend on x."""
+        a=self.a
+        own=a['own'][k,roots];donor=a['donor_ids'][k,roots];beta=a['donor_weights'][k,roots]
+        target,slots=np.nonzero((beta>0)&~own[:,None]);own_rows=np.flatnonzero(own)
+        query_roots=np.r_[roots[own_rows],donor[target,slots]]
+        output_rows=np.r_[own_rows,target]
+        cp,qp=a['candidate_ptr'],a['query_ptr']
+        candidate_count=int((cp[query_roots+1]-cp[query_roots]).sum())
+        query_count=int((qp[cp[query_roots+1]]-qp[cp[query_roots]]).sum())
+        tensor=lambda v:torch.as_tensor(v,device=device)
+        return dict(roots=query_roots,mode=k[output_rows] if np.ndim(k) else k,
+            row=tensor(output_rows),origin=tensor(a['points'][roots[output_rows]]),
+            donor_origin=tensor(a['points'][query_roots]),
+            weight=tensor(np.r_[np.ones(len(own_rows)),beta[target,slots]])[:,None],
+            order=tensor(np.argsort(output_rows,kind='stable')),
+            counts=tensor(np.bincount(output_rows,minlength=len(roots))),
+            layout=(candidate_count,query_count))
+
+    def _mode(self, x, roots, k, *, support_only=False, prepared=None):
+        if prepared is not None:
+            p=prepared;row=p['row']
+            result=self._own((x[row]-p['origin'].to(x.dtype))+p['donor_origin'].to(x.dtype),
+                p['roots'],p['mode'],support_only=support_only,layout=p['layout'])
+            good=result if support_only else result[2]
+            bad=torch.zeros(len(x),device=x.device,dtype=torch.long).index_add(0,row,(~good).long())
+            if support_only:return bad==0
+            weight=p['weight'].to(x.dtype)
+            return (*(_segment_sum((weight*v)[p['order']],p['counts']) for v in result[:2]),bad==0)
         a = self.a
         own = a["own"][k,roots]
         donor = a["donor_ids"][k,roots]

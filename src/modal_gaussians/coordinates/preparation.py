@@ -1,7 +1,6 @@
 """Fixed mode banks and SEA-RAFT initialization, stored inside one scene experiment."""
 from contextlib import contextmanager
 import json
-import os
 import sys
 from pathlib import Path
 import tempfile
@@ -10,7 +9,7 @@ import numpy as np
 
 from modal_gaussians.coordinates.sources import load_coordinate_flow
 from modal_gaussians.coordinates.direct import DIRECT_COORDINATES_FORMAT, SOLVER_CONVENTION, DirectCoordinateConfig, DirectModalCoordinatesArtifact, solve_direct_coordinates_view, _validate_modes
-from modal_gaussians.common.cache import atomic_json, identity, sha256, module_revision
+from modal_gaussians.common.cache import atomic_json, identity, sha256, module_revision, publish_directory
 from modal_gaussians.motion.common.completed_modes import COMPLETED_MODES_FORMAT, CompletedModesArtifact, load_completed_modes
 from modal_gaussians.common.numpy_io import save_named_arrays
 from modal_gaussians.common.progress import Progress
@@ -40,7 +39,7 @@ def _publish(destination):
         yield work
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"Artifact appeared during preparation: {destination}")
-        os.rename(work, destination)
+        publish_directory(work, destination)
 
 
 def _bank_identity(m):

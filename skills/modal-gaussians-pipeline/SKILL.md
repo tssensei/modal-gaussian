@@ -38,3 +38,7 @@ A code cleanup request does not authorize real experiments. A run request includ
 necessary computation and recovery, but does not authorize commit, push, upload,
 package downgrades, raw-input deletion or broad cache cleanup. Distinguish successful
 execution from visual inspection and scientific approval when reporting results.
+
+`static refine-scene` is an explicitly requested optional stage, never appended by
+default. It changes the Gaussian scene/density while freezing motion and sweep q;
+see the scene-refinement commands in [commands](references/commands.md).

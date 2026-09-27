@@ -1,5 +1,50 @@
 # Cleanup and required rebuilds — 2026-09-23
 
+## Explicit frozen-motion sweep scene refinement — 2026-09-26
+
+The experiment driver additionally supports explicitly authorized early stopping
+from a complete evaluation checkpoint (`finish-early`). Stopping policy and actual
+budgets are experiment metadata; the numerical trainer/configuration and its
+resume identity stay unchanged. Existing matching checkpoints remain readable.
+Publish the selected scene/modes/coordinates and rebuild their result/evaluation
+deliverables; do not reinterpret an interrupted checkpoint as a full-budget run.
+Shared coordinate/result publication now uses the existing Windows directory-lock
+retry helper. This changes publication reliability only; existing published
+artifacts remain valid. New preparation identities that include the source-module
+revision may change conservatively; no numerical rebuild is needed for this fix.
+
+New `static refine-scene` is separate from the removed historical joint
+Gaussian/coefficient optimizer. It freezes q and all reference motion while changing
+Gaussian attributes/counts. New scene v8, completed modes v21 and transferred
+coordinates v1 have matching result/evaluation/video/Viser consumers; v5/v6 scenes
+and v20 modes remain supported, v7 stays unsupported.
+
+Reusable ancestors: registered/raw PNGs and camera clocks, original static scene,
+manual partition, original/refined modes and refined controls/reference graph,
+frequency-specific paths/donors, fixed-view and sweep coefficients. No upstream
+retraining, catalog redirect or source mutation is needed. New Gaussian order
+requires freshly baked fields, frozen-coordinate bindings, result/evaluation/video
+publication. Old fixed W/L operator preparation is not reusable on the new domain.
+
+Renderer info exposure preserves existing render output; dynamic-query acceleration
+preserves values/position gradients and recomputes distances/weights/levers. New run
+identities include affected code. Old published ancestors remain readable; never
+edit hashes or reuse an incompatible live training checkpoint. Experiments and
+quality review are recorded separately from synthetic implementation checks.
+
+
+## Fit sweep coefficients with frozen refined modes — 2026-09-26
+
+`fit-sweep` now accepts a matching single-fixed-view refined coordinate artifact
+as its normalization source. Sweep coordinate v2 records its source kind;
+producers, loader, subset publication and downstream result/viewer consumers use
+that contract. The sweep implementation hash changes; v1 sweep outputs remain
+historical and require a new fit/result/evaluation/export to use current readers.
+Static scenes, camera metadata, original/refined modes, fixed-view coordinates
+and refinement preparation remain reusable. No refinement rerun is needed.
+No old manifest or catalog is rewritten. The authorized Bush sweep experiment
+uses a new output directory with frozen RGB-only greedy20 fields.
+
 ## Joint motion-update stencil cache and block size — 2026-09-26
 
 `FixedField` now caches the immutable CSR expansion and segment lengths per
