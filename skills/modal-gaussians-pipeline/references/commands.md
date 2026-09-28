@@ -148,6 +148,26 @@ checked fixed-view prefix and skips warmup, preserving the included shared offse
 and pixel-pair normalization. Use a fresh work/output directory; resume binds the
 same diagnostic source. This does not change the default zero-start recipe.
 
+## Optional interactive modal viewing
+
+Optional interaction inspection uses the existing viewer command:
+
+```sh
+modal-gaussians viewer --input RESULT_OR_MODES --work-dir EXP/interactive_viewer --no-spectrum
+```
+
+Choose **Drive → Interactive simulation**. Hold **Ctrl + left-drag** on visible foreground to excite the
+loaded modes, release to rebound, and use **Damping ratio ζ** (default 0.05) and
+**Interaction strength** (default 1). **Maximum drag distance (%)** adjusts the
+target cap from 1–100% of foreground radius, default 5%. Release Ctrl or the mouse to rebound;
+drag without Ctrl to orbit. Reset clears motion; switching drivers restores recorded/manual playback.
+**Render FPS** selects 30/60 (default 60), independent of recorded-video FPS.
+All loaded modes and the selected resolution remain in use. Server FPS counts
+completed JPEG/message enqueue, not browser presentation; idle/paused states show
+their status instead of a stale rate.
+No coefficient input is required, no training/export runs, and no artifacts change.
+Launch only when requested; this optional inspection does not extend the mainline.
+
 ## Optional frozen-motion sweep scene refinement
 
 Only append this stage when explicitly requested.

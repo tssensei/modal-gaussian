@@ -42,3 +42,11 @@ execution from visual inspection and scientific approval when reporting results.
 `static refine-scene` is an explicitly requested optional stage, never appended by
 default. It changes the Gaussian scene/density while freezing motion and sweep q;
 see the scene-refinement commands in [commands](references/commands.md).
+
+Optional interactive viewing: choose **Drive → Interactive simulation** in Viser
+for Ctrl + left-drag/release and a damping-ratio slider (drag without Ctrl to navigate).
+It reuses loaded modes/scene,
+needs no recorded q, and publishes nothing. See [commands](references/commands.md).
+Render FPS selects 30/60 (default 60) without changing the simulation clock or
+reducing mode count; displayed Server FPS is not browser presentation FPS.
+This does not change the pipeline endpoint or authorize an automatic viewer launch.

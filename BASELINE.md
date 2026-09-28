@@ -363,3 +363,35 @@ Bush A/B: registered 540p 362-frame/30-FPS sweep, source subject_scene_union,
 20 view1 RGB-only modes at step 7000 and independent fitted sweep q. View1's original
 300 frames/q are an untrained-view check, not an independent test set or selection
 criterion. Results remain experimental until metrics and visual review are complete.
+
+## Optional interactive modal simulation
+
+Viewer-only synthesis starts at zero state, with all loaded positive frequencies
+whose displacement RMS exceeds 1e-12. Nonfinite fields/frequencies are rejected.
+Each mode uses displacement RMS over nonzero foreground nodes and a complex principal
+phase; ambiguous phase uses the first largest component. Angular fields use the
+same factor. No normalized GPU field copy is retained. Local conjugate drag
+projection is divided by summed local normalized displacement energy. Default
+normalization can be disabled with **Normalize mode RMS / phase**: valid modes then
+use factor 1 for input projection and rendering, with the local denominator computed
+from raw fields. Mode eligibility is unchanged; switching resets session state.
+The independent **Divide by local support (S_p)** checkbox defaults on; disabling
+it uses delta-z = strength * conjugate(local-field dot drag), preserving the
+zero-support rejection. This changes response magnitude, not frequency or damping.
+This is an optional interaction ablation, not a new accepted motion recipe. Default
+strength is 1; Maximum drag distance (%) sets the target cap to 1–100% of the
+foreground radius, default 5%, step 1% (radius is the 95th percentile distance
+from the coordinate-wise median). Picking requires total
+foreground alpha contribution >=0.1 and the strongest contributor to be foreground,
+using native rasterizer tile order, conics and alpha/transmittance cutoffs.
+
+Free motion uses exact float64 damped-oscillator transitions on a monotonic clock,
+with z=rho-i*v/omega and global damping ratio 0.05 in [0,1]. Dragging holds the
+starting state and applies total cursor displacement; release preserves velocity.
+Recorded coefficients, modal training and reconstruction recipes are unchanged.
+This is motion synthesis in an observed basis, not calibrated physical simulation.
+Interactive display defaults to 60 FPS, with a 30 FPS option. Absolute monotonic
+deadlines and high-resolution sleep replace timeout-based Event waits; overruns
+skip display requests, not elapsed simulation time. Viewer displacement/angular
+sums use complex64 matrix-vector products with the same real(q*field) convention.
+This changes floating-point reduction order only; all loaded modes remain active.

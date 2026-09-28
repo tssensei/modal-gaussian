@@ -23,6 +23,7 @@ from modal_gaussians.vis.inputs import ViewerInput, load_viewer_input
 from modal_gaussians.vis.projections import ViewerProjections
 from modal_gaussians.vis.render_panel import populate_render_tab
 from modal_gaussians.vis.spectrum import ModalSpectrumPanel, SpectrumComparisonController, _hsv_rgb
+from modal_gaussians.vis.interaction import DRIVE_INTERACTIVE, ViewerInteraction
 
 
 DRIVE_FLOW = "flow-derived coordinates"
@@ -362,9 +363,12 @@ class ModalViewerData:
         values = np.array(q, dtype=np.complex64, copy=True)
         if values.shape != (len(self.frequencies_hz),):
             raise ValueError("Viewer modal coordinate has the wrong mode count")
+        if not np.isfinite(values).all() or not math.isfinite(scale):
+            raise ValueError("Viewer modal coordinate and scale must be finite")
+        if scale == 0 or not np.any(values):
+            return self.scene.foreground.active()["means"]
         q_tensor = torch.from_numpy(values).to(self.device)
-        offset = torch.einsum("k,kgc->gc", q_tensor.real, self.phi.real)
-        offset -= torch.einsum("k,kgc->gc", q_tensor.imag, self.phi.imag)
+        offset = (q_tensor @ self.phi.flatten(1)).real.reshape(-1, 3)
         return self.scene.foreground.active()["means"] + float(scale) * offset
 
     def deformed_quaternions(self, q: np.ndarray, scale: float = 1.0) -> Tensor | None:
@@ -379,8 +383,7 @@ class ModalViewerData:
         if scale == 0 or not np.any(values):
             return None
         coefficients = torch.from_numpy(values).to(self.device)
-        angles = torch.einsum("k,kgc->gc", coefficients.real, self.rotation.real)
-        angles -= torch.einsum("k,kgc->gc", coefficients.imag, self.rotation.imag)
+        angles = (coefficients @ self.rotation.flatten(1)).real.reshape(-1, 3)
         # ponytail: blended control rotation is a kinematic prior; infer local
         # rotations from center motion if this approximation fails visually.
         return _rotate_gaussian_quaternions(
@@ -519,6 +522,8 @@ class ModalViserViewer:
         self._render_lock = threading.Lock()
         self._render_running = False
         self._render_again = False
+        self._render_closed = False
+        self._render_thread = None
         self._selection_sync = False
         self._canonical_disabled_cache: list[bool] = []
         self._point_cloud: Any | None = None
@@ -527,6 +532,7 @@ class ModalViserViewer:
         self._component_graph_edge_indices = np.empty((0,), dtype=np.int64)
         self._component_graph_color_mode: int | None = None
         self._frustums: dict[str, Any] = {}
+        self.interaction = None
         all_means = torch.cat(
             (
                 self.data.scene.foreground.active()["means"],
@@ -613,6 +619,7 @@ class ModalViserViewer:
         self._build_color_controls()
         self._build_modal_controls()
         self._build_debug_controls()
+        self.interaction = ViewerInteraction(self)
 
         tabs = self.server.gui.add_tab_group()
         with tabs.add_tab("Render", viser.Icon.CAMERA):
@@ -640,8 +647,11 @@ class ModalViserViewer:
     def _on_playback_view(self, event: Any) -> None:
         """Clamp the local frame slider after changing playback view."""
 
+        if getattr(self, 'interaction', None) is not None and self.interaction.active:
+            return
         available = self.data.has_coordinates(self._active_view_index())
-        self.drive.options = (DRIVE_FLOW, DRIVE_MANUAL) if available else (DRIVE_MANUAL,)
+        self.drive.options = ((DRIVE_FLOW, DRIVE_MANUAL, DRIVE_INTERACTIVE) if available
+                              else (DRIVE_MANUAL, DRIVE_INTERACTIVE))
         if not available:
             self.drive.value = DRIVE_MANUAL
         maximum = self._active_frame_count() - 1
@@ -656,6 +666,9 @@ class ModalViserViewer:
     def _on_canonical(self, event: Any) -> None:
         """Freeze or restore all time/playback controls in canonical mode."""
 
+        if getattr(self, 'interaction', None) is not None and self.interaction.active:
+            self.request_render(event)
+            return
         disabled = bool(self.canonical.value)
         handles = (self.playback_view, *self.playback)
         if disabled:
@@ -694,6 +707,7 @@ class ModalViserViewer:
             )
             self.rotate_ellipsoids.on_update(self.request_render)
             disable_all = self.server.gui.add_button("Turn off all modes")
+            self.disable_all_modes_button = disable_all
             self.mode_controls = []
             for mode_index, frequency in enumerate(self.data.frequencies_hz):
                 enabled = self.server.gui.add_checkbox(
@@ -774,6 +788,8 @@ class ModalViserViewer:
     def _current_coordinate(self) -> tuple[np.ndarray, float]:
         """Select canonical, stored flow-derived, or manual oscillator coordinates."""
 
+        if getattr(self, 'interaction', None) is not None and self.interaction.active:
+            return self.interaction.coordinates(), 1.0
         if bool(self.canonical.value):
             return np.zeros(len(self.data.frequencies_hz), dtype=np.complex64), 1.0
         if str(self.drive.value) == DRIVE_MANUAL:
@@ -1211,6 +1227,7 @@ class ModalViserViewer:
         )
         with self.server.gui.add_folder("Cameras"):
             show = self.server.gui.add_checkbox("Show cameras", True)
+            self.show_cameras = show
             reset = self.server.gui.add_button("Reset orbit center")
             for index, camera in enumerate(self.data.cameras):
                 wxyz, position = self._camera_pose(camera)
@@ -1307,21 +1324,24 @@ class ModalViserViewer:
     def request_render(self, event: Any = None) -> None:
         """Coalesce rapid GUI/camera updates into a single render worker."""
 
-        if event is not None and getattr(event, "client", None) is not None:
-            self._last_client = event.client
         with self._render_lock:
+            if self._render_closed:
+                return
+            if event is not None and getattr(event, "client", None) is not None:
+                self._last_client = event.client
             self._render_again = True
             if self._render_running:
                 return
             self._render_running = True
-        threading.Thread(target=self._render_worker, daemon=True).start()
+            self._render_thread = threading.Thread(target=self._render_worker, daemon=True)
+            self._render_thread.start()
 
     def _render_worker(self) -> None:
         """Render until all updates that arrived during rasterization are consumed."""
 
         while True:
             with self._render_lock:
-                if not self._render_again:
+                if self._render_closed or not self._render_again:
                     self._render_running = False
                     return
                 self._render_again = False
@@ -1331,17 +1351,35 @@ class ModalViserViewer:
                 continue
             try:
                 with getattr(self.data, "gpu_lock", self._render_lock):
+                    started = time.perf_counter()
                     image = self._render(client)
+                    rendered = time.perf_counter()
                 self.server.scene.set_background_image(
                     image, format="jpeg", jpeg_quality=90
                 )
+                finished = time.perf_counter()
+                if self.interaction is not None and self.interaction.active:
+                    self.interaction.note_frame(rendered - started, finished - rendered, finished)
             except Exception as error:
                 print(f"Viewer render failed: {error}")
+
+    def _close_rendering(self):
+        """Finish the current image and reject late camera/GUI requests."""
+        with self._render_lock:
+            self._render_closed = True
+            self._render_again = False
+            worker = self._render_thread
+        if worker is not None:
+            worker.join()
 
     @torch.inference_mode()
     def _render(self, client: viser.ClientHandle) -> np.ndarray:
         """Render one frame and refresh deformed point and graph overlays."""
 
+        if self.interaction is not None:
+            self.interaction.prepare(client)
+            if self.interaction.active:
+                return self.interaction.render(client)
         q, scale = self._current_coordinate()
         means = self.data.deformed_means(q, scale)
         camera = self._render_camera(client)
@@ -1385,6 +1423,9 @@ class ModalViserViewer:
         except KeyboardInterrupt:
             pass
         finally:
+            if self.interaction is not None:
+                self.interaction.close()
+            self._close_rendering()
             if getattr(self.data, "spectrum", None) is not None:
                 self.data.spectrum.close()
             self.server.stop()

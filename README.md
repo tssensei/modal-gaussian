@@ -163,6 +163,34 @@ coefficient fitting or a viewer.
 Use `viewer --no-spectrum` for 3D/manual/coefficient playback without loading FFT
 sources or the Spectrum panel. Default viewing still validates those sources.
 
+Choose **Drive → Interactive simulation**, then hold **Ctrl + left-drag** to move visible
+foreground. Release Ctrl or the mouse to rebound; drag without Ctrl to navigate the camera
+during simulation. Damping ratio ζ defaults to 0.05 (range 0–1); strength
+defaults to 1 (range 0–5). Pause freezes time; Reset clears motion, keeping the
+camera and sliders. Switching drives discards the interactive state and restores
+playback controls. Modes without recorded coefficients also work. Interaction uses
+all valid positive-frequency displacement/angular fields and the original SH
+renderer; it does not use recorded q or manual motion scale. This is a soft modal
+response, not an exact cursor constraint. **Maximum drag distance (%)** adjusts
+the target cap from 1–100% of the foreground robust radius (default 5%, step 1%).
+The selected limit applies on the next pointer update. Damping and strength are
+synthesis settings, not measured material properties. State lives only in the
+session; training artifacts stay unchanged.
+
+**Normalize mode RMS / phase** defaults on. Turn it off to compare raw-mode
+interaction while retaining local support normalization, damping and drag limits.
+Changing it clears the simulation and grab; source fields are never modified.
+**Divide by local support (S_p)** independently controls the local denominator
+(default on). Turn it off for direct conjugate projection without dividing by
+local field energy. Switching either checkbox clears motion; other controls remain.
+
+**Render FPS** selects 30 or 60 (default 60) for interactive free motion, independently
+of recorded-video FPS. The deadline clock skips missed displays without slowing the
+simulation. Held drags update on mouse events; paused/static states do not repeat
+unchanged renders. **Server FPS** measures completed rendering, JPEG90 encoding and
+message enqueue, not browser presentation; the timing line shows Idle/Paused when
+appropriate. All modes, Gaussian rows, SH and the selected resolution are retained.
+
 Motion refinement freezes the entire static scene and learns control-point modal
 corrections plus independent per-frame q. Preparation accepts selected recordings
 (`--view`, repeatable; default all) and optional sweep metadata, with no prior RGB

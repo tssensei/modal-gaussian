@@ -1,5 +1,34 @@
 # Cleanup and required rebuilds — 2026-09-23
 
+## Interactive modal viewer — 2026-09-27
+
+The optional **Normalize mode RMS / phase** checkbox changes only session input
+projection/state conversion; its default remains enabled. Restart the viewer for
+the control. No source artifacts or caches require rebuilding for this ablation.
+The additional **Divide by local support (S_p)** checkbox likewise affects only
+session drag projection and resets motion when toggled; its default is enabled.
+
+`motion/interaction.py` supplies in-memory normalization, conjugate drag projection
+and analytic damped oscillators. `vis/interaction.py` owns native Viser drag events,
+rasterizer-consistent picking and the independent simulation clock. The viewer
+switches q drivers without changing the displacement/angular/SH render convention.
+No artifact format, cache interpretation, training recipe or identity changes.
+All scenes, mode banks, operators, coordinates, results and projection caches remain
+reusable. Restart Viser to use the optional Interactive simulation drive. No rebuild,
+fitting, export, catalog redirection or persistent interaction coordinates required.
+The session-only Maximum drag distance (%) slider replaces the fixed 5% cap;
+its default remains 5%, with a 1–100% range. Existing artifacts stay reusable.
+Hold Ctrl + left-drag replaces Mouse mode; ordinary dragging navigates the camera.
+This uses Viser's native modifier binding; no key adapter or package changes are needed.
+Render FPS now selects 30/60 (default 60) using absolute deadlines. Viewer-only
+complex64 modal matrix-vector products preserve the real(q*field) convention but
+can produce small rounding differences at occlusion edges. There is no changed
+cache producer or artifact interpretation; scenes/modes/q and existing pipeline
+caches remain reusable. Restart the viewer; no training or downstream rebuild.
+Completed-frame statistics include JPEG and message enqueue, not browser display.
+An explicitly requested real-scene viewer inspection does not validate physical
+material parameters or guarantee natural motion outside the observed modal basis.
+
 ## Explicit frozen-motion sweep scene refinement — 2026-09-26
 
 The experiment driver additionally supports explicitly authorized early stopping
