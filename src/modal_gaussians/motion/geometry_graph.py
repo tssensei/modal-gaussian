@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
-from scipy.sparse.csgraph import dijkstra
+from scipy.sparse.csgraph import dijkstra, minimum_spanning_tree
 import scipy.spatial as spatial
 
 cKDTree = getattr(spatial, "cKDTree")
@@ -25,7 +25,9 @@ EVIDENCE_SPATIAL_PRIOR = 2  # KNN-only ablation; no claim of depth support.
 @dataclass(frozen=True)
 class GeometryGraphConfig:
     max_neighbors: int = 16
-    max_distance: float = 0.08
+    max_distance: float | None = 0.08
+    connect_components: bool = False
+    bridge_max_distance: float | None = None
     alpha_minimum: float = 0.05
     control_radius_fraction: float = 0.015
     max_controls: int = 32768
@@ -37,7 +39,15 @@ class GeometryGraphConfig:
         for name in ('max_neighbors', 'max_controls'):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f'{name} must be a positive integer')
-        for name in ('max_distance', 'control_radius_fraction', 'alpha_minimum'):
+        if type(self.connect_components) is not bool:
+            raise ValueError('connect_components must be boolean')
+        if self.max_distance is not None and (isinstance(self.max_distance, bool)
+                or not math.isfinite(self.max_distance) or self.max_distance <= 0):
+            raise ValueError('max_distance must be null or finite and positive')
+        if self.bridge_max_distance is not None and (isinstance(self.bridge_max_distance, bool)
+                or not math.isfinite(self.bridge_max_distance) or self.bridge_max_distance <= 0):
+            raise ValueError('bridge_max_distance must be null or finite and positive')
+        for name in ('control_radius_fraction', 'alpha_minimum'):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f'{name} must be finite and positive')
@@ -282,7 +292,7 @@ def _mutual_knn(points: np.ndarray, config: GeometryGraphConfig) -> tuple[np.nda
         lengths = np.linalg.norm(points[candidates] - points[i], axis=1)
         order = np.lexsort((candidates, lengths))[:k]
         for target, length in zip(candidates[order], lengths[order]):
-            if 0 < length <= config.max_distance:
+            if length > 0 and (config.max_distance is None or length <= config.max_distance):
                 directed.add((i, int(target)))
     edges = np.asarray(sorted((i, j) for i, j in directed if i < j and (j, i) in directed), dtype=np.int64).reshape(-1, 2)
     lengths = np.linalg.norm(points[edges[:, 0]] - points[edges[:, 1]], axis=1)
@@ -308,6 +318,67 @@ def _components(count: int, edges: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
     return degree, component, np.bincount(component).astype(np.int64)
 
 
+def _component_bridges(points: np.ndarray, component: np.ndarray) -> np.ndarray:
+    """Boruvka minimum-length bridges on contracted mutual-KNN components.
+
+    Query a small global neighborhood first. Only unresolved dense components
+    need a complement tree; never allocate a pairwise foreground distance matrix.
+    Zero-length edges remain forbidden by the existing geometry contract.
+    """
+    labels = component.copy()
+    tree = cKDTree(points)
+    bridges = []
+    while len(sizes := np.bincount(labels)) > 1:
+        candidates = []
+        groups = np.argsort(labels, kind='stable')
+        offsets = np.r_[0, np.cumsum(sizes)]
+        # The largest component need not propose an edge: all other components
+        # choose a minimum outgoing edge, so every round still makes progress.
+        for group in range(len(sizes)):
+            if group == int(sizes.argmax()):
+                continue
+            nodes = groups[offsets[group]:offsets[group + 1]]
+            distance, neighbor = tree.query(points[nodes], k=min(16, len(points)))
+            valid = (labels[neighbor] != group) & (distance > 0)
+            masked = np.where(valid, distance, np.inf)
+            row, col = np.unravel_index(masked.argmin(), masked.shape)
+            best = float(masked[row, col])
+            unresolved = ~valid.any(axis=1)
+            if not np.isfinite(best) or np.any(distance[unresolved, -1] <= best):
+                outside = np.flatnonzero(labels != group)
+                # Unique targets let k=2 skip a coincident center without losing
+                # positive-length connections for duplicate Gaussian positions.
+                unique, first = np.unique(points[outside], axis=0, return_index=True)
+                outside = outside[first]
+                distance, neighbor = cKDTree(unique).query(points[nodes], k=[1, 2])
+                masked = np.where((distance > 0) & np.isfinite(distance), distance, np.inf)
+                row, col = np.unravel_index(masked.argmin(), masked.shape)
+                best = float(masked[row, col])
+                if not np.isfinite(best):
+                    raise ValueError('Cannot connect coincident foreground using positive-length edges')
+                target = int(outside[neighbor[row, col]])
+            else:
+                target = int(neighbor[row, col])
+            start, end = sorted((int(nodes[row]), target))
+            candidates.append((best, start, end))
+        # Deduplicate component pairs using their shortest proposed edge.
+        pairs = {}
+        for length, start, end in sorted(candidates):
+            pair = tuple(sorted((int(labels[start]), int(labels[end]))))
+            pairs.setdefault(pair, (length, start, end))
+        rows, cols = np.asarray(list(pairs), dtype=np.int64).T
+        costs = [pairs[pair][0] for pair in pairs]
+        forest = minimum_spanning_tree(coo_matrix((costs, (rows, cols)),
+            shape=(len(sizes), len(sizes))).tocsr()).tocoo()
+        joined = np.column_stack((forest.row, forest.col)).astype(np.int64)
+        for a, b in joined:
+            _, start, end = pairs[(int(a), int(b))]
+            bridges.append((start, end))
+        _, merged, _ = _components(len(sizes), joined)
+        labels = merged[labels]
+    return np.asarray(sorted(bridges), dtype=np.int64).reshape(-1, 2)
+
+
 def build_geometry_graph_arrays(*, foreground_means, view_count, config=None):
     settings = config or GeometryGraphConfig()
     settings.validate()
@@ -317,6 +388,15 @@ def build_geometry_graph_arrays(*, foreground_means, view_count, config=None):
     if type(view_count) is not int or view_count < 1:
         raise ValueError('View count must be positive')
     edges, lengths = _mutual_knn(points, settings)
+    if settings.connect_components:
+        _, component, _ = _components(len(points), edges)
+        bridges = _component_bridges(points, component)
+        if settings.bridge_max_distance is not None:
+            # Cutting long MST edges yields the radius-constrained spanning forest.
+            lengths = np.linalg.norm(points[bridges[:, 0]] - points[bridges[:, 1]], axis=1)
+            bridges = bridges[lengths <= settings.bridge_max_distance]
+        edges = np.unique(np.concatenate((edges, bridges)), axis=0)
+        lengths = np.linalg.norm(points[edges[:, 0]] - points[edges[:, 1]], axis=1)
     evidence = np.zeros((len(edges), view_count), dtype=np.int8)
     visibility = np.zeros((len(points), view_count), dtype=bool)
     degree, component, sizes = _components(len(points), edges)

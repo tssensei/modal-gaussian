@@ -20,7 +20,7 @@ from modal_gaussians.motion import training as nm
 
 FORMAT = "modal_gaussians.neural_prepared"
 OBSERVATION_FIELDS = ("pixel_sample_stride", "alpha_minimum", "mask_erosion_iterations", "energy_floor_fraction")
-GRAPH_FIELDS = ("graph_neighbors", "graph_max_distance", "graph_edge_filter")
+GRAPH_FIELDS = ("graph_neighbors", "graph_max_distance", "graph_edge_filter", "graph_connect_components", "graph_bridge_max_distance")
 CONTROL_FIELDS = ("control_radius_fraction", "max_controls")
 
 

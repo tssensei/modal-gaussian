@@ -83,6 +83,10 @@ views/images identify the actual subset. No source artifact is rewritten.
   Existing files alone do not establish a valid cache hit.
 - Share KNN/control geometry only across matching static identity and Gaussian
   order. Modal weights, view gains, donor eligibility and fields are frequency specific.
+  Geometry configuration also binds `graph_connect_components` (default false)
+  and `graph_max_distance` (null means no local-edge cutoff). Connected graphs
+  retain the existing array schema; bridges are ordinary positive-length spatial
+  prior candidates and receive the usual per-frequency soft weighting later.
 - Mutable run files include logs, status, scheduler limits and checkpoints.
   Atomic publication prevents partially written results from appearing complete.
 - `motion batch-neural` publishes a local `index.json` after all requested modes
@@ -240,3 +244,7 @@ state/checksum. Run identity includes config, inputs and output-affecting code.
 It cannot resume old static training or coordinate refinement. GPU query layouts
 are transient and contain no learned weights; dynamic distances/weights/levers
 are recomputed. A best checkpoint does not claim to be the final update.
+
+Graph contracts additionally bind `graph_bridge_max_distance` (null by default).
+Finite limits cut long bridges, retaining a forest and unchanged Gaussian rows.
+Soft-graph producers and downstream preparation/training check this setting.

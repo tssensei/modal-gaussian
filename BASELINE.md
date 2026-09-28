@@ -227,6 +227,14 @@ Historical reconstruction baselines and source artifacts remain unchanged.
 - Candidate geometry is mutual KNN: K=16, maximum normalized-world distance 0.08.
   Each frequency has its own modal-similarity weights, with minimum factor 0.05.
   Shared control geometry can be reused; one frequency's soft weights cannot.
+  The explicit connectivity experiment uses `configs/neural_component_field_connected.json`:
+  K=12, `graph_max_distance=null`, `graph_connect_components=true`. It retains
+  local mutual-KNN edges and adds a minimum-length spanning tree between their
+  components (C-1 bridges), preserving all foreground rows. K limits local
+  neighbors; bridge endpoints may have higher final degree. Positive geometric
+  edge lengths remain required; all-coincident multi-point input is rejected.
+  Control coverage/interpolation radii and per-frequency soft weighting are unchanged.
+  This experiment does not replace the accepted K=16 baseline without evaluation.
 - GPU alpha fitting and GPU soft propagation use CuPy. There is no CPU fallback.
   The resident preparation worker exits before GNN training starts.
   Alpha's bounded TRF solver QR-reduces the augmented Jacobian and residual
@@ -395,3 +403,9 @@ deadlines and high-resolution sleep replace timeout-based Event waits; overruns
 skip display requests, not elapsed simulation time. Viewer displacement/angular
 sums use complex64 matrix-vector products with the same real(q*field) convention.
 This changes floating-point reduction order only; all loaded modes remain active.
+
+Optional bounded K=8 experiment (`configs/neural_component_field_knn8_bounded.json`):
+`graph_neighbors=8`, `graph_max_distance=0.08`,
+`graph_connect_components=true`, `graph_bridge_max_distance=0.08`. Both local
+edges and bridges are capped; global connectivity is no longer required. This
+experiment does not replace the accepted recipe.

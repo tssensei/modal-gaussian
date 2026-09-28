@@ -1,5 +1,21 @@
 # Cleanup and required rebuilds — 2026-09-23
 
+## Connected K=12 geometry experiment — 2026-09-28
+
+`configs/neural_component_field_connected.json` opts into unbounded mutual KNN
+plus minimum-length component bridges. The geometry cache contract explicitly
+includes `graph_connect_components` and a nullable `graph_max_distance`; the
+geometry module revision also changes. Cache payload layout/version is unchanged.
+Soft-graph publication carries these settings and training checks their agreement.
+Existing immutable graphs and results remain readable; new builds receive new keys.
+
+Reuse the static scene, cameras, foreground selection, stabilized observations,
+flow and FFT/modal images when their identities match. A new topology requires
+new soft graphs, control layout/weights, reference paths, spatial modes, coefficient
+fitting and refinement preparations/results. Never reuse the old fixed W/L or
+resume a motion optimizer against the new graph. No catalog is redirected and
+this experiment does not run those downstream stages automatically.
+
 ## Interactive modal viewer — 2026-09-27
 
 The optional **Normalize mode RMS / phase** checkbox changes only session input
@@ -726,3 +742,14 @@ step renders two frames; the coefficient step renders one. Cached coefficient
 steps performed no graph query/backward. See local
 `tests/benchmark_alternating_refinement.json`; these are not Bush runtime or quality
 measurements. Real 30 FPS artifacts and training remain pending.
+
+## Bounded component bridges — 2026-09-28
+
+`graph_bridge_max_distance` independently caps added bridge lengths. Configuration
+and geometry code revisions enter cache identities; array layouts are unchanged
+and published graphs remain readable. Reuse scene/observations/FFT/alpha, but
+rebuild graphs and downstream controls, modes and coordinates to adopt this change;
+do not resume old optimizers. `configs/neural_component_field_knn8_bounded.json`
+preserves the K=8, dual-0.08 settings for explicitly selected future experiments.
+The default K=16 recipe, accepted baseline and catalog pointers remain unchanged;
+committing this option does not launch a rebuild or promote an experiment.

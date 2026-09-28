@@ -37,7 +37,9 @@ MODE_ARRAYS = {
 @dataclass(frozen=True)
 class NeuralModesConfig:
     graph_neighbors: int = 16
-    graph_max_distance: float = 0.08
+    graph_max_distance: float | None = 0.08
+    graph_connect_components: bool = False
+    graph_bridge_max_distance: float | None = None
     control_radius_fraction: float = 0.015
     max_controls: int = 32768
     hidden_dim: int = 256
@@ -82,8 +84,15 @@ class NeuralModesConfig:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"Neural {name} must be a non-negative integer")
-        for name in ("graph_max_distance",
-                     "control_radius_fraction", "alpha_minimum", "energy_floor_fraction",
+        if self.graph_bridge_max_distance is not None and (isinstance(self.graph_bridge_max_distance, bool)
+                or not math.isfinite(self.graph_bridge_max_distance) or self.graph_bridge_max_distance <= 0):
+            raise ValueError("graph_bridge_max_distance must be null or finite and positive")
+        if type(self.graph_connect_components) is not bool:
+            raise ValueError("graph_connect_components must be boolean")
+        if self.graph_max_distance is not None and (isinstance(self.graph_max_distance, bool)
+                or not math.isfinite(self.graph_max_distance) or self.graph_max_distance <= 0):
+            raise ValueError("graph_max_distance must be null or finite and positive")
+        for name in ("control_radius_fraction", "alpha_minimum", "energy_floor_fraction",
                      "huber_delta", "rotation_length_fraction", "learning_rate", "gradient_clip"):
             value = getattr(self, name)
             if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
@@ -158,6 +167,8 @@ def _geometry_config(config: NeuralModesConfig) -> Any:
     from modal_gaussians.motion.geometry_graph import GeometryGraphConfig
     return GeometryGraphConfig(
         max_neighbors=config.graph_neighbors, max_distance=config.graph_max_distance,
+        connect_components=config.graph_connect_components,
+        bridge_max_distance=config.graph_bridge_max_distance,
         alpha_minimum=config.alpha_minimum, control_radius_fraction=config.control_radius_fraction,
         max_controls=config.max_controls,
         edge_filter=config.graph_edge_filter,

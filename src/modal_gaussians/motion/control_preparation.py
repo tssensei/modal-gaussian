@@ -70,8 +70,10 @@ def prepare_control_weights(*, prepared_dir, geometry_graph_dir, config_path, fr
                 or not np.isclose(external["frequency_hz"], frequency_hz, rtol=0, atol=1e-9)):
             raise ValueError("Prepared observations and modal graph must match the requested frequency")
         if (neural.graph_edge_filter != "none" or neural.graph_neighbors != external["config"]["graph_neighbors"]
-                or not np.isclose(neural.graph_max_distance, external["config"]["graph_max_distance"], rtol=0, atol=1e-12)):
-            raise ValueError("Control preparation requires matching candidate K/radius and no extra graph filter")
+                or neural.graph_max_distance != external["config"]["graph_max_distance"]
+                or neural.graph_connect_components != external["config"].get("graph_connect_components", False)
+                or neural.graph_bridge_max_distance != external["config"].get("graph_bridge_max_distance")):
+            raise ValueError("Control preparation requires matching candidate K/radius/connectivity and no extra graph filter")
         revision, config_id = training_revision(config["fragment"]), identity(config)
         graph_dir = resolve_path(geometry_graph_dir)
         if ready(output, prepared_dir=prepared.path, graph_dir=graph_dir,

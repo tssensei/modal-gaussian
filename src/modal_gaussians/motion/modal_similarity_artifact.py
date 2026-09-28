@@ -185,6 +185,8 @@ def build_modal_similarity_graph_artifact(*, prepared_dir, geometry_graph_dir, v
         "frequency_hz": frequency_hz,
         "config": {"graph_neighbors": contract["config"]["graph_neighbors"],
                    "graph_max_distance": contract["config"]["graph_max_distance"],
+                   "graph_connect_components": contract["config"].get("graph_connect_components", False),
+                   "graph_bridge_max_distance": contract["config"].get("graph_bridge_max_distance"),
                    "graph_edge_filter": "modal-similarity", "modal_similarity": asdict(settings)},
         "source": {"prepared": str(prepared_path), "prepared_identity": prepared["prepared_identity"],
                    "geometry_graph": str(graph_path), "geometry_contract": contract,

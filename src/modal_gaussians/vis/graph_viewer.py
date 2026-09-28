@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from modal_gaussians.common.cache import identity, load_entry
-from modal_gaussians.motion.geometry_graph import GeometryGraph
+from modal_gaussians.motion.geometry_graph import GeometryGraph, GeometryGraphConfig, _mutual_knn
 from modal_gaussians.geometry.scene import load_static_scene, cameras_from_scene_manifest, _load_gsplat_rasterization
 from modal_gaussians.vis.viewer import ModalViserViewer, ViewerCamera, _component_colors, _stable_uniform_indices
 
@@ -117,6 +117,19 @@ class GraphViewerData:
         if not np.array_equal(self.graph.points, means):
             raise ValueError("Geometry points differ from the scene's foreground order or positions")
         self.graph_edge_gaussian_index, self.graph_edge_colors, self.graph_edge_removed = _candidate_graph_display(self.graph, status)
+        self.is_connected_geometry = (not self.is_similarity_graph
+                                     and self.graph_config.get('graph_connect_components', False))
+        self.graph_edge_bridge = np.zeros(len(self.graph_edge_gaussian_index), dtype=bool)
+        if self.is_connected_geometry:
+            # Recover the local-edge subset for display only; never alter saved topology.
+            local, _ = _mutual_knn(self.graph.points.astype(np.float64), GeometryGraphConfig(
+                max_neighbors=self.graph_config['graph_neighbors'],
+                max_distance=self.graph_config['graph_max_distance']))
+            count = len(self.graph.points)
+            edges = self.graph_edge_gaussian_index
+            self.graph_edge_bridge = ~np.isin(edges[:, 0] * count + edges[:, 1],
+                                              local[:, 0] * count + local[:, 1])
+            self.graph_edge_colors[self.graph_edge_bridge] = (255, 130, 20)
         if self.is_soft_graph:
             self.graph_edge_colors = _soft_weight_colors(self.graph_edge_colors, self.graph_edge_factor)
         self.graph_edge_status = status
@@ -138,8 +151,13 @@ class GraphViserViewer(ModalViserViewer):
         config = self.data.graph_config
         similarity = self.data.is_similarity_graph
         soft = self.data.is_soft_graph
+        connected = self.data.is_connected_geometry
         description = "Removed candidate edges are white. The display budget samples both groups."
-        if soft:
+        if connected:
+            description = (f"{self.data.graph_edge_bridge.sum():,} component bridges are orange. "
+                           "Local mutual-KNN edges keep component colors. No modal soft weights have been computed. "
+                           "The display budget prioritizes bridges; K limits local neighbors, not final degree.")
+        elif soft:
             factor = self.data.graph_edge_factor
             description = (f"All candidate connections remain. {(factor < 1).sum():,} downweighted edges "
                 "are gray; darker means a smaller fraction of the original weight. "
@@ -154,12 +172,16 @@ class GraphViserViewer(ModalViserViewer):
             description = (f"Motion difference: {counts[1]:,} candidates (white); "
                 f"insufficient evidence: {counts[2]:,} candidates (gray). "
                 "Only trusted retained edges are shown initially.\n\n" + thresholds)
+        radius = config['graph_max_distance']
+        radius_text = 'unlimited' if radius is None else f'{radius:g} scene units'
+        bridge_radius = config.get('graph_bridge_max_distance')
+        bridge_text = 'unlimited' if bridge_radius is None else f'{bridge_radius:g} scene units'
         gui.add_markdown(
             f"**Static geometry graph** — {len(graph.points):,} Gaussians, "
             f"{len(graph.edge_index):,} retained edges, {int(self.data.graph_edge_removed.sum()):,} removed, "
             f"{len(graph.component_size):,} components.\n\n"
-            f"K = {config['graph_neighbors']}, radius = {config['graph_max_distance']:g} "
-            f"(scene units), filter = {config['graph_edge_filter']}. "
+            f"K = {config['graph_neighbors']}, radius = {radius_text}, "
+            f"bridge radius = {bridge_text}, filter = {config['graph_edge_filter']}. "
             "Colors show retained connected components, including isolated points. "
             + description)
         self.viewer_resolution = gui.add_slider(
@@ -170,9 +192,10 @@ class GraphViserViewer(ModalViserViewer):
         self.show_points = gui.add_checkbox("Show Gaussian centers", True)
         self.point_size = gui.add_slider("Point size", min=0.0002, max=0.008, step=0.0001, initial_value=0.001)
         self.show_component_graph = gui.add_checkbox("Show component graph", True)
-        self.show_retained_edges = gui.add_checkbox("Show unchanged edges" if soft else "Show retained edges", True)
+        self.show_retained_edges = gui.add_checkbox(
+            "Show local KNN edges" if connected else "Show unchanged edges" if soft else "Show retained edges", True)
         self.show_removed_edges = gui.add_checkbox(
-            "Show downweighted edges" if soft else "Show motion-difference edges" if similarity else "Show removed edges",
+            "Show bridge edges" if connected else "Show downweighted edges" if soft else "Show motion-difference edges" if similarity else "Show removed edges",
             soft or not similarity)
         self.show_unsupported_edges = None
         if similarity and not soft:
@@ -195,7 +218,10 @@ class GraphViserViewer(ModalViserViewer):
         if not self.show_component_graph.value:
             self._remove_component_graph()
             return
-        if self.data.is_soft_graph:
+        if self.data.is_connected_geometry:
+            selected = _candidate_edge_subset(self.data.graph_edge_bridge,
+                self.component_graph_edge_count.value, self.show_retained_edges.value, self.show_removed_edges.value)
+        elif self.data.is_soft_graph:
             selected = _candidate_edge_subset(self.data.graph_edge_factor < 1,
                 self.component_graph_edge_count.value, self.show_retained_edges.value, self.show_removed_edges.value)
         elif getattr(self.data, "graph_edge_status", None) is not None:

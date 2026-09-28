@@ -163,6 +163,14 @@ coefficient fitting or a viewer.
 Use `viewer --no-spectrum` for 3D/manual/coefficient playback without loading FFT
 sources or the Spectrum panel. Default viewing still validates those sources.
 
+The optional `configs/neural_component_field_connected.json` experiment builds
+K=12 mutual neighbors without a distance cutoff, then adds minimum-length bridges
+to connect all foreground components. Use this same config for geometry preparation,
+control preparation and mode training. Existing published modes remain unchanged.
+`viewer --scene STATIC --geometry-graph GEOMETRY_GRAPH --work-dir VIEWER_WORK`
+shows local edges and orange bridge edges with separate toggles and a display budget.
+This geometry-only view does not compute modal soft weights or train modes.
+
 Choose **Drive → Interactive simulation**, then hold **Ctrl + left-drag** to move visible
 foreground. Release Ctrl or the mouse to rebound; drag without Ctrl to navigate the camera
 during simulation. Damping ratio ζ defaults to 0.05 (range 0–1); strength
@@ -230,3 +238,8 @@ establish real-scene reconstruction quality. No formal reconstruction metrics ar
 computed automatically. Explicit `result evaluate` measures native-resolution input
 PNGs against uncompressed renders (PSNR, SSIM, RMSE; add `--lpips` for LPIPS-Alex).
 Install the `evaluation` extra for LPIPS. An MP4 is not a metric input.
+
+For bounded connectivity, use `configs/neural_component_field_knn8_bounded.json`
+(K=8, local and bridge radii 0.08). Unlike the local KNN radius,
+`graph_bridge_max_distance` independently caps added bridges;
+remaining islands stay disconnected. Geometry-only viewing preserves every Gaussian.

@@ -89,6 +89,13 @@ Freeze observations/KNN geometry directly from the static scene and references.
 Per-view relative depth tolerances are explicit calibration values; do not invent
 them from another scene. Read the resulting `manifest.json` for `geometry_graph`.
 
+For an explicitly requested connected-graph experiment, substitute
+`configs/neural_component_field_connected.json` consistently in preparation,
+batch/control preparation and training: K=12, no distance cutoff, minimum-length
+component bridges. Keep new outputs separate from the accepted K=16 results.
+Inspect with `viewer --scene STATIC --geometry-graph GEOMETRY_GRAPH --work-dir VIEWER_WORK`;
+orange edges are bridges and can be toggled separately. Viewing does not train modes.
+
 ```sh
 modal-gaussians motion prepare-neural --scene STATIC --view view1 REFERENCE1 TOLERANCE1 --view view2 REFERENCE2 TOLERANCE2 --config configs/neural_component_field.json --cache-dir SCENE_CACHE --output PREPARED
 modal-gaussians motion batch-neural --modal-images MODAL_IMAGES --prepared PREPARED --geometry-graph GEOMETRY_GRAPH --config configs/neural_component_field.json --output BATCH --cpu-workers 3 --gpu-workers 2 --threads-per-worker 2
@@ -212,3 +219,9 @@ For a user-requested immediate stop, set policy `mode` to
 only a final full-frame evaluation of the retained checkpoint and best-state
 publication, without further Gaussian updates. The original process's allocator
 peak is unavailable after an external stop and is reported as unrecorded.
+
+Bounded graph experiment: use `configs/neural_component_field_knn8_bounded.json`
+consistently across preparation and training, with `graph_neighbors=8`,
+`graph_max_distance=0.08`, `graph_connect_components=true`, and
+`graph_bridge_max_distance=0.08`. Unbridgeable islands remain separate; the
+geometry-only viewer does not invoke downstream training.

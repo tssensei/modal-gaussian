@@ -83,9 +83,11 @@ def iterate_neural(*, prepared_dir, config_path, output_dir, stage="modes", freq
                                   rtol=0, atol=1e-9) for slot in slots):
                 raise ValueError("External modal graph may only train its selected frequency")
             if (settings.graph_neighbors != external["config"]["graph_neighbors"]
-                    or not np.isclose(settings.graph_max_distance, external["config"]["graph_max_distance"], rtol=0, atol=1e-12)
+                    or settings.graph_max_distance != external["config"]["graph_max_distance"]
+                    or settings.graph_connect_components != external["config"].get("graph_connect_components", False)
+                    or settings.graph_bridge_max_distance != external["config"].get("graph_bridge_max_distance")
                     or settings.graph_edge_filter != "none"):
-                raise ValueError("External graph requires matching candidate K/radius and graph_edge_filter=none")
+                raise ValueError("External graph requires matching candidate K/radius/connectivity and graph_edge_filter=none")
     if root == prepared.path or root.is_relative_to(prepared.path):
         raise ValueError("Experiment must not overwrite prepared inputs")
     strategy_config = settings.training_fragment_config
